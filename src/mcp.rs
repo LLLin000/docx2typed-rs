@@ -122,6 +122,7 @@ struct McpSession {
     engine: Engine,
     workdir: Option<String>,
     author: Option<String>,
+    track: bool,
 }
 
 impl McpSession {
@@ -130,9 +131,9 @@ impl McpSession {
             engine: Engine::new(),
             workdir: None,
             author: None,
+            track: false,
         }
     }
-
     fn require_workdir(&self) -> Result<&str, Value> {
         match self.workdir.as_deref() {
             Some(workdir) => Ok(workdir),
@@ -278,6 +279,7 @@ impl McpSession {
             .get("author")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let track = args.get("track").and_then(Value::as_bool).unwrap_or(false);
         let contract_ranges = args.get("contract_ranges");
         let supported_features = args
             .get("supported_features")
@@ -362,8 +364,12 @@ impl McpSession {
         if let Some(count) = session.get_mut("paragraphs") {
             *count = json!(paragraphs);
         }
+        if track {
+            session["effective_mode"] = json!("track");
+        }
         self.workdir = Some(workdir);
         self.author = author;
+        self.track = track;
         self.success("workdir_open", json!({ "session": session }), build_commit)
     }
 
@@ -438,11 +444,21 @@ impl McpSession {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let tracked = self.track;
+        let author = self.author.clone();
         self.draft_tool("replace_text", args, build_commit, move |target| {
             draft::ensure_projection(target)
                 .map_err(|error| MutationError::new(error.code, error.detail))?;
-            draft::replace_text(target, &paragraph_id, &old, &new)
-                .map_err(|error| MutationError::new(error.code, error.detail))
+            draft::replace_text_with_options(
+                target,
+                &paragraph_id,
+                &old,
+                &new,
+                tracked,
+                author.as_deref(),
+                None,
+            )
+            .map_err(|error| MutationError::new(error.code, error.detail))
         })
     }
 
@@ -514,15 +530,17 @@ impl McpSession {
     }
 
     fn commit_sync(&self, args: &Value, build_commit: &str) -> Value {
-        self.draft_tool("commit_sync", args, build_commit, |target| {
-            let changed = draft::apply_projection(target)
-                .map_err(|error| MutationError::new(error.code, error.detail))?;
+        let tracked = self.track;
+        let author = self.author.clone();
+        self.draft_tool("commit_sync", args, build_commit, move |target| {
+            let changed =
+                draft::apply_projection_with_options(target, tracked, author.as_deref(), None)
+                    .map_err(|error| MutationError::new(error.code, error.detail))?;
             if changed.is_empty() {
-                // Clean no-op commit: nothing to publish (mirror of Python).
                 return Ok(json!({
                     "changed_paragraph_ids": [],
                     "warnings": [],
-                    "edit_mode": "direct",
+                    "edit_mode": if tracked { "track" } else { "direct" },
                     "state": "clean",
                     "current_snapshot": Value::Null,
                 }));
@@ -537,8 +555,14 @@ impl McpSession {
                         .map(str::to_string)
                 })
                 .unwrap_or_default();
-            let published = collab::publish_current(target, &parent, "agent", &changed, None)
-                .map_err(|error| MutationError::new(error.code, error.detail))?;
+            let published = collab::publish_current(
+                target,
+                &parent,
+                author.as_deref().unwrap_or("agent"),
+                &changed,
+                None,
+            )
+            .map_err(|error| MutationError::new(error.code, error.detail))?;
             let current = published
                 .get("current_snapshot")
                 .cloned()
@@ -546,7 +570,7 @@ impl McpSession {
             Ok(json!({
                 "changed_paragraph_ids": changed,
                 "warnings": [],
-                "edit_mode": "direct",
+                "edit_mode": if tracked { "track" } else { "direct" },
                 "state": "clean",
                 "current_snapshot": current,
             }))

@@ -412,12 +412,25 @@ pub fn replace_in_body(
 }
 
 /// The `replace_text` tool body: preflight, locate the paragraph, prove a
-/// single occurrence, write the draft back. Returns the operation data.
+/// single occurrence, write the draft back, and record the exact leaf-local
+/// operation for the build sidecar.
 pub fn replace_text(
     workdir: &Path,
     paragraph_id: &str,
     old: &str,
     new: &str,
+) -> Result<Value, CollaborationError> {
+    replace_text_with_options(workdir, paragraph_id, old, new, false, None, None)
+}
+
+pub fn replace_text_with_options(
+    workdir: &Path,
+    paragraph_id: &str,
+    old: &str,
+    new: &str,
+    tracked: bool,
+    author: Option<&str>,
+    date: Option<&str>,
 ) -> Result<Value, CollaborationError> {
     crate::collab::ensure_agent_ready(workdir)?;
     let (header, mut blocks) = read_blocks(workdir)?;
@@ -435,12 +448,56 @@ pub fn replace_text(
     } else {
         format!("{marker}\n{new_body}")
     };
+    record_island_operation(workdir, paragraph_id, old, new, tracked, author, date)?;
     write_draft(workdir, &header, &blocks)?;
     Ok(serde_json::json!({
         "paragraph_id": paragraph_id,
         "draft": "dirty",
         "next": "diff_preview to inspect style ownership, then commit_sync",
     }))
+}
+
+fn record_island_operation(
+    workdir: &Path,
+    paragraph_id: &str,
+    old: &str,
+    new: &str,
+    tracked: bool,
+    author: Option<&str>,
+    date: Option<&str>,
+) -> Result<(), CollaborationError> {
+    let package = fs::read(workdir.join("_template.docx"))
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    let inventory = docx2typed_core::prose::enumerate_package_bytes(&package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)
+        .ok_or_else(|| CollaborationError::new("invalid-edit", "unknown paragraph part"))?;
+    let leaf = inventory
+        .leaves
+        .iter()
+        .find(|leaf| {
+            leaf.part_key == part && leaf.paragraph_id == paragraph_id && leaf.text.contains(old)
+        })
+        .ok_or_else(|| {
+            CollaborationError::new(
+                "cross-leaf-edit",
+                format!("{paragraph_id}: replacement must stay within one text leaf"),
+            )
+        })?;
+    let mut islands = docx2typed_core::prose::load_islands(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    islands.push(docx2typed_core::prose::IslandEdit {
+        part,
+        paragraph_id: paragraph_id.to_string(),
+        leaf_index: leaf.leaf_index,
+        old: old.to_string(),
+        new: new.to_string(),
+        tracked,
+        author: author.unwrap_or("").to_string(),
+        date: date.unwrap_or("").to_string(),
+    });
+    docx2typed_core::prose::save_islands(workdir, &islands)
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))
 }
 
 /// The `insert_paragraph` tool body: block insert after `after_id`.
@@ -561,6 +618,15 @@ pub fn diff_preview(workdir: &Path) -> Result<Value, CollaborationError> {
 /// differs from the committed typed record are reported as changed; a
 /// no-change draft returns an empty list without touching typed.md.
 pub fn apply_projection(workdir: &Path) -> Result<Vec<String>, CollaborationError> {
+    apply_projection_with_options(workdir, false, None, None)
+}
+
+pub fn apply_projection_with_options(
+    workdir: &Path,
+    tracked: bool,
+    author: Option<&str>,
+    date: Option<&str>,
+) -> Result<Vec<String>, CollaborationError> {
     if !workdir.join(PROJECTION_FILE).is_file() {
         // No draft: a clean no-op commit (mirror of Python's sync on a
         // clean workdir, which reports no changed paragraphs).
@@ -703,31 +769,21 @@ pub fn apply_projection(workdir: &Path) -> Result<Vec<String>, CollaborationErro
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let mut recorded = 0usize;
     for id in &changed {
-        eprintln!("DBG id={id}");
-        let new_body =
-            match parse_typed_paragraphs(&fs::read_to_string(workdir.join("typed.md")).map_err(
+        let Some(new_body) =
+            parse_typed_paragraphs(&fs::read_to_string(workdir.join("typed.md")).map_err(
                 |error| CollaborationError::new("workdir-unreadable", error.to_string()),
             )?)
             .remove(id)
-            {
-                Some(body) => body,
-                None => {
-                    eprintln!("DBG no new_body for {id}");
-                    continue;
-                }
-            };
-        let old_body = match before.get(id) {
-            Some(body) => body,
-            None => {
-                eprintln!("DBG no old_body for {id}");
-                continue;
-            }
+        else {
+            continue;
         };
-        eprintln!(
-            "DBG old={old_body:?} new={new_body:?} equal={}",
-            *old_body == new_body
-        );
+        let Some(old_body) = before.get(id) else {
+            continue;
+        };
         if *old_body == new_body {
+            continue;
+        }
+        if islands.iter().any(|edit| edit.paragraph_id == *id) {
             continue;
         }
         islands.retain(|edit| edit.paragraph_id != *id);
@@ -737,6 +793,9 @@ pub fn apply_projection(workdir: &Path) -> Result<Vec<String>, CollaborationErro
             leaf_index: 0,
             old: old_body.clone(),
             new: new_body,
+            tracked,
+            author: author.unwrap_or("").to_string(),
+            date: date.unwrap_or("").to_string(),
         });
         recorded += 1;
     }

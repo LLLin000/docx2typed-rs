@@ -957,6 +957,9 @@ impl Engine {
             leaf_index,
             old: text.old.clone(),
             new: text.new.clone(),
+            tracked: false,
+            author: String::new(),
+            date: String::new(),
         };
         let canonical = canonical_operation_input(
             "edit",

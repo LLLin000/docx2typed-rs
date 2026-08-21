@@ -12,10 +12,11 @@
 //! reconstructs the frame from the generation a history record references
 //! (a live reference; GC is out of scope for this slice).
 
-use std::path::Path;
-
 use docx2typed_store::store::Store;
 use serde_json::{json, Value};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::history;
 use crate::server::MutationError;
@@ -43,9 +44,34 @@ fn mutation_from_store(error: &docx2typed_store::StoreError) -> MutationError {
 /// they are recomputed by the Core free functions `paragraph_fingerprint` /
 /// `region_fingerprint` over a `CanonicalParagraph`.
 pub(crate) fn project_document_json(workdir: &Path) -> Result<Value, String> {
-    let projection = docx2typed_core::document_projection::project_workdir(workdir)
-        .map_err(|error| error.to_string())?;
-    serde_json::to_value(&projection).map_err(|error| error.to_string())
+    let template = workdir.join("_template.docx");
+    let islands =
+        docx2typed_core::prose::load_islands(workdir).map_err(|error| error.to_string())?;
+    if islands.is_empty() {
+        let projection = docx2typed_core::document_projection::project_workdir(workdir)
+            .map_err(|error| error.to_string())?;
+        return serde_json::to_value(&projection).map_err(|error| error.to_string());
+    }
+    // Review must show the committed MCP edits, not only the immutable
+    // template. Project a short-lived patched template; the source workdir
+    // remains untouched and the generated path never enters the frame.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let temp_dir: PathBuf =
+        std::env::temp_dir().join(format!("docx2typed-review-{stamp}-{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).map_err(|error| error.to_string())?;
+    let result = (|| {
+        let patched = docx2typed_core::prose::apply_edits(&template, &islands)
+            .map_err(|error| error.to_string())?;
+        fs::write(temp_dir.join("_template.docx"), patched).map_err(|error| error.to_string())?;
+        let projection = docx2typed_core::document_projection::project_workdir(&temp_dir)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(&projection).map_err(|error| error.to_string())
+    })();
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
 }
 
 /// A fail-closed Core fingerprint check on one patch target: recompute the

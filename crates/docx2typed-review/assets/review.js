@@ -600,13 +600,21 @@ function normalizeParagraph(pid, rec, revRegistry, comRegistry) {
     anchors.forEach(function (anchor) {
       if (!anchor || typeof anchor !== 'object') return;
       if ((anchor.paragraph_id || anchor.pid || '') !== pid) return;
+      /* Frame anchors carry paragraph_id but no scalar offsets (the Core
+         CommentEntry has only kind/part/paragraph_id). Without offsets
+         addComment stores start=null and the units filter drops the
+         comment entirely - the "undefined" marker bug. Fall back to the
+         whole-paragraph span so the comment attaches to its paragraph. */
+      var start = toNumber(anchor.start, null);
+      var end = toNumber(anchor.end, null);
+      if (start === null || end === null) { start = 0; end = textLength; }
       addComment({
         cid: meta.cid || meta.id,
         author: meta.author,
         date: meta.date,
         text: meta.text,
-        start: anchor.start,
-        end: anchor.end,
+        start: start,
+        end: end,
       });
     });
   });

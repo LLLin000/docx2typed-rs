@@ -234,18 +234,25 @@ impl IndependentVerifier {
             let output_part =
                 read_member_bytes(&std::fs::read(output).unwrap_or_default(), part_path)
                     .unwrap_or_default();
-            match recompute_edited_part(&template_part, &edits) {
-                Ok(expected) => {
-                    if expected != output_part {
-                        edited_exact = false;
-                        edited_detail = format!(
-                            "part {part_path} differs from the independently recomputed edit"
-                        );
-                    }
-                }
-                Err(message) => {
+            if edits.iter().any(|edit| edit.tracked) {
+                if let Err(message) = verify_tracked_part(&output_part, &edits) {
                     edited_exact = false;
                     edited_detail = format!("part {part_path}: {message}");
+                }
+            } else {
+                match recompute_edited_part(&template_part, &edits) {
+                    Ok(expected) => {
+                        if expected != output_part {
+                            edited_exact = false;
+                            edited_detail = format!(
+                                "part {part_path} differs from the independently recomputed edit"
+                            );
+                        }
+                    }
+                    Err(message) => {
+                        edited_exact = false;
+                        edited_detail = format!("part {part_path}: {message}");
+                    }
                 }
             }
         }
@@ -410,6 +417,7 @@ pub struct IslandEdit {
     pub leaf_index: usize,
     pub old: String,
     pub new: String,
+    pub tracked: bool,
 }
 
 const ISLANDS_SCHEMA: &str = "docx2typed-islands-1";
@@ -430,6 +438,10 @@ fn load_islands(workdir: &Path) -> Option<Vec<IslandEdit>> {
         let leaf_index = edit.get("leaf_index")?.as_u64()? as usize;
         let old = edit.get("old")?.as_str()?.to_string();
         let new = edit.get("new")?.as_str()?.to_string();
+        let tracked = edit
+            .get("tracked")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
         if !old.is_empty() {
             out.push(IslandEdit {
                 part,
@@ -437,6 +449,7 @@ fn load_islands(workdir: &Path) -> Option<Vec<IslandEdit>> {
                 leaf_index,
                 old,
                 new,
+                tracked,
             });
         }
     }
@@ -449,6 +462,30 @@ fn part_path(part_key: &str) -> String {
     } else {
         format!("word/{part_key}.xml")
     }
+}
+
+fn verify_tracked_part(output_part: &[u8], edits: &[&IslandEdit]) -> Result<(), String> {
+    let xml = String::from_utf8_lossy(output_part);
+    for edit in edits.iter().filter(|edit| edit.tracked) {
+        let old = xml_escape(&edit.old);
+        let new = xml_escape(&edit.new);
+        if !xml.contains("<w:del") || !xml.contains("<w:ins") {
+            return Err("tracked output is missing w:del/w:ins containers".to_string());
+        }
+        if !xml.contains(&format!("<w:delText>{old}</w:delText>"))
+            && !xml.contains(&format!(
+                "<w:delText xml:space=\"preserve\">{old}</w:delText>"
+            ))
+        {
+            return Err(format!("tracked deletion text {:?} is missing", edit.old));
+        }
+        if !xml.contains(&format!("<w:t>{new}</w:t>"))
+            && !xml.contains(&format!("<w:t xml:space=\"preserve\">{new}</w:t>"))
+        {
+            return Err(format!("tracked insertion text {:?} is missing", edit.new));
+        }
+    }
+    Ok(())
 }
 
 fn part_key_from_path(path: &str) -> Option<String> {

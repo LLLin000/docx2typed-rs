@@ -44,6 +44,15 @@ pub struct IslandEdit {
     pub old: String,
     /// Replacement text (XML-escaped on write).
     pub new: String,
+    /// Generate a tracked OOXML delete+insert pair instead of a direct swap.
+    #[serde(default)]
+    pub tracked: bool,
+    /// Revision author for tracked edits.
+    #[serde(default)]
+    pub author: String,
+    /// Revision date in ISO-8601 form for tracked edits.
+    #[serde(default)]
+    pub date: String,
 }
 
 /// A resolved prose leaf with its byte ranges inside one part.
@@ -1225,12 +1234,15 @@ fn read_part(template: &Path, part: &str) -> Result<Vec<u8>, CoreError> {
 /// package bytes. Every edit is re-validated (leaf editable, old text
 /// proven, opaque containment) and the global invariant gate runs first;
 /// any failure returns Err with no output produced.
+/// Apply direct or tracked island edits. Tracked edits replace one text run
+/// with a `w:del` + `w:ins` pair while preserving the run properties.
 pub fn apply_edits(template: &Path, edits: &[IslandEdit]) -> Result<Vec<u8>, CoreError> {
     if edits.is_empty() {
         return std::fs::read(template).map_err(CoreError::io);
     }
     validate_package(template)?;
     let package = std::fs::read(template).map_err(CoreError::io)?;
+    let mut next_revision_id = max_revision_id(&package).saturating_add(1);
     // Group edits by part, preserving order within each part.
     let mut by_part: BTreeMap<String, Vec<&IslandEdit>> = BTreeMap::new();
     for edit in edits {
@@ -1251,14 +1263,28 @@ pub fn apply_edits(template: &Path, edits: &[IslandEdit]) -> Result<Vec<u8>, Cor
                     edit.old, edit.paragraph_id, edit.leaf_index, part
                 )));
             };
-            let replacement = xml_escape(&edit.new).into_bytes();
-            spans.push((byte_start, byte_end, replacement));
-            // Whitespace preservation: a text with leading/trailing spaces
-            // needs xml:space="preserve" on the w:t start tag (a separate
-            // span on the tag bytes, applied right-to-left like the rest).
-            if needs_xml_space(&edit.new) {
-                if let Some(tag_span) = maybe_inject_xml_space(&part_bytes, leaf.open_end) {
-                    spans.push(tag_span);
+            if edit.tracked {
+                let replacement = tracked_run_replacement(
+                    &part_bytes,
+                    &leaf,
+                    &edit.old,
+                    &edit.new,
+                    &edit.author,
+                    &edit.date,
+                    next_revision_id,
+                    next_revision_id.saturating_add(1),
+                )?;
+                next_revision_id = next_revision_id.saturating_add(2);
+                spans.push(replacement);
+            } else {
+                let replacement = xml_escape(&edit.new).into_bytes();
+                spans.push((byte_start, byte_end, replacement));
+                // Whitespace preservation: a text with leading/trailing spaces
+                // needs xml:space="preserve" on the w:t start tag.
+                if needs_xml_space(&edit.new) {
+                    if let Some(tag_span) = maybe_inject_xml_space(&part_bytes, leaf.open_end) {
+                        spans.push(tag_span);
+                    }
                 }
             }
         }
@@ -1271,6 +1297,128 @@ pub fn apply_edits(template: &Path, edits: &[IslandEdit]) -> Result<Vec<u8>, Cor
         current = patch_zip_member(&current, &part_path(part), &new_part)?;
     }
     Ok(current)
+}
+
+fn max_revision_id(package: &[u8]) -> u32 {
+    let mut max_id = 0u32;
+    let marker = b"w:id=\"";
+    let mut start = 0usize;
+    while let Some(offset) = package[start..]
+        .windows(marker.len())
+        .position(|w| w == marker)
+    {
+        let begin = start + offset + marker.len();
+        let end = package[begin..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .map(|n| begin + n)
+            .unwrap_or(package.len());
+        if let Ok(value) = std::str::from_utf8(&package[begin..end])
+            .unwrap_or("")
+            .parse::<u32>()
+        {
+            max_id = max_id.max(value);
+        }
+        start = end;
+        if start >= package.len() {
+            break;
+        }
+    }
+    max_id
+}
+
+fn tracked_run_replacement(
+    part: &[u8],
+    leaf: &ProseLeaf,
+    old: &str,
+    new: &str,
+    author: &str,
+    date: &str,
+    delete_id: u32,
+    insert_id: u32,
+) -> Result<(usize, usize, Vec<u8>), CoreError> {
+    let before = &part[..leaf.text_start];
+    let mut run_start = None;
+    for index in 0..before.len().saturating_sub(3) {
+        if &before[index..index + 4] == b"<w:r"
+            && before
+                .get(index + 4)
+                .is_some_and(|byte| *byte == b' ' || *byte == b'>')
+        {
+            run_start = Some(index);
+        }
+    }
+    let run_start = run_start
+        .ok_or_else(|| CoreError::Domain("tracked-edit: owning run not found".to_string()))?;
+    let run_end_rel = part[leaf.text_end..]
+        .windows(6)
+        .position(|w| w == b"</w:r>")
+        .ok_or_else(|| CoreError::Domain("tracked-edit: owning run end not found".to_string()))?;
+    let run_end = leaf.text_end + run_end_rel + 6;
+    let run = &part[run_start..run_end];
+    let t_count = run.windows(5).filter(|w| *w == b"<w:t>").count()
+        + run.windows(5).filter(|w| *w == b"<w:t ").count();
+    if t_count != 1 || run.windows(6).filter(|w| *w == b"</w:t>").count() != 1 {
+        return Err(CoreError::Domain(
+            "tracked-edit: replacement must target one text run".to_string(),
+        ));
+    }
+    let rpr = run
+        .windows(5)
+        .position(|w| w == b"<w:rPr")
+        .and_then(|start| {
+            run[start..]
+                .windows(8)
+                .position(|w| w == b"</w:rPr>")
+                .map(|end| String::from_utf8_lossy(&run[start..start + end + 8]).into_owned())
+        })
+        .unwrap_or_default();
+    let prefix = leaf.text.split_once(old).map(|(p, _)| p).unwrap_or("");
+    let suffix = leaf.text.split_once(old).map(|(_, s)| s).unwrap_or("");
+    let attrs = |kind: &str, id: u32| {
+        format!(
+            "<w:{kind} w:id=\"{id}\" w:author=\"{}\" w:date=\"{}\">",
+            xml_attr(author),
+            xml_attr(date)
+        )
+    };
+    let run_text = |tag: &str, text: &str| {
+        let space = if text.starts_with(' ') || text.ends_with(' ') {
+            " xml:space=\"preserve\""
+        } else {
+            ""
+        };
+        format!(
+            "<w:r>{rpr}<w:{tag}{space}>{}</w:{tag}></w:r>",
+            xml_escape(text)
+        )
+    };
+    if !leaf.text.contains(old) {
+        return Err(CoreError::Domain(
+            "tracked-edit: old text is not in leaf".to_string(),
+        ));
+    }
+    let mut replacement = String::new();
+    if !prefix.is_empty() {
+        replacement.push_str(&run_text("t", prefix));
+    }
+    replacement.push_str(&attrs("del", delete_id));
+    replacement.push_str(&run_text("delText", old));
+    replacement.push_str("</w:del>");
+    replacement.push_str(&attrs("ins", insert_id));
+    replacement.push_str(&run_text("t", new));
+    replacement.push_str("</w:ins>");
+    if !suffix.is_empty() {
+        replacement.push_str(&run_text("t", suffix));
+    }
+    Ok((run_start, run_end, replacement.into_bytes()))
+}
+
+fn xml_attr(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Read one member's decoded bytes from raw package bytes.
@@ -1877,6 +2025,9 @@ mod tests {
             leaf_index: 0,
             old: "PVA".to_string(),
             new: "PLBA".to_string(),
+            tracked: false,
+            author: String::new(),
+            date: String::new(),
         };
         let out = apply_edits(&template, &[edit]).expect("apply edit");
         // Re-open the output: every part identical except document.xml.
@@ -1921,6 +2072,9 @@ mod tests {
             leaf_index: 0,
             old: "FIELD".to_string(),
             new: "XXX".to_string(),
+            tracked: false,
+            author: String::new(),
+            date: String::new(),
         };
         let error = apply_edits(&template, &[edit]).expect_err("must reject");
         assert!(error.to_string().contains("opaque-paragraph-mutated"));
@@ -1935,6 +2089,9 @@ mod tests {
             leaf_index: 0,
             old: "nonexistent text".to_string(),
             new: "x".to_string(),
+            tracked: false,
+            author: String::new(),
+            date: String::new(),
         };
         let error = apply_edits(&template, &[edit]).expect_err("must reject");
         assert!(error.to_string().contains("invalid-edit"));
@@ -1950,6 +2107,9 @@ mod tests {
             leaf_index: 0,
             old: "重复句子内容".to_string(),
             new: "x".to_string(),
+            tracked: false,
+            author: String::new(),
+            date: String::new(),
         };
         let error = apply_edits(&template, &[edit]).expect_err("must reject");
         assert!(error.to_string().contains("prose-edit-ambiguous"));
