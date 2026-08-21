@@ -1364,7 +1364,7 @@ fn tracked_run_replacement(
         ));
     }
     let rpr = run
-        .windows(5)
+        .windows(6)
         .position(|w| w == b"<w:rPr")
         .and_then(|start| {
             run[start..]
