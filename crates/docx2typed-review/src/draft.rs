@@ -420,7 +420,7 @@ pub fn replace_text(
     old: &str,
     new: &str,
 ) -> Result<Value, CollaborationError> {
-    replace_text_with_options(workdir, paragraph_id, old, new, false, None, None)
+    replace_text_with_options(workdir, paragraph_id, old, new, false, None, None, None)
 }
 
 pub fn replace_text_with_options(
@@ -431,6 +431,7 @@ pub fn replace_text_with_options(
     tracked: bool,
     author: Option<&str>,
     date: Option<&str>,
+    leaf_index: Option<usize>,
 ) -> Result<Value, CollaborationError> {
     crate::collab::ensure_agent_ready(workdir)?;
     let (header, mut blocks) = read_blocks(workdir)?;
@@ -442,13 +443,27 @@ pub fn replace_text_with_options(
     })?;
     let marker = blocks[index].split('\n').next().unwrap_or("").to_string();
     let body = block_body(&blocks[index]);
-    let new_body = replace_in_body(&body, old, new, paragraph_id)?;
+    let new_body = if let Some(leaf_index) = leaf_index {
+        let occurrence = leaf_occurrence(workdir, paragraph_id, leaf_index, old)?;
+        replace_nth_in_body(&body, old, new, occurrence, paragraph_id)?
+    } else {
+        replace_in_body(&body, old, new, paragraph_id)?
+    };
     blocks[index] = if new_body.is_empty() {
         marker
     } else {
         format!("{marker}\n{new_body}")
     };
-    record_island_operation(workdir, paragraph_id, old, new, tracked, author, date)?;
+    record_island_operation(
+        workdir,
+        paragraph_id,
+        old,
+        new,
+        tracked,
+        author,
+        date,
+        leaf_index,
+    )?;
     write_draft(workdir, &header, &blocks)?;
     Ok(serde_json::json!({
         "paragraph_id": paragraph_id,
@@ -456,7 +471,59 @@ pub fn replace_text_with_options(
         "next": "diff_preview to inspect style ownership, then commit_sync",
     }))
 }
+fn leaf_occurrence(
+    workdir: &Path,
+    paragraph_id: &str,
+    leaf_index: usize,
+    old: &str,
+) -> Result<usize, CollaborationError> {
+    let package = fs::read(workdir.join("_template.docx"))
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    let inventory = docx2typed_core::prose::enumerate_package_bytes(&package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)
+        .ok_or_else(|| CollaborationError::new("invalid-edit", "unknown paragraph part"))?;
+    Ok(inventory
+        .leaves
+        .iter()
+        .filter(|leaf| {
+            leaf.part_key == part
+                && leaf.paragraph_id == paragraph_id
+                && leaf.leaf_index < leaf_index
+                && leaf.text == old
+        })
+        .count())
+}
 
+fn replace_nth_in_body(
+    body: &str,
+    old: &str,
+    new: &str,
+    occurrence: usize,
+    paragraph_id: &str,
+) -> Result<String, CollaborationError> {
+    let mut start = 0usize;
+    for _ in 0..occurrence {
+        let position = body[start..].find(old).ok_or_else(|| {
+            CollaborationError::new(
+                "text-not-found",
+                format!("{paragraph_id}: occurrence of {old:?} not found"),
+            )
+        })?;
+        start += position + old.len();
+    }
+    let position = body[start..].find(old).ok_or_else(|| {
+        CollaborationError::new(
+            "text-not-found",
+            format!("{paragraph_id}: occurrence of {old:?} not found"),
+        )
+    })? + start;
+    let mut out = String::with_capacity(body.len() + new.len());
+    out.push_str(&body[..position]);
+    out.push_str(new);
+    out.push_str(&body[position + old.len()..]);
+    Ok(out)
+}
 fn record_island_operation(
     workdir: &Path,
     paragraph_id: &str,
@@ -465,6 +532,7 @@ fn record_island_operation(
     tracked: bool,
     author: Option<&str>,
     date: Option<&str>,
+    leaf_index: Option<usize>,
 ) -> Result<(), CollaborationError> {
     let package = fs::read(workdir.join("_template.docx"))
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
@@ -476,7 +544,9 @@ fn record_island_operation(
         .leaves
         .iter()
         .find(|leaf| {
-            leaf.part_key == part && leaf.paragraph_id == paragraph_id && leaf.text.contains(old)
+            leaf.part_key == part
+                && leaf.paragraph_id == paragraph_id
+                && leaf_index.map_or(leaf.text.contains(old), |index| leaf.leaf_index == index)
         })
         .ok_or_else(|| {
             CollaborationError::new(

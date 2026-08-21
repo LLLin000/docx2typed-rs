@@ -446,6 +446,10 @@ impl McpSession {
             .to_string();
         let tracked = self.track;
         let author = self.author.clone();
+        let leaf_index = args
+            .get("leaf_index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
         self.draft_tool("replace_text", args, build_commit, move |target| {
             draft::ensure_projection(target)
                 .map_err(|error| MutationError::new(error.code, error.detail))?;
@@ -457,6 +461,7 @@ impl McpSession {
                 tracked,
                 author.as_deref(),
                 None,
+                leaf_index,
             )
             .map_err(|error| MutationError::new(error.code, error.detail))
         })
