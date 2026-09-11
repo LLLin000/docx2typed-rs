@@ -106,10 +106,13 @@ Two corrections the prototype forced, kept here as design constraints:
   existing pointer, and the existing transaction lane. The store's durability
   machinery (`generations/`, journals, recovery, the fault-injection tests) is
   untouched — it keeps doing transactions, while history moves to the graph.
-- GC is one mark-and-sweep over the graph plus retention (ADR 0042): reachable
-  objects survive, the rest are collected. Retention trims *content*, never
-  commit metadata, so trimming downgrades a restore to `version-trimmed`
-  rather than making a version vanish from the list.
+- GC is one mark-and-sweep over the graph plus retention (ADR 0042):
+  reachable objects survive, the rest are collected. Retention trims *content*,
+  never commit metadata; each applied trim is recorded in the small
+  `history-trim.jsonl` retention ledger (not a history authority), so trimming
+  downgrades a restore/export to `version-trimmed` rather than making a version
+  vanish from the list. `history_verify` treats that deliberate loss as
+  healthy while still failing on an unrecorded missing object.
 - Migration: existing generations are imported as objects + one commit each,
   in order, then the graph takes over.
 - Deliberately still excluded: packfiles, delta chains, compression, branches.

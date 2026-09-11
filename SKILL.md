@@ -123,8 +123,9 @@ Rules:
 - `format_span` needs a CLEAN draft (styles live in the committed AST):
   commit_sync (or revert) first, then format.
 - MCP profiles keep tool selection small: set `DOCX2TYPED_MCP_PROFILE=editor`
-  (12 tools) for plain editing sessions, `review` (27) when revisions/comments
-  are in play, `full` for everything.
+  (27 tools) for ordinary editing plus save/history/structural transitions,
+  `review` (27) when per-revision/comments and review collaboration are in
+  play, and `full` for everything.
 - **NEVER split hunks at style boundaries.** Style edges are not edit
   boundaries: `document_patch` accepts spans crossing style regions and the
   engine assigns ownership itself (`proportional-preserve`, flagged via

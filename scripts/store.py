@@ -2146,7 +2146,9 @@ def _legacy_chain(root: Path, generation: str | None) -> list[dict[str, Any]]:
         if not record:
             break
         record["generation"] = generation
-        record["content"] = "retained"
+        record["content"] = (
+            "trimmed" if record.get("version") in trimmed_versions(root) else "retained"
+        )
         chain.append(record)
         generation = record.get("parent_generation")
     return chain
@@ -2166,6 +2168,7 @@ def _version_chain(root: Path) -> list[dict[str, Any]]:
 
     chain: list[dict[str, Any]] = []
     seen: set[str] = set()
+    trimmed = trimmed_versions(root)
     commit = pointer.get("head_commit")
     while isinstance(commit, str) and commit and commit not in seen:
         seen.add(commit)
@@ -2175,7 +2178,11 @@ def _version_chain(root: Path) -> list[dict[str, Any]]:
         record["commit"] = commit
         tree_object = record.get("tree_object")
         if isinstance(tree_object, str):
-            record["content"] = "retained" if _has_object(root, "tree", tree_object) else "trimmed"
+            record["content"] = (
+                "trimmed"
+                if record.get("version") in trimmed
+                else ("retained" if _has_object(root, "tree", tree_object) else "trimmed")
+            )
         else:
             record["content"] = "retained"  # content still rides in its generation
         chain.append(record)
@@ -2265,33 +2272,31 @@ def _trim_log_path(root: Path) -> Path:
 
 
 def _append_trim_log(root: Path, versions: list[dict[str, Any]]) -> None:
-    """Record which versions retention trimmed — content gone ON PURPOSE.
+    """Durably record content trims before sweeping their objects.
 
-    Without this, verification cannot tell a deliberate trim from corruption,
-    and a lingering generation would let a restore quietly resurrect content
-    that retention decided to drop."""
+    This marker is load-bearing: if it cannot be written, the caller must
+    abort before deleting content, rather than silently making verification
+    confuse an expected trim with corruption."""
     if not versions:
         return
     path = _trim_log_path(root)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            for record in versions:
-                handle.write(
-                    json.dumps(
-                        {
-                            "version": record.get("version"),
-                            "tree_object": record.get("tree_object"),
-                            "trimmed_at": _now_iso(),
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        for record in versions:
+            handle.write(
+                json.dumps(
+                    {
+                        "version": record.get("version"),
+                        "tree_object": record.get("tree_object"),
+                        "trimmed_at": _now_iso(),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
                 )
-            handle.flush()
-            os.fsync(handle.fileno())
-    except OSError:
-        pass
+                + "\n"
+            )
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def trimmed_versions(root: str | Path) -> set[str]:
@@ -2315,9 +2320,10 @@ def trimmed_versions(root: str | Path) -> set[str]:
 
 
 def history_verify(root: str | Path) -> dict[str, Any]:
-    """Every retained version's content, still present and hash-correct?
+    """Check retained content and report deliberate trims separately.
 
-    A missing object is detected and named — never silently different content."""
+    A missing object is detected and named; content intentionally released by
+    retention is reported as ``trimmed`` rather than corruption."""
     root_path = Path(root).resolve()
     try:
         from .objectstore import has as _has_object, verify as _verify_tree
@@ -2375,11 +2381,21 @@ def history_gc(
     store = Store(root_path)
     with store.writer(timeout_ms=0):
         chain = _version_chain(root_path)
+        trimmed_names = trimmed_versions(root_path)
         # a version is pinned by an intentional name, not by a descriptive
         # system label — otherwise every restore would live forever
-        retained = [r for index, r in enumerate(chain) if index < keep_last or r.get("pin")]
+        retained = [
+            record
+            for index, record in enumerate(chain)
+            if record.get("version") not in trimmed_names
+            and (index < keep_last or record.get("pin"))
+        ]
         keep_trees = {r["tree_object"] for r in retained if r.get("tree_object")}
-        keep_generations = {r.get("generation") for r in chain if not r.get("tree_object")}
+        keep_generations = {
+            r.get("generation")
+            for r in chain
+            if not r.get("tree_object") and r.get("version") not in trimmed_names
+        }
         pointer = _read_pointer(root_path) or {}
         if pointer.get("generation"):
             keep_generations.add(pointer["generation"])
@@ -2390,6 +2406,8 @@ def history_gc(
                         keep_generations.add(record["generation"])
 
         trimmed = [r for r in chain if r not in retained]
+        trimmed_version_names = {r.get("version") for r in trimmed}
+        newly_trimmed = [r for r in trimmed if r.get("version") not in trimmed_names]
         reclaimable: list[str] = []
         if reclaim_generations and store.generations_dir.is_dir():
             for gen_dir in sorted(store.generations_dir.iterdir()):
@@ -2404,7 +2422,7 @@ def history_gc(
                 version_name = version.get("version")
                 if isinstance(tree_object, str) and tree_object in keep_trees:
                     reclaimable.append(gen_dir.name)
-                elif version_name in {r.get("version") for r in trimmed}:
+                elif version_name in trimmed_version_names:
                     # its content was just trimmed: the generation must go too,
                     # otherwise a restore would resurrect what retention dropped
                     reclaimable.append(gen_dir.name)
@@ -2419,10 +2437,10 @@ def history_gc(
             "swept_objects": 0,
             "freed_bytes": 0,
         }
-        _append_trim_log(root_path, trimmed)
         report["versions_trimmed"] = [r.get("version") for r in trimmed]
         if dry_run:
             return report
+        _append_trim_log(root_path, newly_trimmed)
         try:
             from .objectstore import sweep as _sweep
         except ImportError:  # pragma: no cover - direct script execution

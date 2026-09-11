@@ -97,9 +97,10 @@ is appended to the operation evidence and joined on demand.
 - The content binding is the **tree hash**. The collaboration record keeps its
   own `typed_sha256` for the live drift check (`draft dirty`), which is a
   different question from what a version contains (ADR 0044).
-- A labelled version's tree is retained beyond the count limit (pinning
-  without a second mechanism); its commit metadata is retained regardless
-  (ADR 0042).
+- An explicitly named version's tree is retained beyond the count limit
+  (`commit_sync(label=…)` sets `pin=true`). System-generated labels on restore
+  and baseline transitions are descriptive and do not pin; commit metadata is
+  retained regardless (ADR 0042).
 
 ### Tool surface (deliberately small)
 
@@ -158,10 +159,10 @@ Nothing rewinds: the pointer advances, V18 stays, every later version stays.
 
 Measured on the 3000-paragraph fixture (976 KB source):
 
-| | today | with ADR 0043 (prototyped) |
+| | today | ADR 0043 object graph |
 |---|---|---|
 | ten versions, state payload | 23.8 MB in 88 files | **2.73 MB in 6421 blobs** |
-| history index | one `generation.json` per version | **8.5 KB in one file** |
+| history index | one `generation.json` per version | **none — commit parent chain** |
 | bytes a version adds | ~4.4 MB | **5–44 KB** |
 | blob lost | silent | detected + named (version, path, chunk) |
 
@@ -171,11 +172,12 @@ accumulated inside every later generation), `format.json` 1.21 MB,
 one-paragraph edit changes 1 of 3100 `format.json` records (0.3 KB) and one
 line of `typed.md` (0.2 KB).
 
-So history moves to content-addressed blobs behind one append-only log:
-`objects/<sha256>` + `history.jsonl` + `refs/current`, derivatives regenerated
-on materialisation, manifests fanned out into buckets so an edit rewrites one
-bucket. Retention (ADR 0042) is unchanged — the root set is read from the log
-instead of from per-generation manifests.
+History moves to content-addressed objects whose version commit parent chain
+is anchored by `workdir.json` HEAD: `objects/<sha256>` plus commit, tree, map,
+leaf, and blob objects. `ledger.jsonl` is only the durable idempotency plane,
+not history. Derived views regenerate on materialisation; retention roots come
+from the commit chain, and applied content trims are recorded separately in
+`history-trim.jsonl` so deliberate loss is distinguishable from corruption.
 
 ## Phases
 
@@ -203,8 +205,11 @@ commit object; `workdir.json` carries `head_commit` / `head_tree_object`.
 Restore and export materialise from the pool and only fall back to a
 generation for workdirs saved before the pool existed. `history_verify`
 checks every retained version object by object; `history_gc` trims content
-past `keep_last` (labelled versions are kept) and reclaims the generations
-whose content the pool already holds — commit metadata is never dropped.
+past `keep_last` (explicitly pinned versions are kept), records applied trims
+in `history-trim.jsonl`, and reclaims the generations whose content the pool
+already holds — commit metadata is never dropped. A deliberate trim remains
+listed as `content: trimmed`, is accepted by `history_verify`, and refuses
+restore/export with `version-trimmed`.
 The Store's `generations/` lane keeps its job (transactions, recovery, fault
 injection).
 

@@ -375,8 +375,8 @@ def test_p2_a_missing_object_is_detected_not_silently_substituted(tmp_path):
 
 
 def test_p2_retention_reclaims_generations_but_never_commit_metadata(tmp_path):
-    """history_gc trims content past retention; the versions still list, and a
-    labelled version is kept whatever the count limit says."""
+    """history_gc trims content past retention; the versions still list, and an
+    explicitly named version is kept whatever the count limit says."""
     workdir = _open(tmp_path, "poolgc")
     for index in range(3):
         text = CONFUSING[6:12] if index == 0 else f"第{index}版"
@@ -397,6 +397,38 @@ def test_p2_retention_reclaims_generations_but_never_commit_metadata(tmp_path):
     assert json.loads(history_verify())["ok"] is True
     assert not _fails(history_restore("V1", operation_id="gc-restore"))
 
+
+
+def test_gc_marks_trimmed_content_without_resurrecting_it(tmp_path):
+    """Retention is observable and irreversible: dry-run does not mark a trim,
+    verify accepts an intentional trim, and restore cannot use old generations."""
+    workdir = _open(tmp_path, "trim")
+    for index, (old, new) in enumerate(
+        [
+            (CONFUSING[6:12], "未命名第一版"),
+            ("未命名第一版", "未命名第二版"),
+            ("未命名第二版", "未命名第三版"),
+        ],
+        start=1,
+    ):
+        _edit(workdir, old, new, operation_id=f"trim-edit-{index}")
+        _save(workdir)
+
+    store_root = store_dir_path(workdir)
+    preview = _j(history_gc(keep_last=1, dry_run=True))
+    assert preview["versions_trimmed"] == ["V2", "V1"]
+    assert not (store_root / "history-trim.jsonl").exists()
+
+    applied = _j(history_gc(keep_last=1, dry_run=False))
+    assert applied["versions_trimmed"] == ["V2", "V1"]
+    history = store_history_list(workdir)["versions"]
+    assert [(item["version"], item["content"]) for item in history] == [
+        ("V3", "retained"),
+        ("V2", "trimmed"),
+        ("V1", "trimmed"),
+    ]
+    assert _j(history_verify())["ok"] is True
+    assert _fails(history_restore("V1", operation_id="trim-restore")) == "version-trimmed"
 
 # ---------------------------------------------------------------------------
 # P3 — structural operations become baseline transitions (one workspace)

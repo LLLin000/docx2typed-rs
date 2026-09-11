@@ -294,6 +294,14 @@ _Avoid_: 提交点, checkpoint
 用户可见的可回退保存点，指向一个 Snapshot 并锚定其内容；id 创建时确定且永不复用。
 _Avoid_: 修订（该词已属于 revisions.json 的 Word 修订）, commit, checkpoint, 版本号 C{n}
 
+**Pinned Version**:
+显式命名（`commit_sync(label=…)`）而被 retention 保留在 `keep_last` 之外的 Version；恢复和基线迁移产生的描述性 label 不会 pin。
+_Avoid_: 永久版本
+
+**Trimmed Version**:
+commit 元数据仍在版本链中，但内容因 retention 被释放的 Version；`history_list` 仍显示 `content: trimmed`，`history_verify` 将其视为预期状态，恢复/导出 fail-closed。
+_Avoid_: 已删除版本, 丢失版本
+
 **Restore**:
 把某个历史 Version 的内容复制为一个新 Version 的操作；current 只向前，历史永不回拨。
 _Avoid_: 回滚, revert, reset, 检出

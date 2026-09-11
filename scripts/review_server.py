@@ -116,7 +116,9 @@ def _review_mutation(
 
 
 def _json_bytes(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False).encode("utf-8")
+    # Stable bytes are part of idempotent HTTP replay: the first response and
+    # the persisted envelope must serialize to the same body.
+    return json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
 
 # Browser surfaces never receive store-failure internals: absolute paths,
 # Windows drive letters, or transient temp filenames embedded in StoreError
