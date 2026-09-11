@@ -653,6 +653,61 @@ def _read_phases_soft(tx_dir: Path) -> list[dict[str, Any]] | None:
 # Store
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Durable idempotency plane (independent of generation lifetime)
+# --------------------------------------------------------------------------
+
+LEDGER_LOG = "ledger.jsonl"
+
+
+def _ledger_log_path(root: Path) -> Path:
+    return root / STORE_DIR_NAME / LEDGER_LOG
+
+
+def _append_ledger_log(root: Path, operation_id: str, record: dict[str, Any]) -> None:
+    """Append one idempotency record to the store's durable log.
+
+    The record is also written beside its artifact, but that copy travels with
+    a generation — and generations are reclaimable by design (ADR 0042/0043).
+    Idempotency must not depend on a directory whose purpose is to be
+    collected, so every record is appended here as well, in the same
+    transaction that commits the pointer. Append-only, fsynced, one line per
+    operation."""
+    path = _ledger_log_path(root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {"operation_id": operation_id, **record}, ensure_ascii=False, sort_keys=True
+        ) + "\n"
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        pass  # the artifact-side copy remains as the fallback
+
+
+def _read_ledger_log(root: Path) -> dict[str, dict[str, Any]]:
+    """operation_id -> the last record appended for it."""
+    records: dict[str, dict[str, Any]] = {}
+    path = _ledger_log_path(root)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return records
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        operation_id = payload.get("operation_id")
+        if isinstance(operation_id, str):
+            records[operation_id] = payload
+    return records
+
+
 class Store:
     """One store-backed workdir: pointer, generations, transactions, Writer
     lane, recovery reserve, filesystem qualification."""
@@ -927,6 +982,9 @@ class Store:
         from .protocol import operation_ledger  # local: avoids import cycles
 
         if generation:
+            logged = _read_ledger_log(self.root).get(operation_id)
+            if logged is not None and isinstance(logged.get("envelope"), dict):
+                return logged, None
             for gen_dir in sorted(self.generations_dir.iterdir(), reverse=True):
                 record = operation_ledger.lookup_persisted(operation_id, gen_dir, directory=True)
                 if record is not None:
@@ -1667,6 +1725,7 @@ class Store:
                     # survives the generation being reclaimed (ADR 0043)
                     from .objectstore import build_tree, write_commit
 
+                    _fire("version-objects")
                     tree_result = build_tree(self.root, gen_dir, digest=digest)
                     version_record = {
                         "version": f"V{sequence}",
@@ -1684,6 +1743,7 @@ class Store:
                         "restored_from": boundary.get("restored_from"),
                         "created_at": _now_iso(),
                     }
+                    _fire("version-commit")
                     version_record["commit"] = write_commit(
                         self.root,
                         {
@@ -1801,14 +1861,20 @@ class Store:
         _fire("ledger-write")
         from .protocol import operation_ledger  # local: avoids import cycles
 
-        operation_ledger.record(
+        operation_id = (
             (envelope.get("data") or {}).get("operation_id")
-            or envelope.get("operation", "mutation"),
+            or envelope.get("operation", "mutation")
+        )
+        operation_ledger.record(
+            operation_id,
             canonical,
             envelope,
             anchor,
             directory=directory,
         )
+        # the same record goes into the store's own log, so idempotency does
+        # not depend on a generation that retention may reclaim
+        _append_ledger_log(self.root, operation_id, {"input_sha256": canonical, "envelope": envelope})
 
     def _publish_externals(
         self,
