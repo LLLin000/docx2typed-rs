@@ -122,6 +122,7 @@ try:
         head_version as store_head_version,
         history_gc as store_history_gc,
         history_list as store_history_list,
+        trimmed_versions,
         history_verify as store_history_verify,
         read_root,
         store_dir_path,
@@ -5309,6 +5310,14 @@ def history_restore(
                 f"{version} is not in this document's history; call history_list",
                 operation_id=operation_id,
             )
+        if version in trimmed_versions(workdir):
+            return _failure_result(
+                "history_restore",
+                "version-trimmed",
+                f"{version} was trimmed by retention (its content is gone on purpose); "
+                "restore a version that is still retained",
+                operation_id=operation_id,
+            )
         pooled = isinstance(record.get("tree_object"), str) and record.get("tree_object")
         source_generation = store_dir_path(workdir) / "generations" / str(record.get("generation") or "")
         if not pooled and not source_generation.is_dir():
@@ -6466,6 +6475,13 @@ def build_docx(
                     "build_docx",
                     "version-not-found",
                     f"{version} is not in this document's history; call history_list",
+                    operation_id=operation_id,
+                )
+            if version in trimmed_versions(workdir):
+                return _failure_result(
+                    "build_docx",
+                    "version-trimmed",
+                    f"{version} was trimmed by retention and can no longer be exported",
                     operation_id=operation_id,
                 )
             pooled = isinstance(record.get("tree_object"), str) and record.get("tree_object")

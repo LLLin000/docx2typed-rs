@@ -2257,6 +2257,63 @@ def state(root: str | Path) -> dict[str, Any]:
     }
 
 
+TRIM_LOG = "history-trim.jsonl"
+
+
+def _trim_log_path(root: Path) -> Path:
+    return root / STORE_DIR_NAME / TRIM_LOG
+
+
+def _append_trim_log(root: Path, versions: list[dict[str, Any]]) -> None:
+    """Record which versions retention trimmed — content gone ON PURPOSE.
+
+    Without this, verification cannot tell a deliberate trim from corruption,
+    and a lingering generation would let a restore quietly resurrect content
+    that retention decided to drop."""
+    if not versions:
+        return
+    path = _trim_log_path(root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            for record in versions:
+                handle.write(
+                    json.dumps(
+                        {
+                            "version": record.get("version"),
+                            "tree_object": record.get("tree_object"),
+                            "trimmed_at": _now_iso(),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ) + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
+
+
+def trimmed_versions(root: str | Path) -> set[str]:
+    """Version names retention has trimmed (empty when nothing was trimmed)."""
+    path = _trim_log_path(Path(root).resolve())
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    names: set[str] = set()
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload.get("version"), str):
+            names.add(payload["version"])
+    return names
+
+
 def history_verify(root: str | Path) -> dict[str, Any]:
     """Every retained version's content, still present and hash-correct?
 
@@ -2269,7 +2326,13 @@ def history_verify(root: str | Path) -> dict[str, Any]:
 
     results: list[dict[str, Any]] = []
     ok = True
+    trimmed = trimmed_versions(root_path)
     for record in _version_chain(root_path):
+        name = str(record.get("version"))
+        if name in trimmed:
+            # content dropped on purpose: reported, never counted as damage
+            results.append({"version": name, "content": "trimmed", "missing": []})
+            continue
         tree_object = record.get("tree_object")
         if isinstance(tree_object, str) and tree_object:
             report = (
@@ -2278,7 +2341,7 @@ def history_verify(root: str | Path) -> dict[str, Any]:
                 else {"ok": False, "missing": ["tree"], "checked": 0}
             )
             results.append({
-                "version": record.get("version"),
+                "version": name,
                 "content": "retained" if report["ok"] else "missing",
                 "missing": report["missing"][:5],
             })
@@ -2287,7 +2350,7 @@ def history_verify(root: str | Path) -> dict[str, Any]:
         generation = root_path / STORE_DIR_NAME / "generations" / str(record.get("generation") or "")
         present = generation.is_dir()
         results.append({
-            "version": record.get("version"),
+            "version": name,
             "content": "retained" if present else "missing",
             "missing": [] if present else ["generation"],
         })
@@ -2326,6 +2389,7 @@ def history_gc(
                     if isinstance(record.get("generation"), str):
                         keep_generations.add(record["generation"])
 
+        trimmed = [r for r in chain if r not in retained]
         reclaimable: list[str] = []
         if reclaim_generations and store.generations_dir.is_dir():
             for gen_dir in sorted(store.generations_dir.iterdir()):
@@ -2335,8 +2399,14 @@ def history_gc(
                     manifest = json.loads((gen_dir / "generation.json").read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     continue
-                tree_object = ((manifest.get("version") or {}) or {}).get("tree_object")
+                version = manifest.get("version") or {}
+                tree_object = version.get("tree_object")
+                version_name = version.get("version")
                 if isinstance(tree_object, str) and tree_object in keep_trees:
+                    reclaimable.append(gen_dir.name)
+                elif version_name in {r.get("version") for r in trimmed}:
+                    # its content was just trimmed: the generation must go too,
+                    # otherwise a restore would resurrect what retention dropped
                     reclaimable.append(gen_dir.name)
 
         report: dict[str, Any] = {
@@ -2349,6 +2419,8 @@ def history_gc(
             "swept_objects": 0,
             "freed_bytes": 0,
         }
+        _append_trim_log(root_path, trimmed)
+        report["versions_trimmed"] = [r.get("version") for r in trimmed]
         if dry_run:
             return report
         try:
