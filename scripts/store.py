@@ -200,6 +200,63 @@ def kill_at(name: str) -> None:
     set_fault(name, _Kill())
 
 
+_TIMINGS_ENV = "DOCX2TYPED_TIMINGS"
+
+
+class _MutationProfiler:
+    """Best-effort phase timings for one mutation when explicitly enabled."""
+
+    def __init__(self, operation: str, operation_id: str) -> None:
+        destination = os.environ.get(_TIMINGS_ENV)
+        self.path = Path(destination) if destination else None
+        self.operation = operation
+        self.operation_id = operation_id
+        self.started = time.perf_counter()
+        self.phases: list[dict[str, Any]] = []
+
+    @contextmanager
+    def phase(self, name: str):
+        if self.path is None:
+            yield
+            return
+        started = time.perf_counter()
+        status = "success"
+        try:
+            yield
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            self.phases.append(
+                {
+                    "name": name,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                    "status": status,
+                }
+            )
+
+    def finish(self, outcome: str, error: BaseException | None = None) -> None:
+        if self.path is None:
+            return
+        record: dict[str, Any] = {
+            "schema": "docx2typed-mutation-timings-1",
+            "operation": self.operation,
+            "operation_id": self.operation_id,
+            "outcome": outcome,
+            "duration_ms": round((time.perf_counter() - self.started) * 1000, 3),
+            "phases": self.phases,
+        }
+        if error is not None:
+            record["error"] = type(error).__name__
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError:
+            # Diagnostics must never turn a durable mutation into a failure.
+            pass
+
+
 # --------------------------------------------------------------------------
 # Durability helpers
 # --------------------------------------------------------------------------
@@ -1754,6 +1811,7 @@ class Store:
         external-published -> pointer CAS -> ledger -> materialize ->
         completed journal. Every cut point yields only old/new/needs-recovery.
         """
+        profiler = _MutationProfiler(operation, operation_id)
         with self.writer(timeout_ms=lock_timeout_ms):
             self._require_reserve()
             if self.transactions_dir.exists() and any(self.transactions_dir.iterdir()):
@@ -1793,58 +1851,63 @@ class Store:
             # The lookup hits the generation the record was written under
             # (records live in the generation the operation committed, and the
             # pointer may have advanced past it since).
-            prior, _corrupt_path = self.lookup_ledger(
-                operation_id,
-                generation=generation,
-                anchor=ledger_anchor,
-                directory=ledger_directory,
-            )
+            with profiler.phase("ledger-lookup"):
+                prior, _corrupt_path = self.lookup_ledger(
+                    operation_id,
+                    generation=generation,
+                    anchor=ledger_anchor,
+                    directory=ledger_directory,
+                )
             if prior is not None:
                 prior_envelope = prior.get("envelope")
                 if prior["input_sha256"] == canonical and isinstance(prior_envelope, dict):
+                    profiler.finish("replay")
                     return prior_envelope
                 raise StoreError(
                     "operation-id-reused",
                     f"operation_id {operation_id!r} was already used with different canonical input",
                 )
             generation_id = uuid.uuid4().hex
-            tx_dir, intent = self._begin_journal(
-                operation_id,
-                canonical,
-                expected_generation,
-                input_sha256,
-                kind,
-            )
+            with profiler.phase("journal-intent"):
+                tx_dir, intent = self._begin_journal(
+                    operation_id,
+                    canonical,
+                    expected_generation,
+                    input_sha256,
+                    kind,
+                )
             pointer_committed = False
             try:
-                if generation:
-                    gen_dir = self._copy_generation(current, generation_id)
-                    self._overlay_ingress(gen_dir)
-                    target: Path = gen_dir
-                else:
-                    gen_dir = None
-                    target = self.root
+                with profiler.phase("generation-copy"):
+                    if generation:
+                        gen_dir = self._copy_generation(current, generation_id)
+                        self._overlay_ingress(gen_dir)
+                        target: Path = gen_dir
+                    else:
+                        gen_dir = None
+                        target = self.root
                 transaction = Transaction(self, tx_dir, operation_id, generation_id)
                 if evidence_path is not None:
                     transaction.set_evidence_path(evidence_path)
-                result = run(target, transaction)
+                with profiler.phase("operation-run"):
+                    result = run(target, transaction)
                 outcome, data, kind_name, payload, diagnostics = result
                 from .protocol import result_envelope, run_evidence
-
-                evidence = run_evidence(
-                    operation,
-                    outcome,
-                    kind=kind_name,
-                    operation_id=operation_id,
-                    payload=payload,
-                )
-                envelope = result_envelope(
-                    operation,
-                    outcome,
-                    data={"operation_id": operation_id, **data},
-                    diagnostics=diagnostics,
-                    evidence=[evidence],
-                )
+                with profiler.phase("result-envelope"):
+                    evidence = run_evidence(
+                        operation,
+                        outcome,
+                        kind=kind_name,
+                        operation_id=operation_id,
+                        payload=payload,
+                    )
+                    envelope = result_envelope(
+                        operation,
+                        outcome,
+                        data={"operation_id": operation_id, **data},
+                        diagnostics=diagnostics,
+                        evidence=[evidence],
+                    )
                 externals = transaction.externals()
                 version_record: dict[str, Any] | None = None
                 if generation and transaction.save_boundary is not None:
@@ -1860,8 +1923,9 @@ class Store:
                     # survives the generation being reclaimed (ADR 0043)
                     from .objectstore import build_tree, write_commit
 
-                    _fire("version-objects")
-                    tree_result = build_tree(self.root, gen_dir, digest=digest)
+                    with profiler.phase("version-tree"):
+                        _fire("version-objects")
+                        tree_result = build_tree(self.root, gen_dir, digest=digest)
                     version_record = {
                         "version": f"V{sequence}",
                         "seq": sequence,
@@ -1879,106 +1943,118 @@ class Store:
                         "restored_from": boundary.get("restored_from"),
                         "created_at": _now_iso(),
                     }
-                    _fire("version-commit")
-                    version_record["commit"] = write_commit(
-                        self.root,
-                        {
-                            key: value
-                            for key, value in version_record.items()
-                            if key != "commit"
-                        }
-                        | {"generation": generation_id},
-                    )
+                    with profiler.phase("version-commit"):
+                        _fire("version-commit")
+                        version_record["commit"] = write_commit(
+                            self.root,
+                            {
+                                key: value
+                                for key, value in version_record.items()
+                                if key != "commit"
+                            }
+                            | {"generation": generation_id},
+                        )
                 if generation:
-                    manifest = _generation_manifest(
-                        gen_dir,
-                        generation=generation_id,
-                        parent=current,
-                        operation_id=operation_id,
-                        input_sha256=canonical,
-                        version=version_record,
-                    )
-                    _write_generation_manifest(gen_dir, manifest)
-                    _fsync_tree(gen_dir)
-                    manifest_sha = manifest["assets_sha256"]
+                    with profiler.phase("generation-manifest"):
+                        manifest = _generation_manifest(
+                            gen_dir,
+                            generation=generation_id,
+                            parent=current,
+                            operation_id=operation_id,
+                            input_sha256=canonical,
+                            version=version_record,
+                        )
+                        _write_generation_manifest(gen_dir, manifest)
+                        _fsync_tree(gen_dir)
+                        manifest_sha = manifest["assets_sha256"]
                 else:
                     manifest_sha = manifest_sha256 or canonical
-                transaction.write_evidence(evidence)
+                with profiler.phase("evidence-write"):
+                    transaction.write_evidence(evidence)
                 evidence_target = str(
                     transaction.evidence_path
                     if transaction.evidence_path is not None
                     else (gen_dir / "run.evidence.json" if gen_dir else self.root / "run.evidence.json")
                 )
                 ledger_anchor_path = ledger_anchor or (gen_dir if gen_dir else self.root)
-                prepared = _journal_record(
-                    "prepared",
-                    {
-                        "operation_id": operation_id,
-                        "generation": generation_id if generation else None,
-                        "parent": current,
-                        "input_sha256": canonical,
-                        "manifest_sha256": manifest_sha,
-                        "evidence_path": evidence_target,
-                        "evidence_sha256": semantic_sha256(evidence),
-                        "envelope": envelope,
-                        "envelope_sha256": semantic_sha256(envelope),
-                        "ledger_anchor": str(ledger_anchor_path),
-                        "ledger_directory": bool(ledger_directory),
-                        "externals": [
-                            {
-                                "target": str(ext["target"]),
-                                "staged": str(ext["staged"]),
-                                "mode": ext["mode"],
-                                "sha256": ext.get("sha256"),
-                                "backup": ext.get("backup"),
-                                "backup_sha256": ext.get("backup_sha256"),
-                            }
-                            for ext in externals
-                        ],
-                    },
-                    prev_hash=intent["record_sha256"],
-                )
-                _write_journal_record(tx_dir, prepared)
-                self._publish_externals(tx_dir, prepared, externals, operation_id)
-                committed = _journal_record(
-                    "generation-committed",
-                    {
-                        "operation_id": operation_id,
-                        "generation": generation_id if generation else None,
-                        "parent": current,
-                    },
-                    prev_hash=prepared["record_sha256"],
-                )
+                with profiler.phase("journal-prepared"):
+                    prepared = _journal_record(
+                        "prepared",
+                        {
+                            "operation_id": operation_id,
+                            "generation": generation_id if generation else None,
+                            "parent": current,
+                            "input_sha256": canonical,
+                            "manifest_sha256": manifest_sha,
+                            "evidence_path": evidence_target,
+                            "evidence_sha256": semantic_sha256(evidence),
+                            "envelope": envelope,
+                            "envelope_sha256": semantic_sha256(envelope),
+                            "ledger_anchor": str(ledger_anchor_path),
+                            "ledger_directory": bool(ledger_directory),
+                            "externals": [
+                                {
+                                    "target": str(ext["target"]),
+                                    "staged": str(ext["staged"]),
+                                    "mode": ext["mode"],
+                                    "sha256": ext.get("sha256"),
+                                    "backup": ext.get("backup"),
+                                    "backup_sha256": ext.get("backup_sha256"),
+                                }
+                                for ext in externals
+                            ],
+                        },
+                        prev_hash=intent["record_sha256"],
+                    )
+                    _write_journal_record(tx_dir, prepared)
+                with profiler.phase("external-publish"):
+                    self._publish_externals(tx_dir, prepared, externals, operation_id)
+                with profiler.phase("pointer-commit"):
+                    committed = _journal_record(
+                        "generation-committed",
+                        {
+                            "operation_id": operation_id,
+                            "generation": generation_id if generation else None,
+                            "parent": current,
+                        },
+                        prev_hash=prepared["record_sha256"],
+                    )
+                    if generation:
+                        self._commit_pointer(generation_id, operation_id, manifest_sha, version_record)
+                    pointer_committed = generation
+                    _write_journal_record(tx_dir, committed)
+                with profiler.phase("ledger-write"):
+                    self._write_ledger_at(envelope, canonical, ledger_anchor_path, ledger_directory)
                 if generation:
-                    self._commit_pointer(generation_id, operation_id, manifest_sha, version_record)
-                pointer_committed = generation
-                _write_journal_record(tx_dir, committed)
-                self._write_ledger_at(envelope, canonical, ledger_anchor_path, ledger_directory)
-                if generation:
-                    self._materialize_root(gen_dir)
-                completed = _journal_record(
-                    "completed",
-                    {
-                        "operation_id": operation_id,
-                        "generation": generation_id if generation else None,
-                        "parent": current,
-                        "outcome": outcome,
-                        "input_sha256": canonical,
-                        "envelope": envelope,
-                    },
-                    prev_hash=committed["record_sha256"],
-                )
-                _write_journal_record(tx_dir, completed)
-                shutil.rmtree(tx_dir, ignore_errors=True)
-                shutil.rmtree(self.staging_dir / operation_id, ignore_errors=True)
-                try:
-                    self.staging_dir.rmdir()
-                except OSError:
-                    pass
+                    with profiler.phase("materialize"):
+                        self._materialize_root(gen_dir)
+                with profiler.phase("completion"):
+                    completed = _journal_record(
+                        "completed",
+                        {
+                            "operation_id": operation_id,
+                            "generation": generation_id if generation else None,
+                            "parent": current,
+                            "outcome": outcome,
+                            "input_sha256": canonical,
+                            "envelope": envelope,
+                        },
+                        prev_hash=committed["record_sha256"],
+                    )
+                    _write_journal_record(tx_dir, completed)
+                    shutil.rmtree(tx_dir, ignore_errors=True)
+                    shutil.rmtree(self.staging_dir / operation_id, ignore_errors=True)
+                    try:
+                        self.staging_dir.rmdir()
+                    except OSError:
+                        pass
+                profiler.finish(outcome)
                 return envelope
             except _Kill:
+                profiler.finish("killed")
                 raise
             except BaseException as exc:
+                profiler.finish("failure", exc)
                 self._abort(tx_dir, operation_id, generation_id, exc, current, pointer_committed)
                 if isinstance(exc, OSError) and exc.errno == 28:
                     raise ReserveDepleted(

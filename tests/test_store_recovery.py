@@ -113,6 +113,28 @@ def _mutate(store: Store, *, op: str | None = None, run=None, expect: type | Non
         return exc
 
 
+def test_mutation_timings_are_opt_in(tmp_path, monkeypatch):
+    workdir = _extract(tmp_path)
+    timings = tmp_path / "timings.jsonl"
+    monkeypatch.setenv("DOCX2TYPED_TIMINGS", str(timings))
+
+    envelope = _mutate(Store.open(workdir))
+
+    assert envelope["outcome"] == "success"
+    row = json.loads(timings.read_text(encoding="utf-8").strip())
+    assert row["schema"] == "docx2typed-mutation-timings-1"
+    assert row["operation"] == "edit"
+    assert {
+        "generation-copy",
+        "operation-run",
+        "generation-manifest",
+        "pointer-commit",
+        "ledger-write",
+        "materialize",
+        "completion",
+    } <= {phase["name"] for phase in row["phases"]}
+
+
 def _free_port() -> int:
     import socket
 
