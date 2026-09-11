@@ -86,6 +86,11 @@ PHASE_ORDER = (
 # mutations overlay them into the generation copy before running.
 INGRESS_FILES = ("typed.md", "edit.md")
 
+# Assets that determine the built document. Deliberately NOT the whole
+# generation: evidence, review state, derived views and transaction metadata
+# change constantly and must not read as a content change (ADR 0044).
+CANONICAL_ASSETS = ("typed.md", "format.json", "styles.json", "_template.docx")
+
 # Lock outcomes are stable diagnostic codes (public contract).
 WRITER_BUSY = "writer-busy"
 WRITER_TIMEOUT = "writer-timeout"
@@ -477,14 +482,38 @@ def _probe_or_reuse(store_dir: Path) -> dict[str, Any]:
 # Pointer, generation manifest, journal records
 # --------------------------------------------------------------------------
 
-def _pointer_payload(generation: str, operation_id: str | None, manifest_sha256: str) -> dict[str, Any]:
-    return {
+VERSION_POINTER_FIELDS = ("head_version", "head_version_generation", "head_tree", "version_seq")
+
+
+def _pointer_payload(
+    generation: str,
+    operation_id: str | None,
+    manifest_sha256: str,
+    *,
+    previous: dict[str, Any] | None = None,
+    version: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Pointer payload = HEAD: the current generation plus the version HEAD
+    names. A plain mutation carries the version fields forward (canonical may
+    drift ahead of HEAD — that is `version dirty`, ADR 0044); only a save
+    boundary replaces them."""
+    payload = {
         "schema": POINTER_SCHEMA,
         "generation": generation,
         "operation_id": operation_id,
         "manifest_sha256": manifest_sha256,
         "written_at": _now_iso(),
     }
+    for field in VERSION_POINTER_FIELDS:
+        carried = (previous or {}).get(field)
+        if carried is not None:
+            payload[field] = carried
+    if version is not None:
+        payload["head_version"] = version["version"]
+        payload["head_version_generation"] = generation
+        payload["head_tree"] = version["head_tree"]
+        payload["version_seq"] = version["seq"]
+    return payload
 
 
 def _read_pointer(root: Path) -> dict[str, Any] | None:
@@ -509,6 +538,7 @@ def _generation_manifest(
     parent: str | None,
     operation_id: str,
     input_sha256: str,
+    version: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     assets = []
     for path in _walk_files(gen_dir):
@@ -517,7 +547,7 @@ def _generation_manifest(
             continue
         assets.append({"path": rel, "bytes": path.stat().st_size, "sha256": file_sha256(path)})
     assets_sha256 = semantic_sha256(assets)
-    return {
+    manifest = {
         "schema": GENERATION_MANIFEST_SCHEMA,
         "generation": generation,
         "parent": parent,
@@ -527,6 +557,9 @@ def _generation_manifest(
         "assets_sha256": assets_sha256,
         "created_at": _now_iso(),
     }
+    if version is not None:
+        manifest["version"] = version
+    return manifest
 
 
 def _write_generation_manifest(gen_dir: Path, manifest: dict[str, Any]) -> None:
@@ -1044,8 +1077,15 @@ class Store:
         generation: str,
         operation_id: str,
         manifest_sha256: str,
+        version: dict[str, Any] | None = None,
     ) -> None:
-        pointer = _pointer_payload(generation, operation_id, manifest_sha256)
+        pointer = _pointer_payload(
+            generation,
+            operation_id,
+            manifest_sha256,
+            previous=_read_pointer(self.root),
+            version=version,
+        )
         _write_durable(
             self.root / POINTER_FILE,
             _canonical_bytes(pointer) + b"\n",
@@ -1437,11 +1477,20 @@ class Store:
 
     def _gc_abandoned(self, result: dict[str, Any]) -> None:
         """Delete abandoned temp generations and staging not referenced by the
-        pointer or any transaction journal. No speculative GC beyond that."""
+        pointer, the version chain, or any transaction journal. No speculative
+        GC beyond that."""
         referenced: set[str] = set()
         pointer = _read_pointer(self.root)
         if pointer and pointer.get("generation"):
             referenced.add(pointer["generation"])
+        # Every generation the version chain names is user history: dropping one
+        # would turn a listed version into an unrestorable one (ADR 0042/0043).
+        for record in _version_chain(self.root):
+            generation = record.get("generation")
+            if isinstance(generation, str):
+                referenced.add(generation)
+            else:
+                break
         if self.transactions_dir.is_dir():
             for tx_dir in self.transactions_dir.iterdir():
                 if not tx_dir.is_dir():
@@ -1593,6 +1642,25 @@ class Store:
                     evidence=[evidence],
                 )
                 externals = transaction.externals()
+                version_record: dict[str, Any] | None = None
+                if generation and transaction.save_boundary is not None:
+                    # The save boundary turns this mutation into a user Version
+                    # (ADR 0044). The tree digest covers the canonical assets only,
+                    # so evidence or derived views changing never invents a version.
+                    boundary = transaction.save_boundary
+                    predecessor = _read_pointer(self.root) or {}
+                    sequence = int(predecessor.get("version_seq") or 0) + 1
+                    version_record = {
+                        "version": f"V{sequence}",
+                        "seq": sequence,
+                        "parent_version": predecessor.get("head_version"),
+                        "parent_generation": predecessor.get("head_version_generation"),
+                        "head_tree": _canonical_tree_digest(gen_dir),
+                        "origin": boundary.get("origin") or "commit_sync",
+                        "label": boundary.get("label"),
+                        "restored_from": boundary.get("restored_from"),
+                        "created_at": _now_iso(),
+                    }
                 if generation:
                     manifest = _generation_manifest(
                         gen_dir,
@@ -1600,6 +1668,7 @@ class Store:
                         parent=current,
                         operation_id=operation_id,
                         input_sha256=canonical,
+                        version=version_record,
                     )
                     _write_generation_manifest(gen_dir, manifest)
                     _fsync_tree(gen_dir)
@@ -1653,7 +1722,7 @@ class Store:
                     prev_hash=prepared["record_sha256"],
                 )
                 if generation:
-                    self._commit_pointer(generation_id, operation_id, manifest_sha)
+                    self._commit_pointer(generation_id, operation_id, manifest_sha, version_record)
                 pointer_committed = generation
                 _write_journal_record(tx_dir, committed)
                 self._write_ledger_at(envelope, canonical, ledger_anchor_path, ledger_directory)
@@ -1830,6 +1899,7 @@ class Transaction:
         self.generation = generation
         self._externals: list[dict[str, Any]] = []
         self._evidence_path: Path | None = None
+        self._save_boundary: dict[str, Any] | None = None
 
     def staging(self, name: str) -> Path:
         """A prepared staging path for an external output (parent created)."""
@@ -1856,6 +1926,28 @@ class Transaction:
 
     def set_evidence_path(self, path: Path) -> None:
         self._evidence_path = Path(path)
+
+    def mark_save_boundary(
+        self,
+        *,
+        origin: str,
+        label: str | None = None,
+        restored_from: str | None = None,
+    ) -> None:
+        """Declare that THIS mutation creates a user Version (ADR 0044).
+
+        Version intent belongs to the Store transaction, not to the collaboration
+        layer: publishing a snapshot happens many times per task, saving a version
+        happens once. Only the save boundary sets it; the default is no version."""
+        self._save_boundary = {
+            "origin": origin,
+            "label": label,
+            "restored_from": restored_from,
+        }
+
+    @property
+    def save_boundary(self) -> dict[str, Any] | None:
+        return self._save_boundary
 
     @property
     def evidence_path(self) -> Path | None:
@@ -1884,6 +1976,100 @@ def has_store(root: str | Path) -> bool:
 
 def store_dir_path(root: str | Path) -> Path:
     return Path(root) / STORE_DIR_NAME
+
+
+def _canonical_tree_digest(gen_dir: Path) -> str:
+    """Digest of the authoritative inputs of one generation.
+
+    This is the pre-Merkle stand-in for a version's tree root (ADR 0043): the
+    same semantic content, so `version dirty` keeps its meaning when the object
+    graph arrives."""
+    assets = {
+        name: (file_sha256(gen_dir / name) if (gen_dir / name).is_file() else None)
+        for name in CANONICAL_ASSETS
+    }
+    return semantic_sha256(assets)
+
+
+def canonical_tree_digest(root: str | Path) -> str:
+    """Tree digest of the CURRENT generation of ``root`` (read-only)."""
+    root_path = Path(root).resolve()
+    if not has_store(root_path):
+        return _canonical_tree_digest(root_path)
+    pointer = _read_pointer(root_path) or {}
+    gen_dir = root_path / STORE_DIR_NAME / "generations" / str(pointer.get("generation") or "")
+    return _canonical_tree_digest(gen_dir if gen_dir.is_dir() else root_path)
+
+
+def head_version(root: str | Path) -> dict[str, Any]:
+    """The version HEAD names, plus whether canonical still matches it."""
+    root_path = Path(root).resolve()
+    pointer = _read_pointer(root_path) or {}
+    current = canonical_tree_digest(root_path)
+    recorded = pointer.get("head_tree")
+    return {
+        "version": pointer.get("head_version"),
+        "generation": pointer.get("head_version_generation"),
+        "seq": pointer.get("version_seq"),
+        "tree": recorded,
+        "canonical_tree": current,
+        # no recorded tree yet == the document has never been saved: it counts
+        # as dirty so the first commit creates V1
+        "dirty": current != recorded,
+    }
+
+
+def _version_chain(root: Path) -> list[dict[str, Any]]:
+    """Version records from HEAD backwards, newest first (the commit graph)."""
+    pointer = _read_pointer(root) or {}
+    generations_dir = root / STORE_DIR_NAME / "generations"
+    chain: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    generation = pointer.get("head_version_generation")
+    while isinstance(generation, str) and generation and generation not in seen:
+        seen.add(generation)
+        manifest_path = generations_dir / generation / "generation.json"
+        if not manifest_path.is_file():
+            break
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            break
+        record = dict(manifest.get("version") or {})
+        if not record:
+            break
+        record["generation"] = generation
+        record["content"] = "retained"
+        chain.append(record)
+        generation = record.get("parent_generation")
+    return chain
+
+
+def history_list(root: str | Path, *, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    """Walk the version chain from HEAD — the commit graph is the history."""
+    root_path = Path(root).resolve()
+    chain = _version_chain(root_path)
+    head = head_version(root_path)
+    window = chain[max(0, offset): max(0, offset) + max(1, limit)]
+    return {
+        "schema": "docx2typed-history-1",
+        "current": head["version"],
+        "current_tree": head["tree"],
+        "version_dirty": head["dirty"],
+        "total": len(chain),
+        "retained": sum(1 for item in chain if item.get("content") == "retained"),
+        "trimmed": sum(1 for item in chain if item.get("content") == "trimmed"),
+        "offset": max(0, offset),
+        "versions": window,
+    }
+
+
+def find_version(root: str | Path, version: str) -> dict[str, Any] | None:
+    """One version record by name (``V12``), or None."""
+    for record in _version_chain(Path(root).resolve()):
+        if record.get("version") == version:
+            return record
+    return None
 
 
 def read_root(root: str | Path) -> Path:

@@ -1532,52 +1532,81 @@
     },
     "workdir_open": {
       "input": {
-        "type": "object",
-        "required": [
-          "workdir"
-        ],
         "properties": {
           "workdir": {
             "type": "string"
           },
           "author": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "track": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "contract_ranges": {
-            "type": [
-              "object",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "additionalProperties": {
+                    "type": "integer"
+                  },
+                  "type": "object"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "supported_features": {
-            "type": [
-              "array",
-              "null"
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "items": {
-              "type": "string"
-            }
+            "default": null
           },
           "required_features": {
-            "type": [
-              "array",
-              "null"
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "items": {
-              "type": "string"
-            }
+            "default": null
           }
         },
-        "additionalProperties": false
+        "required": [
+          "workdir"
+        ]
       },
       "output": {
         "$ref": "docx2typed-result-1"
@@ -1712,17 +1741,31 @@
     },
     "commit_sync": {
       "input": {
-        "type": "object",
-        "required": [],
         "properties": {
           "operation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
-        "additionalProperties": false
+        "required": []
       },
       "output": {
         "$ref": "docx2typed-result-1"
@@ -2103,23 +2146,42 @@
     },
     "build_docx": {
       "input": {
-        "type": "object",
-        "required": [],
         "properties": {
           "output": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "operation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
-        "additionalProperties": false
+        "required": []
       },
       "output": {
         "$ref": "docx2typed-result-1"
@@ -2170,9 +2232,8 @@
     },
     "workdir_status": {
       "input": {
-        "type": "object",
         "properties": {},
-        "additionalProperties": false
+        "required": []
       },
       "output": {
         "type": "string"
@@ -2655,6 +2716,58 @@
       },
       "output": {
         "type": "string"
+      }
+    },
+    "history_list": {
+      "input": {
+        "properties": {
+          "limit": {
+            "default": 20,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
+        "required": []
+      }
+    },
+    "history_restore": {
+      "input": {
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "paragraphs": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "version"
+        ]
       }
     }
   }

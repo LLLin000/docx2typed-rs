@@ -1,6 +1,14 @@
 # PRD: Version timeline (persistent workspace, savepoints, restore)
 
-Status: draft · 2026-09-11 · branch `feature/agent-editor-facade`
+Status: **P0 + P1 implemented** · 2026-09-11 · branch `feature/agent-editor-facade`
+
+Landed: the save boundary (`commit_sync` is the only place a version is
+created), `version dirty` with its export gate, `history_list`,
+`history_restore` (whole version and the guarded cherry-pick), and
+`build_docx(version=…)`. Storage is still the pre-P2 generation layout with
+the version chain as the retention root; the object graph is P2.
+Acceptance: `tests/test_version_timeline.py` (C1–C8) plus the interface
+suite; both green.
 
 ## Problem Statement
 

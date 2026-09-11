@@ -31,7 +31,9 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import shutil
 import sys
+import tempfile
 from difflib import SequenceMatcher
 import re
 import threading
@@ -110,7 +112,18 @@ try:
         semantic_sha256,
         typed_path,
     )
-    from .store import Store, StoreError, has_store, read_root
+    from .store import (
+        CANONICAL_ASSETS,
+        Store,
+        StoreError,
+        canonical_tree_digest,
+        find_version,
+        has_store,
+        head_version as store_head_version,
+        history_list as store_history_list,
+        read_root,
+        store_dir_path,
+    )
 except ImportError:  # direct script execution has no package context.
     # Running ``python scripts/mcp_server.py`` directly must work for debugging:
     # put this directory on sys.path so the flat sibling modules import.
@@ -2595,11 +2608,39 @@ def _workdir_open_result(
 
 @mcp.tool()
 def workdir_status() -> str:
-    """Freshness state of the opened workdir: clean, dirty, stale-clean, or conflict."""
+    """Freshness of the opened workdir plus the version HEAD names.
+
+    ``draft_dirty`` is the projection drifting from canonical;
+    ``version.dirty`` is canonical drifting from the saved version. They are
+    different facts and both are reported (ADR 0044)."""
     with session.lock:
         workdir = session.require()
         state = classify_edit_state(workdir)
-        return _json({"state": state["state"], "edit_body_sha256": state["edit_body_sha256"]})
+        head = store_head_version(workdir)
+        history = store_history_list(workdir, limit=2)
+        previous = next(
+            (item.get("version") for item in history["versions"] if item.get("version") != head["version"]),
+            None,
+        )
+        return _json(
+            {
+                "state": state["state"],
+                "edit_body_sha256": state["edit_body_sha256"],
+                "draft_dirty": state["state"] in {"dirty", "conflict"},
+                "version": {
+                    "current": head["version"],
+                    "previous": previous,
+                    "seq": head["seq"],
+                    "tree": head["tree"],
+                    "dirty": head["dirty"],
+                },
+                "versions": {
+                    "total": history["total"],
+                    "retained": history["retained"],
+                    "trimmed": history["trimmed"],
+                },
+            }
+        )
 
 
 @mcp.tool()
@@ -4970,6 +5011,154 @@ def _probe_commit_buildability(workdir: Path) -> None:
         shutil.rmtree(scratch_root, ignore_errors=True)
 
 
+def _materialize_version(generation_dir: Path, destination: Path) -> None:
+    """Copy a version's stored state into a plain workdir (for exporting or
+    verifying it) without touching the live workdir or its store."""
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    for path in sorted(generation_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(generation_dir).as_posix()
+        if rel == "generation.json" or rel.startswith(".docx2typed-store/"):
+            continue
+        target = destination / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+
+
+def _paragraph_records(workdir: Path) -> dict[str, dict]:
+    """format.json's paragraph records keyed by id."""
+    try:
+        data = json.loads((workdir / "format.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(r.get("id")): r for r in (data.get("paragraphs") or []) if isinstance(r, dict)}
+
+
+def _cherry_pick_guard(source: Path, target: Path, paragraph_ids: list[str]) -> str | None:
+    """Why a selective restore is refused, or None when it is dependency-free.
+
+    A paragraph is not self-contained: its format record carries ``token_ids``
+    into a GLOBAL token table (revision open/close pairs, comment anchors,
+    rpr-change, ranges — a real paragraph references a dozen or more), so
+    swapping one across versions can dangle OOXML bytes or split an anchor pair.
+    v1 therefore only moves paragraphs that reference no tokens at all
+    (ADR 0045); anything else is refused by name, never approximated."""
+    source_records, current_records = _paragraph_records(source), _paragraph_records(target)
+    problems: list[str] = []
+    for paragraph_id in sorted(set(paragraph_ids)):
+        old, new = source_records.get(paragraph_id), current_records.get(paragraph_id)
+        if old is None or new is None:
+            problems.append(f"{paragraph_id} is missing from one of the two states")
+            continue
+        for label, record in (("the version", old), ("the current state", new)):
+            tokens = record.get("token_ids") or []
+            if tokens:
+                names = ", ".join(str(item[0]) for item in tokens[:4])
+                problems.append(f"{paragraph_id} references {len(tokens)} token(s) in {label} ({names}…)")
+    if not problems:
+        return None
+    return (
+        "selective restore moves dependency-free paragraphs only: "
+        + "; ".join(problems)
+        + ". Restore the whole version, or patch the paragraph explicitly with its target text."
+    )
+
+
+def _apply_cherry_pick(source: Path, target: Path, paragraph_ids: list[str]) -> list[str]:
+    """Splice the selected paragraphs (text AND format record) from a version
+    into the current canonical state. Returns the ids actually replaced."""
+    from .typed_core import parse_typed, serialize_typed
+
+    chosen = set(paragraph_ids)
+    source_document = parse_typed((source / "typed.md").read_text(encoding="utf-8"))
+    target_document = parse_typed((target / "typed.md").read_text(encoding="utf-8"))
+    source_paragraphs = {p.paragraph_id: p for p in source_document.paragraphs}
+    replaced: list[str] = []
+    for index, paragraph in enumerate(target_document.paragraphs):
+        if paragraph.paragraph_id in chosen and paragraph.paragraph_id in source_paragraphs:
+            target_document.paragraphs[index] = source_paragraphs[paragraph.paragraph_id]
+            replaced.append(paragraph.paragraph_id)
+    missing = sorted(chosen - set(replaced))
+    if missing:
+        raise ToolError("version-content-missing", f"{', '.join(missing)} not found in the restored version")
+    atomic_write_text(target / "typed.md", serialize_typed(target_document))
+
+    source_records = _paragraph_records(source)
+    format_path = target / "format.json"
+    format_data = json.loads(format_path.read_text(encoding="utf-8"))
+    for record in format_data.get("paragraphs") or []:
+        record_id = record.get("id")
+        source_record = source_records.get(record_id) if record_id in chosen else None
+        if source_record is not None:
+            # take the version's record wholesale: text and the record that
+            # describes it must move together (they are one paragraph state)
+            record.clear()
+            record.update(source_record)
+    atomic_write_text(
+        format_path, json.dumps(format_data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    )
+    return sorted(replaced)
+
+
+def _recorded_assets(generation_dir: Path) -> dict[str, str]:
+    """path -> sha256 as recorded in a generation manifest ({} if unreadable)."""
+    try:
+        manifest = json.loads((generation_dir / "generation.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        str(entry.get("path")): str(entry.get("sha256"))
+        for entry in (manifest.get("assets") or [])
+        if isinstance(entry, dict)
+    }
+
+
+def _changed_paragraph_texts(left: Path, right: Path) -> list[str]:
+    """Paragraph ids whose visible text differs between two canonical states
+    (used for a version's change summary). Read-only; unreadable sides compare
+    as "no information" rather than raising."""
+    from .typed_core import parse_typed, visible_text
+
+    def texts(path: Path) -> dict[str, str]:
+        try:
+            document = parse_typed(path.read_text(encoding="utf-8"))
+        except (OSError, Exception):  # noqa: BLE001 - a summary never blocks a save
+            return {}
+        return {p.paragraph_id: visible_text(p.nodes) for p in document.paragraphs}
+
+    before, after = texts(left), texts(right)
+    return sorted(
+        pid for pid in set(before) | set(after) if before.get(pid) != after.get(pid)
+    )
+
+
+def _commit_decision(workdir: Path) -> dict[str, Any]:
+    """What a save would do, decided before any generation is created.
+
+    Three independent facts (ADR 0044): the draft may differ from canonical
+    (`draft dirty`), canonical may differ from the version HEAD names
+    (`version dirty`), and the collaboration ledger may be behind the files
+    (`publish pending`). Only when all three are false is a save a true no-op.
+    """
+    state = classify_edit_state(workdir)
+    head = store_head_version(workdir)
+    collab = document_state_readonly(workdir)
+    draft_dirty = state["state"] in {"dirty", "conflict"}
+    version_dirty = bool(head["dirty"])
+    publish_pending = not bool(collab.get("current_matches_filesystem"))
+    return {
+        "draft_dirty": draft_dirty,
+        "version_dirty": version_dirty,
+        "publish_pending": publish_pending,
+        "noop": not (draft_dirty or version_dirty or publish_pending),
+        "head": head,
+        "draft_state": state["state"],
+    }
+
+
 def _commit_sync_impl(
     workdir: Path,
     *,
@@ -5005,23 +5194,225 @@ def _commit_sync_impl(
 
 
 @mcp.tool()
-def commit_sync(operation_id: str | None = None) -> CallToolResult:
-    """Apply the draft to the canonical typed AST and publish one CAS snapshot.
+def history_list(limit: int = 20, offset: int = 0) -> str:
+    """The version timeline: versions from HEAD backwards, newest first.
 
-    Mutating: ``operation_id`` may be omitted (the server generates a fresh
-    id). Identical retries replay the original result; changed input or a
-    reused id from ANY earlier call (success or failure) fails
-    operation-id-reused."""
+    The history is the version chain itself (each version names its parent), so
+    this needs no index file. ``content`` says whether a version's content is
+    still retained or has been trimmed by retention; a trimmed version still
+    appears (its metadata is kept) but can no longer be restored."""
+    with session.lock:
+        workdir = session.require()
+        history = store_history_list(workdir, limit=limit, offset=offset)
+        head = store_head_version(workdir)
+        history["draft_dirty"] = classify_edit_state(workdir)["state"] in {"dirty", "conflict"}
+        history["version_dirty"] = bool(head["dirty"])
+        return _json(history)
+
+
+@mcp.tool()
+def history_restore(
+    version: str,
+    paragraphs: list[str] | None = None,
+    operation_id: str | None = None,
+) -> CallToolResult:
+    """Restore an earlier version by copying its state FORWARD into a new version.
+
+    History never rewinds (ADR 0039): the restore creates a NEW version whose
+    content comes from ``version``, and every version in between stays listed
+    and restorable. The restored state is verified against the hashes recorded
+    with that version, and the result is published like any other canonical
+    write, so the caller's next ``commit_sync`` sees a consistent workspace.
+
+    ``paragraphs=[...]`` is the guarded selective form (ADR 0045): it moves only
+    paragraphs that reference no tokens in either state, and refuses the rest
+    with ``partial-restore-needs-dependent-state`` naming what it would need —
+    a paragraph is not self-contained (its format record points into a global
+    token table), so a bare swap could dangle revision or anchor bytes.
+
+    Refused when: the version is unknown (``version-not-found``), its content
+    has been trimmed (``version-trimmed``), a recorded hash does not match
+    (``version-content-missing``), the draft has unsaved edits
+    (``restore-draft-dirty``), or the selection is coupled
+    (``partial-restore-needs-dependent-state``)."""
+    with session.lock:
+        if session.workdir is None:
+            return _failure_result("history_restore", "workdir-not-open", "no workdir open; call workdir_open first", operation_id=operation_id)
+        workdir = session.workdir
+        record = find_version(workdir, version)
+        if record is None:
+            return _failure_result(
+                "history_restore",
+                "version-not-found",
+                f"{version} is not in this document's history; call history_list",
+                operation_id=operation_id,
+            )
+        source_generation = store_dir_path(workdir) / "generations" / str(record.get("generation") or "")
+        if not source_generation.is_dir():
+            return _failure_result(
+                "history_restore",
+                "version-trimmed",
+                f"{version} content has been trimmed by retention and can no longer be restored",
+                operation_id=operation_id,
+            )
+        draft = classify_edit_state(workdir)
+        if draft["state"] in {"dirty", "conflict"}:
+            return _failure_result(
+                "history_restore",
+                "restore-draft-dirty",
+                "the draft has unsaved edits; commit_sync or revert them before restoring, "
+                "otherwise the restore would silently discard them",
+                operation_id=operation_id,
+            )
+        if paragraphs is not None and not paragraphs:
+            return _failure_result(
+                "history_restore",
+                "restore-empty-selection",
+                "paragraphs must name at least one paragraph; omit it to restore the whole version",
+                operation_id=operation_id,
+            )
+        selection = sorted(set(paragraphs)) if paragraphs else None
+        before_root = read_root(workdir)
+        head_tree_before = store_head_version(workdir)["tree"]
+        manifest_before = _workdir_manifest_sha256(workdir)
+
+        def run(target, tx=None):
+            recorded = _recorded_assets(source_generation)
+            for name in CANONICAL_ASSETS:
+                origin = source_generation / name
+                if not origin.is_file():
+                    raise ToolError("version-content-missing", f"{version} has no recorded {name}")
+                expected = recorded.get(name)
+                if expected is not None and file_sha256(origin) != expected:
+                    raise ToolError(
+                        "version-content-missing",
+                        f"{version} content for {name} does not match the hash recorded with it",
+                    )
+                shutil.copyfile(origin, target / name)
+            picked: list[str] = []
+            if selection is not None:
+                # selective restore: start from the CURRENT state and move only
+                # the dependency-free paragraphs out of the version, so the rest
+                # of the document keeps every later change
+                current_root = read_root(workdir)
+                shutil.copyfile(current_root / "typed.md", target / "typed.md")
+                shutil.copyfile(current_root / "format.json", target / "format.json")
+                refusal = _cherry_pick_guard(source_generation, target, selection)
+                if refusal is not None:
+                    raise ToolError("partial-restore-needs-dependent-state", refusal)
+                picked = _apply_cherry_pick(source_generation, target, selection)
+            # the projection and its sidecar are a hash-bound pair: regenerate
+            # them from the restored canonical state instead of copying half a
+            # binding (copying the pair raw fails as edit-header-tampered)
+            for name in ("edit.md", "edit.state.json"):
+                (target / name).unlink(missing_ok=True)
+            refresh_edit_projection(target, init=True)
+            classify_edit_state(target)
+            validate_workdir(target)
+            changed = _changed_paragraph_texts(before_root / "typed.md", target / "typed.md")
+            unchanged = canonical_tree_digest(target) == head_tree_before
+            if not unchanged:
+                collaboration = document_state(target)
+                publish_current(
+                    target,
+                    expected_parent_snapshot=collaboration["current_snapshot"]["id"],
+                    origin="cherry-pick" if selection is not None else "restore",
+                    restored_from=version,
+                    changed_paragraph_ids=changed,
+                )
+            if tx is not None and not unchanged:
+                picked_text = ", ".join(picked)
+                label = f"cherry-pick {version}: {picked_text}" if picked else f"restore {version}"
+                tx.mark_save_boundary(
+                    origin="cherry-pick" if selection is not None else "restore",
+                    restored_from=version,
+                    label=label,
+                )
+            payload = {
+                **base_evidence_payload(),
+                "inputs": {"workdir": {"manifest_sha256": manifest_before}},
+                "outputs": {"workdir": {"manifest_sha256": _workdir_manifest_sha256(target)}},
+                "checks": [{"name": "history-restore", "status": "pass", "restored_from": version}],
+            }
+            return (
+                "success",
+                {
+                    "restored_from": version,
+                    "cherry_picked": picked or None,
+                    "changed_paragraph_ids": changed,
+                    "noop": unchanged,
+                    "state": "clean",
+                },
+                "mutation",
+                payload,
+                [],
+            )
+
+        return _mutation_tool(
+            operation_id,
+            "history_restore",
+            {"workdir": str(workdir), "version": version, "paragraphs": selection},
+            workdir,
+            directory=True,
+            evidence_path=workdir / "run.evidence.json",
+            run=run,
+            store_workdir=workdir,
+            require_agent_preflight=True,
+        )
+
+
+@mcp.tool()
+def commit_sync(operation_id: str | None = None, label: str | None = None) -> CallToolResult:
+    """Save the current document state — the save boundary that creates a Version.
+
+    Two independent facts decide what happens (ADR 0044):
+      - ``draft_dirty``  — edit.md differs from canonical -> the draft is synced;
+      - ``version_dirty`` — canonical differs from the tree HEAD names -> a new
+        Version is created (this is why a clean draft can still save a version,
+        e.g. after format/decision operations);
+    neither, and the collaboration ledger already matches -> a true no-op: no
+    generation, no Version, nothing written.
+
+    ``label`` names the version (a labelled version is retained beyond the
+    count limit). Mutating: ``operation_id`` may be omitted (the server
+    generates a fresh id); identical retries replay the original result."""
     with session.lock:
         if session.workdir is None:
             return _failure_result("commit_sync", "workdir-not-open", "no workdir open; call workdir_open first", operation_id=operation_id)
         workdir = session.workdir
+        decision = _commit_decision(workdir)
+        if decision["noop"] and operation_id is None:
+            # nothing to write: no draft, no version pending, ledger current
+            history = store_history_list(workdir, limit=1)
+            envelope = result_envelope(
+                "commit_sync",
+                "success",
+                data={
+                    "noop": True,
+                    "reason": "already saved: draft clean, no unsaved canonical change",
+                    "changed_paragraph_ids": [],
+                    "version": decision["head"]["version"],
+                    "version_dirty": False,
+                    "draft_dirty": False,
+                    "current_snapshot": document_state_readonly(workdir).get("current_snapshot"),
+                },
+            )
+            return mcp_result(envelope)
         manifest_before = _workdir_manifest_sha256(workdir)
+        head_tree_before = decision["head"]["tree"]
 
         def run(target, tx=None):
             revision_before = classify_edit_state(target)["edit_body_sha256"]
             _probe_commit_buildability(target)
             result = _commit_sync_impl(target, origin="agent", agent_gate=False)
+            creates_version = canonical_tree_digest(target) != head_tree_before
+            if creates_version and tx is not None:
+                tx.mark_save_boundary(origin="commit_sync", label=label)
+            result["version"] = {
+                "created": creates_version,
+                "previous": decision["head"]["version"],
+                "label": label if creates_version else None,
+            }
             result["document_state"] = {
                 "revision_before": revision_before,
                 "revision_after": classify_edit_state(target)["edit_body_sha256"],
@@ -5913,8 +6304,18 @@ def revert(operation_id: str | None = None) -> CallToolResult:
 
 
 @mcp.tool()
-def build_docx(output: str | None = None, operation_id: str | None = None) -> CallToolResult:
-    """Build the DOCX from the committed workdir (requires clean state).
+def build_docx(
+    output: str | None = None,
+    operation_id: str | None = None,
+    version: str | None = None,
+ ) -> CallToolResult:
+    """Export a DOCX from the saved state — never from an unnamed one.
+
+    Without ``version`` this exports the current state and REQUIRES it to be
+    saved: if canonical has drifted from the version HEAD names, the build is
+    refused with ``version-save-required`` (an export that no version
+    describes cannot be traced, ADR 0044). ``version="V12"`` exports that
+    historical version without touching HEAD and without restoring it.
 
     Mutating: ``operation_id`` may be omitted (the server generates a fresh
     id). Identical retries replay the original result; changed input or a
@@ -5924,6 +6325,26 @@ def build_docx(output: str | None = None, operation_id: str | None = None) -> Ca
         if session.workdir is None:
             return _failure_result("build_docx", "workdir-not-open", "no workdir open; call workdir_open first", operation_id=operation_id)
         workdir = session.workdir
+        exported_version: str | None = None
+        version_source: Path | None = None
+        if version is not None:
+            record = find_version(workdir, version)
+            if record is None:
+                return _failure_result(
+                    "build_docx",
+                    "version-not-found",
+                    f"{version} is not in this document's history; call history_list",
+                    operation_id=operation_id,
+                )
+            version_source = store_dir_path(workdir) / "generations" / str(record.get("generation") or "")
+            if not version_source.is_dir():
+                return _failure_result(
+                    "build_docx",
+                    "version-trimmed",
+                    f"{version} content has been trimmed by retention and can no longer be exported",
+                    operation_id=operation_id,
+                )
+            exported_version = version
         manifest_before = _workdir_manifest_sha256(workdir)
         resolved_output = (
             Path(output).resolve()
@@ -5940,16 +6361,38 @@ def build_docx(output: str | None = None, operation_id: str | None = None) -> Ca
                 str(exc),
                 operation_id=operation_id,
             )
+        if exported_version is None:
+            decision = _commit_decision(workdir)
+            if decision["version_dirty"]:
+                return _failure_result(
+                    "build_docx",
+                    "version-save-required",
+                    "the document has changes that no version describes; call commit_sync "
+                    "first (or build_docx(version=...) to export a saved version), so the "
+                    "exported file can be traced to a version",
+                    operation_id=operation_id,
+                    details={"version_dirty": True, "head_version": decision["head"]["version"]},
+                )
+            exported_version = decision["head"]["version"]
 
 
         def run(target, tx=None):
+            source = target
+            if version_source is not None:
+                # export a historical version: materialise its state into a
+                # scratch workdir and build there, so HEAD and the live
+                # workdir are untouched
+                scratch = (tx.staging("version-workdir") if tx is not None else Path(
+                    tempfile.mkdtemp(prefix="docx2typed-export-")) / "wd")
+                _materialize_version(version_source, scratch)
+                source = scratch
             if tx is not None:
                 staged = tx.staging("build.docx")
-                built = _build_workdir_to_staging(target, staged)
+                built = _build_workdir_to_staging(source, staged)
                 tx.stage_external(resolved_output, staged, mode="replace")
                 published = resolved_output
             else:
-                built = build_workdir(target, resolved_output)
+                built = build_workdir(source, resolved_output)
                 published = built
             # remember the PUBLISHED artifact (the staging path in the store
             # lane is transient), so verify_output can omit its argument
@@ -5962,7 +6405,19 @@ def build_docx(output: str | None = None, operation_id: str | None = None) -> Ca
                 },
                 "checks": [{"name": "build", "status": "pass"}],
             }
-            return "success", {"output": str(published)}, "build", payload, []
+            return (
+                "success",
+                {
+                    "output": str(published),
+                    "version": exported_version,
+                    "tree": (find_version(workdir, exported_version) or {}).get("head_tree")
+                    if exported_version
+                    else canonical_tree_digest(workdir),
+                },
+                "build",
+                payload,
+                [],
+            )
 
         return _mutation_tool(
             operation_id,
@@ -5970,6 +6425,7 @@ def build_docx(output: str | None = None, operation_id: str | None = None) -> Ca
             {
                 "workdir": str(workdir),
                 "output": output,
+                "version": version,
             },
             workdir,
             directory=True,
@@ -6152,6 +6608,8 @@ _PROFILES: dict[str, set[str] | None] = {
         "format_span",
         "diff_preview",
         "commit_sync",
+        "history_list",
+        "history_restore",
         "build_docx",
         "verify_output",
     },

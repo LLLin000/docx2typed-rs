@@ -494,6 +494,7 @@ def _publish_current_locked(
     origin: str,
     changed_paragraph_ids: list[str],
     batch_id: str | None = None,
+    restored_from: str | None = None,
 ) -> dict[str, Any]:
     state = ensure_session(workdir)
     current = state["current_snapshot"]
@@ -515,6 +516,9 @@ def _publish_current_locked(
         "batch_id": batch_id,
         "published_at": _now(),
     }
+    if restored_from is not None:
+        # a restore is a normal publish whose content came from a version
+        new_current["restored_from"] = restored_from
     state["current_snapshot"] = new_current
     state["staged_snapshot"] = _empty_staged(new_current)
     state["writer"] = {"state": "idle", "batch_id": None}
@@ -536,6 +540,7 @@ def publish_current(
     origin: str,
     changed_paragraph_ids: list[str],
     batch_id: str | None = None,
+    restored_from: str | None = None,
 ) -> dict[str, Any]:
     return _publish_current_locked(
         workdir,
