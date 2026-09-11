@@ -1740,6 +1740,7 @@ class Store:
                         ),
                         "origin": boundary.get("origin") or "commit_sync",
                         "label": boundary.get("label"),
+                        "pin": bool(boundary.get("pin")),
                         "restored_from": boundary.get("restored_from"),
                         "created_at": _now_iso(),
                     }
@@ -2030,6 +2031,7 @@ class Transaction:
         *,
         origin: str,
         label: str | None = None,
+        pin: bool | None = None,
         restored_from: str | None = None,
         baseline_epoch: int | None = None,
     ) -> None:
@@ -2041,6 +2043,9 @@ class Transaction:
         self._save_boundary = {
             "origin": origin,
             "label": label,
+            # only an intentional name pins a version past retention: system
+            # labels ("restore V1", "accept all revisions") merely describe
+            "pin": pin,
             "restored_from": restored_from,
             "baseline_epoch": baseline_epoch,
         }
@@ -2307,7 +2312,9 @@ def history_gc(
     store = Store(root_path)
     with store.writer(timeout_ms=0):
         chain = _version_chain(root_path)
-        retained = [r for index, r in enumerate(chain) if index < keep_last or r.get("label")]
+        # a version is pinned by an intentional name, not by a descriptive
+        # system label — otherwise every restore would live forever
+        retained = [r for index, r in enumerate(chain) if index < keep_last or r.get("pin")]
         keep_trees = {r["tree_object"] for r in retained if r.get("tree_object")}
         keep_generations = {r.get("generation") for r in chain if not r.get("tree_object")}
         pointer = _read_pointer(root_path) or {}

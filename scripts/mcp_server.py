@@ -5395,6 +5395,7 @@ def history_restore(
                     origin="cherry-pick" if selection is not None else "restore",
                     restored_from=version,
                     label=label,
+                    pin=False,  # descriptive, not a user naming
                 )
             payload = {
                 **base_evidence_payload(),
@@ -5475,7 +5476,8 @@ def commit_sync(operation_id: str | None = None, label: str | None = None) -> Ca
             result = _commit_sync_impl(target, origin="agent", agent_gate=False)
             creates_version = canonical_tree_digest(target) != head_tree_before
             if creates_version and tx is not None:
-                tx.mark_save_boundary(origin="commit_sync", label=label)
+                # an explicit label is an intentional name: it pins the version
+                tx.mark_save_boundary(origin="commit_sync", label=label, pin=label is not None)
             result["version"] = {
                 "created": creates_version,
                 "previous": decision["head"]["version"],
@@ -5762,6 +5764,7 @@ def _table_op_tool(operation: str, table_ref: str, output: str, workdir_out: str
                     tx.mark_save_boundary(
                         origin="baseline-transition",
                         label=f"table {operation} (baseline E{epoch_before + 1})",
+                        pin=False,
                         baseline_epoch=epoch_before + 1,
                     )
             payload = {
@@ -5917,6 +5920,7 @@ def decide_all(
                     tx.mark_save_boundary(
                         origin="baseline-transition",
                         label=f"{action} all revisions (baseline E{epoch_before + 1})",
+                        pin=False,
                         baseline_epoch=epoch_before + 1,
                     )
             report = json.loads((created / "decisions.json").read_text(encoding="utf-8"))
