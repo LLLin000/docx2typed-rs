@@ -20,6 +20,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -121,20 +122,105 @@ def grade(task_id: str, output: Path, workdir: Path) -> dict[str, Any]:
     return {"task_id": task_id, "prompt": task["prompt"], "result": "pass" if passed else "fail", "oracles": results}
 
 
-def serve() -> int:
-    """Persistent MCP tool loop: one JSON request per line, one RESULT line
-    per request. State (workdir session) persists across calls."""
+def _count_key(value: Any, key: str) -> int:
+    if isinstance(value, dict):
+        return (1 if key in value else 0) + sum(_count_key(v, key) for v in value.values())
+    if isinstance(value, list):
+        return sum(_count_key(v, key) for v in value)
+    return 0
+
+
+def _tool_result_ok(value: Any) -> bool:
+    if hasattr(value, "isError"):
+        if bool(getattr(value, "isError")):
+            return False
+        return _tool_result_ok(getattr(value, "structuredContent", None))
+    if isinstance(value, dict):
+        return value.get("outcome") != "failure" and value.get("is_error") is not True
+    if isinstance(value, str):
+        try:
+            return _tool_result_ok(json.loads(value))
+        except json.JSONDecodeError:
+            return True
+    return True
+
+
+def _trace_event(request: dict[str, Any], value: Any, duration_ms: int, ok: bool) -> dict[str, Any]:
+    args = request.get("args") if isinstance(request.get("args"), dict) else {}
+    return {
+        "kind": "tool_call",
+        "tool": request.get("tool", ""),
+        "ok": ok and _tool_result_ok(value),
+        "duration_ms": duration_ms,
+        "arg_keys": sorted(args),
+        "match_ref_count": _count_key(args, "match_ref"),
+        "wrong_tool": bool(args.get("_wrong_tool", False)),
+        "recovery": bool(args.get("_recovery", False)),
+        "raw_xml_escape": bool(args.get("_raw_xml_escape", False)),
+    }
+
+def serve(
+    *,
+    trace_out: Path | None = None,
+    variant: str = "unknown",
+    task_id: str | None = None,
+) -> int:
+    """Persistent MCP loop with optional timing trace output."""
     import importlib
 
+    started = time.monotonic()
+    events: list[dict[str, Any]] = []
     server = importlib.import_module("scripts.mcp_server")
     print(SERVE_BANNER, flush=True)
     for line in sys.stdin:
+        if not line.strip():
+            continue
+        request: dict[str, Any] = {}
+        call_started = time.monotonic()
         try:
-            request = json.loads(line)
+            parsed = json.loads(line)
+            if not isinstance(parsed, dict):
+                raise TypeError("request must be an object")
+            request = parsed
             out = getattr(server, request["tool"])(**request.get("args", {}))
+            duration_ms = int((time.monotonic() - call_started) * 1000)
+            events.append(_trace_event(request, out, duration_ms, True))
             print("RESULT " + json.dumps({"ok": True, "data": out}, ensure_ascii=True)[:2000], flush=True)
         except Exception as exc:  # noqa: BLE001 - structured tool failure
+            duration_ms = int((time.monotonic() - call_started) * 1000)
+            events.append(
+                {
+                    "kind": "tool_call",
+                    "tool": request.get("tool", ""),
+                    "ok": False,
+                    "duration_ms": duration_ms,
+                    "arg_keys": sorted(request.get("args", {})) if isinstance(request.get("args"), dict) else [],
+                    "error": str(exc)[:500],
+                    "match_ref_count": 0,
+                    "wrong_tool": False,
+                    "recovery": False,
+                    "raw_xml_escape": False,
+                }
+            )
             print("RESULT " + json.dumps({"ok": False, "error": str(exc)[:500]}, ensure_ascii=True), flush=True)
+    server_wall_time_ms = int((time.monotonic() - started) * 1000)
+    if trace_out is not None:
+        trace_out.parent.mkdir(parents=True, exist_ok=True)
+        trace_out.write_text(
+            json.dumps(
+                {
+                    "schema": "docx2typed-agent-trace-1",
+                    "variant": variant,
+                    "task_id": task_id,
+                    "duration_ms": server_wall_time_ms,
+                    "server_wall_time_ms": server_wall_time_ms,
+                    "events": events,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
     return 0
 
 
@@ -170,24 +256,51 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--grade", nargs=3, metavar=("TASK_ID", "OUTPUT", "WORKDIR"))
     parser.add_argument("--record", metavar="RESULTS_JSON", help="write the agent-qualification provenance record")
+    parser.add_argument("--trace-out", metavar="TRACE_JSON", help="write per-tool timing trace while serving")
+    parser.add_argument("--variant", default="unknown", help="skill variant name stored in a serving trace")
+    parser.add_argument("--task-id", default=None, help="evaluation task id stored in a serving trace")
+    eval_group = parser.add_mutually_exclusive_group()
+    eval_group.add_argument("--metrics", metavar="TRACE_JSON", help="analyze one trace or trace collection")
+    eval_group.add_argument("--compare", nargs=2, metavar=("TRACE_A", "TRACE_B"), help="compare two trace variants")
+    parser.add_argument("--eval-tasks", default=str(REPO_ROOT / "evals" / "skill" / "tasks.json"))
     parser.add_argument("--model", default="unknown")
     parser.add_argument("--agent-version", default="unknown")
     parser.add_argument("--mcp-commit", default="unknown")
-    parser.add_argument("--out", default="agent-qualification.json")
+    parser.add_argument("--out", default=None, help="output path for records or evaluation reports")
     args = parser.parse_args(argv)
+    if args.metrics or args.compare:
+        from scripts.skill_eval import analyze_file, compare_traces
+
+        manifest = Path(args.eval_tasks) if args.eval_tasks else None
+        report = (
+            analyze_file(Path(args.metrics), manifest)
+            if args.metrics
+            else compare_traces(Path(args.compare[0]), Path(args.compare[1]), manifest)
+        )
+        text = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+        if args.out:
+            Path(args.out).write_text(text, encoding="utf-8")
+            print(f"report written: {args.out}")
+        else:
+            print(text, end="")
+        return 0
     if args.list:
         for task in _load_tasks():
             print(f"{task['id']}: {task['prompt']}  [{task['source']}]")
         return 0
     if args.serve:
-        return serve()
+        return serve(
+            trace_out=Path(args.trace_out) if args.trace_out else None,
+            variant=args.variant,
+            task_id=args.task_id,
+        )
     if args.grade:
         task_id, output, workdir = args.grade
         report = grade(task_id, Path(output), Path(workdir))
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report["result"] == "pass" else 1
     if args.record:
-        record_path = Path(args.out)
+        record_path = Path(args.out or "agent-qualification.json")
         record_path.write_text(
             json.dumps(record(Path(args.record), model=args.model, agent_version=args.agent_version, mcp_commit=args.mcp_commit), ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",

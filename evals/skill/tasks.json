@@ -1,0 +1,53 @@
+{
+  "schema": "docx2typed-skill-eval-1",
+  "tasks": [
+    {
+      "id": "edit-exact",
+      "prompt": "把正文中的“20 mg”改成“25 mg”，其他内容不要动。",
+      "intent": "single_edit",
+      "expect": {"max_locate_calls": 1, "max_mutation_calls": 1, "required_mutation": "document_patch", "max_primitive_calls": 0}
+    },
+    {
+      "id": "replace-all",
+      "prompt": "全文把“血浆凝胶”统一成“富血小板血浆凝胶”。",
+      "intent": "global_replace",
+      "expect": {"max_locate_calls": 0, "max_mutation_calls": 1, "required_mutation": "document_replace", "max_primitive_calls": 0}
+    },
+    {
+      "id": "edit-second-occurrence",
+      "prompt": "只改第二处 Zn2+，把 2+ 设成上标。",
+      "intent": "numbered_format",
+      "expect": {"max_locate_calls": 1, "max_mutation_calls": 1, "max_primitive_calls": 0}
+    },
+    {
+      "id": "rewrite-context",
+      "prompt": "把讨论部分改得更简洁，但保留老师的批注。",
+      "intent": "context_rewrite",
+      "expect": {"max_locate_calls": 1, "max_mutation_calls": 1, "forbidden_tools": ["delete_comment"], "max_primitive_calls": 0}
+    },
+    {
+      "id": "format-span",
+      "prompt": "把这一处缺失的化学式下标补成 Word 下标，不改其他文字。",
+      "intent": "format_existing_span",
+      "expect": {"max_locate_calls": 1, "max_mutation_calls": 1, "required_mutation": "format_span", "max_primitive_calls": 0}
+    },
+    {
+      "id": "restore-version",
+      "prompt": "刚才那版不好，恢复到老师二审版，但保留版本历史。",
+      "intent": "forward_restore",
+      "expect": {"max_locate_calls": 1, "required_mutation": "history_restore", "forbidden_tools": ["extract"]}
+    },
+    {
+      "id": "historical-export",
+      "prompt": "把昨天的 V12 再导出一份，但我现在这版继续保留。",
+      "intent": "historical_export",
+      "expect": {"max_locate_calls": 1, "required_mutation": "build_docx", "forbidden_tools": ["history_restore", "extract"]}
+    },
+    {
+      "id": "accept-and-continue",
+      "prompt": "接受所有已有修订，然后继续改这一句。",
+      "intent": "baseline_then_edit",
+      "expect": {"max_mutation_calls": 2, "required_mutation": "decide_all", "max_primitive_calls": 0}
+    }
+  ]
+}

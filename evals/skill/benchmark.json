@@ -1,0 +1,52 @@
+{
+  "schema": "docx2typed-skill-benchmark-1",
+  "task_manifest": "evals/skill/tasks.json",
+  "prompt_policy": "Run the identical task prompt against both skill variants; change only the skill text and keep the MCP server revision, model, temperature, and workdir seed fixed.",
+  "timing_contract": "agent_wall_time_ms is supplied by the external Agent runner when available; agent_bench --serve records MCP-server wall time as the fallback duration_ms and never captures document text.",
+  "variants": [
+    {
+      "id": "A-baseline",
+      "description": "The pre-router skill revision selected by the evaluator.",
+      "trace_variant": "A-baseline"
+    },
+    {
+      "id": "B-router",
+      "description": "The compact decision-router SKILL.md plus progressive references.",
+      "trace_variant": "B-router"
+    }
+  ],
+  "run_protocol": [
+    "Start one persistent agent_bench --serve process per task and variant.",
+    "Pass --trace-out, --variant, and --task-id to record tool timing without document text.",
+    "Keep the workdir seed and input DOCX identical between A and B.",
+    "Analyze each trace with python -m scripts.agent_bench --metrics TRACE_JSON.",
+    "Compare paired traces with python -m scripts.agent_bench --compare TRACE_A TRACE_B."
+  ],
+  "primary_metrics": [
+    "skill_triggered",
+    "agent_wall_time_ms",
+    "tool_calls",
+    "locate_calls",
+    "mutation_calls",
+    "commit_count",
+    "build_count",
+    "verify_result",
+    "wrong_tool_calls",
+    "recovery_calls",
+    "re_reads",
+    "first_mutation_success",
+    "match_ref_usage",
+    "document_replace_usage",
+    "diff_preview_usage",
+    "user_clarifications",
+    "fallback_primitive_calls",
+    "raw_xml_escape",
+    "route_violation_count"
+  ],
+  "reporting": {
+    "aggregate": ["mean", "median", "first_mutation_success_rate", "route_pass_rate"],
+    "comparison_delta": "B minus A",
+    "minimum_repetitions_for_release_claim": 3,
+    "claim_boundary": "A parser smoke test is not an Agent A/B result; report actual traces and model provenance separately."
+  }
+}

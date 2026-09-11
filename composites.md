@@ -14,7 +14,10 @@ next step until the criterion holds.
 
 Edit ordinary prose; formatting, structure, anchors stay locked.
 
-1. `extract <input.docx> -o <workdir>` — creates typed.md + edit.md + sidecars.
+1. If this is a first import, an explicit fork, or a different source DOCX,
+   run `extract <input.docx> -o <workdir>` to create the typed project. If a
+   trusted workdir already exists for this logical document, resume it instead
+   of creating another one.
 2. Plan: `view <workdir> --mode clean` ONCE for the full document; use
    `get_paragraph`/`regions.md` only for paragraphs you are about to change
    or that carry complex structure. Do not read the document paragraph by
@@ -26,9 +29,11 @@ Edit ordinary prose; formatting, structure, anchors stay locked.
      exactly; cross-region rewrites follow the explicit
      `proportional-preserve` policy with a recorded warning), then
      `edit sync <workdir>`; or
-   - **MCP draft (default)**: `workdir_open` → `document_read` /
-     `document_search` → `document_patch` (hunks or unified diff, one call
-     per editing intention) → `diff_preview` → `commit_sync`.
+   - **MCP draft (default)**: `workdir_open` → `document_search` /
+     windowed `document_read` when context is missing → `document_patch`
+     (hunks or unified diff, one call per editing intention); use
+     `diff_preview` only for multi-hunk, broad, normalized, structural, or
+     explicitly reviewed changes, then `commit_sync` once.
      Paragraph primitives (`get_paragraph`/`batch_edit`/…) are the
      advanced fallback: only for explicitly requesting exact per-region
      style ownership, post-refusal region diagnosis, or recovery.
@@ -243,12 +248,14 @@ revisions intact, verify PASS.
 
 Drive the whole edit loop through the MCP server.
 
-1. `workdir_open` → `workdir_status` (clean required).
-2. `document_read` (whole; `view="outline"` first for large documents) and
-   `document_search` for locating targets — whole blocks with
-   `prev_id`/`next_id` anchors come back, no per-paragraph reads.
+1. `workdir_open` → `workdir_status` (clean required); reuse the same open
+   session for subsequent rounds.
+2. `document_search` for locating targets; use windowed `document_read` only
+   when context is missing (`view="outline"` first for large documents).
 3. `document_patch` (hunks or unified diff, `base_revision` from the
-   read/search token) → `diff_preview` → `commit_sync`.
+   read/search token). Use `diff_preview` only for multi-hunk, broad,
+   normalized, structural, or explicitly reviewed changes; then
+   `commit_sync` once.
 4. `build_docx` → `verify_output` → Microsoft Word check.
    Fallback only: `get_paragraph` + `batch_edit` for explicitly
    requesting exact per-region style ownership or refusal diagnosis.
@@ -264,11 +271,13 @@ owns scope, review decisions, and final acceptance.
 
 1. **Open the agent**: collect the DOCX, desired result, tracked/direct edit
    preference, and comment-retention policy. Repeat the plan in one sentence.
-2. **Create the baseline**: copy the source to a new scratch workdir, run
+2. **Create or resume the baseline**: if this is the first import, an explicit
+   fork, or a different source DOCX, copy the source to scratch storage, run
    `extract`, validate it, and report the source fingerprint and initial
-   inventory. Do not modify the original DOCX.
-3. **Run round 1**: open the workdir once, read the full clean projection once,
-   inspect only target paragraphs/regions, make the smallest valid edits, and
+   inventory. If a trusted workdir already exists for this logical document,
+   resume it instead. Never modify the original DOCX.
+3. **Run round 1**: open the workdir once, locate the requested content with
+   search, read only the needed context, make the smallest valid edits, and
    commit them. Report changed paragraph IDs, edit mode, and unresolved items.
 4. **Human review**: open the review console. The human selects revisions or
    source comments, accepts/rejects/defers, or adds a source-anchored patch or
@@ -282,7 +291,6 @@ owns scope, review decisions, and final acceptance.
    `verify`, open it in Microsoft Word, and render through Word when a PDF is
    required. Return the output path with a compact evidence summary. LibreOffice
    checks are optional and non-gating.
-   round loop and do not present a partial DOCX as final.
 
 **Completion criterion**: the human can tell what the agent is doing, what is
 waiting for them, and what remains before delivery; every round is resumable
