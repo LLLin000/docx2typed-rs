@@ -31,11 +31,11 @@ one generation per mutation (a nine-call editing session produced 3–11).
   or pinned version, and report the retained count and disk usage in
   `workdir_status`. A version trimmed by retention is reported as trimmed, not
   silently missing (ADR 0040's missing-content contract).
-- **Not in v1**: content-defined chunking, an object database, pack files,
-  per-version compression. Those are only revisited if measured retention
-  actually hurts; the cheap intermediate step, if it is ever needed, is the
-  content-addressed file pool over the hashes the generation manifest already
-  records (ADR 0041).
+- **Storage shape**: superseded by ADR 0043 — measured on a 3000-paragraph
+  document, the loose-file-per-generation layout duplicated 4.7× (43.9 MB for
+  ten versions of a 976 KB source), so history now lives in content-addressed
+  blobs behind one append-only log. The retention *policy* here is unchanged;
+  only where the bytes live moved.
 
 ## Consequences
 

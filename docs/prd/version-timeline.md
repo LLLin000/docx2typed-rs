@@ -124,18 +124,26 @@ history_restore("V18")
 
 Nothing rewinds: the pointer advances, V18 stays, every later version stays.
 
-### Storage (ADR 0041/0042)
+### Storage (ADR 0041/0042/0043)
 
-- **v1 adds no bytes.** A version references a generation that already exists;
-  the restore path copies state forward through the existing commit lane.
-- Generations are cheap to *reference* and expensive to *duplicate*
-  (1.4–2.0 MB each, ~70 % derivable). Retention therefore lives in the GC root
-  set, not in a storage format: `mutate(..., keep_generations=...)` and
-  `_gc_abandoned(result, keep=...)` take roots as data, and `mcp_server`
-  supplies the version-referenced generations.
-- Later, if measured retention hurts: (b) share unchanged assets by the sha256
-  the generation manifest already records, (c) `typed.md` line deltas /
-  `zstd --patch-from`. Not now.
+Measured on the 3000-paragraph fixture (976 KB source):
+
+| | today | with ADR 0043 |
+|---|---|---|
+| one version | 5.33 MB in 20 loose files | ~1 KB delta + metadata |
+| ten versions | 43.9 MB in 182 files | shared blobs, one log |
+
+Where the 5.33 MB goes: `.review/snapshots/C*.json` 0.66 MB **each** (derived,
+accumulated inside every later generation), `format.json` 1.21 MB,
+`_template.docx` 0.95 MB (identical everywhere), `typed.md` 0.20 MB. A
+one-paragraph edit changes 1 of 3100 `format.json` records (0.3 KB) and one
+line of `typed.md` (0.2 KB).
+
+So history moves to content-addressed blobs behind one append-only log:
+`objects/<sha256>` + `history.jsonl` + `refs/current`, derivatives regenerated
+on materialisation, manifests fanned out into buckets so an edit rewrites one
+bucket. Retention (ADR 0042) is unchanged — the root set is read from the log
+instead of from per-generation manifests.
 
 ## Phases
 
@@ -156,11 +164,11 @@ via `store.read_root` and reuse the existing diff).
 Failure codes: `version-not-found`, `version-trimmed`, `version-content-missing`,
 `restore-draft-dirty`, `restore-review-pending`.
 
-**P2 — cheap generations.** Content-addressed asset sharing keyed by the
-manifest's sha256, plus marking regenerable assets (`edit.md`, `regions.md`,
-`revisions.md`, `.review/snapshots/*`). Prerequisite if hardlinks are chosen:
-every writer must replace files atomically (only `_write_edit` is confirmed
-today).
+**P2 — the storage move of ADR 0043.** `objects/` + `history.jsonl` +
+`refs/current`; import existing generations as blobs; stop storing derived
+files; bucket the manifests; add `history_verify`. This is the phase that makes
+long histories affordable and removes the loose-file blast radius, so it is
+worth doing before P3.
 
 **P3 — baseline transitions.** Absorb `decide_all` / `table_*` new-workdir
 output into the same timeline: new generation + version with
