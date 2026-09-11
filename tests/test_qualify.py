@@ -377,6 +377,7 @@ def test_python_self_comparison_success(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_committed_plan_end_to_end_qualifies_and_publishes_artifacts(tmp_path):
     """The committed plan runs end to end and publishes artifacts.  The
     office-evidence check fails closed on this runner because blocking cells

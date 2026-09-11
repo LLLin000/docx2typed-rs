@@ -264,7 +264,10 @@ def test_matrix_case_execution_passes_positive_and_refused(tmp_path, monkeypatch
     task_map["cases"]["cm-positive-fast"] = {"capability": "text.edit.body", "kind": "matrix", "label": "fast positive"}
     task_map["cases"]["cm-refused-fast"] = {"capability": "text.edit.body", "kind": "matrix", "label": "fast refused"}
     task_map["summary"]["matrix_count"] = len(task_map["matrix_cases"])
-    record = _execute_capability_matrix(plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map)
+    record = _execute_capability_matrix(
+        plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map,
+        only={"cm-positive-fast", "cm-refused-fast"},
+    )
     assert record["result"] == "pass", record["detail"]
     by_id = {case["id"]: case for case in record["matrix_cases"]}
     assert by_id["cm-positive-fast"]["result"] == "pass"
@@ -277,7 +280,10 @@ def test_matrix_case_diagnostic_mismatch_fails_the_check(tmp_path):
     plan = _capability_matrix_plan()
     task_map = _task_map()
     task_map["matrix_cases"]["cm-invalid-arguments"]["diagnostic"] = "workdir-not-found"
-    record = _execute_capability_matrix(plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map)
+    record = _execute_capability_matrix(
+        plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map,
+        only={"cm-invalid-arguments"},
+    )
     assert record["result"] == "fail"
     assert "diagnostic" in record["detail"]
 
@@ -299,7 +305,9 @@ def test_matrix_case_workdir_mutation_fails_the_check(tmp_path):
     task_map["capabilities"]["text.edit.body"]["cases"]["matrix"].append("cm-mutates")
     task_map["cases"]["cm-mutates"] = {"capability": "text.edit.body", "kind": "matrix", "label": "mutates"}
     task_map["summary"]["matrix_count"] = len(task_map["matrix_cases"])
-    record = _execute_capability_matrix(plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map)
+    record = _execute_capability_matrix(
+        plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map, only={"cm-mutates"}
+    )
     assert record["result"] == "fail"
     assert "mutated" in record["detail"]
 
@@ -310,7 +318,9 @@ def test_matrix_case_structural_drift_fails_the_check(tmp_path):
     plan = _capability_matrix_plan()
     task_map = _task_map()
     del task_map["capabilities"]["text.edit.body"]
-    record = _execute_capability_matrix(plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map)
+    record = _execute_capability_matrix(
+        plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map, only=set()
+    )
     assert record["result"] == "fail"
     assert "task map drift" in record["detail"]
 
@@ -351,7 +361,10 @@ def test_matrix_declared_not_run_is_never_counted_as_pass(tmp_path):
         "capability": "lock.writer-lane", "kind": "matrix", "label": "declared not-run",
     }
     task_map["summary"]["matrix_count"] = len(task_map["matrix_cases"])
-    record = _execute_capability_matrix(plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map)
+    record = _execute_capability_matrix(
+        plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map,
+        only={"cm-declared-not-run"},
+    )
     assert record["result"] == "fail"
     assert "declared not-run" in record["detail"]
     by_id = {case["id"]: case for case in record["matrix_cases"]}
@@ -406,7 +419,9 @@ def test_matrix_empty_dir_creation_fails_no_mutation(tmp_path):
     task_map["capabilities"]["text.edit.body"]["cases"]["matrix"].append("cm-mkdir")
     task_map["cases"]["cm-mkdir"] = {"capability": "text.edit.body", "kind": "matrix", "label": "mkdir"}
     task_map["summary"]["matrix_count"] = len(task_map["matrix_cases"])
-    record = _execute_capability_matrix(plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map)
+    record = _execute_capability_matrix(
+        plan, ROOT, tmp_path / "scratch", BUNDLE, task_map=task_map, only={"cm-mkdir"}
+    )
     assert record["result"] == "fail"
     assert "mutated" in record["detail"]
 

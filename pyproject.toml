@@ -47,3 +47,12 @@ docx2typed = ["protocol_schema_bundle.json", "unicode_vertical_catalog.json"]
 
 [tool.setuptools.data-files]
 "share/docx2typed" = ["capabilities/manifest.json"]
+
+[tool.pytest.ini_options]
+# The default run is the fast feedback loop. The release gate itself
+# (`python -m scripts.qualify`, or `pytest -m slow`) runs the full
+# qualification plan end to end and costs minutes.
+addopts = "-m 'not slow'"
+markers = [
+    "slow: release-gate checks that run the whole qualification plan",
+]
