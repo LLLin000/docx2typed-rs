@@ -27,10 +27,13 @@ one generation per mutation (a nine-call editing session produced 3–11).
   versions (`mcp_server`), so `store.py` stays free of collaboration
   vocabulary: `mutate(..., keep_generations=...)` and
   `_gc_abandoned(result, keep=...)` take the roots as data.
-- **Retention policy, v1**: keep the most recent 50 versions plus every named
-  or pinned version, and report the retained count and disk usage in
-  `workdir_status`. A version trimmed by retention is reported as trimmed, not
-  silently missing (ADR 0040's missing-content contract).
+- **Retention policy, v1**: keep the last 50 **trees** plus every labelled
+  tree, and report retained counts and disk usage in `workdir_status`.
+- **Commit metadata is never trimmed.** A version commit object is a few
+  hundred bytes; dropping it would make history forget that a version ever
+  existed. What retention reclaims is *content* (trees and blobs), so a
+  trimmed version still appears in `history_list` with `content: trimmed`, and
+  restoring it fails closed as `version-trimmed` — never `version-not-found`.
 - **Storage shape**: superseded by ADR 0043 — measured on a 3000-paragraph
   document, the loose-file-per-generation layout duplicated 4.7× (43.9 MB for
   ten versions of a 976 KB source), so history now lives in content-addressed

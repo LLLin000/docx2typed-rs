@@ -1,115 +1,117 @@
-# 0043 — History storage: content-addressed blobs behind one append-only log
+# 0043 — History is a commit graph of content-addressed objects
 
 ## Status
 
 Accepted (version-timeline design, `docs/prd/version-timeline.md`).
-Supersedes the "no object database in v1" bullet of ADR 0042.
+Supersedes the "no object database in v1" bullet of ADR 0042, and replaces the
+`history.jsonl` layout this ADR first proposed.
 
 ## Context
 
 The store keeps one **directory of ~20 loose files per generation**
-(`.docx2typed-store/generations/<id>/…`). Measured on a 3000-paragraph
-document (976 KB source):
+(`.docx2typed-store/generations/<id>/…`). Measured on a 3000-paragraph document
+(976 KB source):
 
 - one generation = **5.33 MB in 20 files**; ten generations = **43.9 MB in 182
-  files** — and the duplication grows with every version;
-- the bytes are mostly **derivable or duplicated**: `.review/snapshots/C*.json`
-  0.66 MB *each* (one per snapshot, accumulated inside every later generation),
-  `format.json` 1.21 MB, `_template.docx` 0.95 MB (identical in every
-  generation). The actual content, `typed.md`, is 0.20 MB;
+  files**, and duplication grows with every version;
+- most of it is derived or duplicated: `.review/snapshots/C*.json` 0.66 MB
+  *each* (accumulated into every later generation), `format.json` 1.21 MB,
+  `_template.docx` 0.95 MB (identical everywhere); the actual content,
+  `typed.md`, is 0.20 MB;
 - a one-paragraph edit changes **1 of 3100** `format.json` records (0.3 KB) and
-  **1 line** of `typed.md` (0.2 KB) — but today both files are rewritten whole,
-  so a version costs ~4.4 MB to record ~1 KB of change.
+  **1 line** of `typed.md` (0.2 KB), yet both files are rewritten whole.
 
-Loose files are also the wrong failure shape: losing one file of one generation
-loses information silently, and there is no way to tell what is missing.
+A first proposal — blobs plus an append-only `history.jsonl` as the history
+authority — was prototyped and worked (2.73 MB of blobs for 23.8 MB of state,
+8.5 KB of log, 5–44 KB per version, lost blobs named rather than silent), but
+it keeps a **second authority**: the log says what history is, the pointer says
+what is current, and the two need their own recovery story (append line → crash
+→ pointer not yet swapped). That coordination problem does not need to exist.
 
 ## Decision
 
-Borrow Git's shape, at our scale, and drop the per-generation directory:
+History **is** the version commit graph. No history file, no separate ledger:
 
 ```
 .docx2typed-store/
-  objects/<ab>/<sha256>      content-addressed blobs; each unique byte stored once
-  history.jsonl              append-only: one record per version = the history
-  refs/current               one line: the current version id
-  lock, reserve, probe.json  the writer lane and filesystem qualification (unchanged)
+  objects/<ab>/<sha256>     content-addressed objects (commit, tree, leaf, blob)
+  generations/              INTERNAL: the Store's own materialisation lane for
+                            mutations and crash recovery — it no longer carries
+                            user history
+  transactions/ staging/    crash journal + recovery reserve (unchanged)
+  lock/ probe               writer lane + filesystem qualification (unchanged)
+  workdir.json              HEAD: current_generation, head_version, head_tree, version_seq
 ```
 
-- **One log is the history.** A version record carries `id`, `parent`,
-  snapshot metadata, and a pointer to its **manifest blob** — the
-  path → chunk-hash mapping for the state it names. No directory per version,
-  no `generation.json` per directory, no separate `versions.jsonl`, no
-  snapshot files kept inside history.
-- **Blobs, once.** Identical content (template, styles, unchanged paragraphs,
-  a manifest that did not change) is stored once and referenced by hash; the
-  measured 4.7× duplication disappears and the ratio improves as history grows.
-- **Chunk at the granularity where change happens.** The two big state files
-  are chunked per paragraph record (`typed.md` blocks, `format.json` records);
-  small files (`styles.json`, `_template.docx`, `revisions.json`) are single
-  blobs. A manifest is itself a blob, fanned out into buckets (one bucket per
-  512 entries) so an edit rewrites one bucket, not the whole index — the same
-  trick as Git's trees-of-trees, one level deep, and the reason per-version
-  metadata stays in the hundreds of bytes rather than the hundreds of KB.
-- **Derived files are never stored.** `edit.md`, `regions.md`, `revisions.md`
+- **A Version is a commit object**: `{type: "version", schema, seq, parent,
+  tree, created_at, author, origin, operation_id, label, restored_from}`.
+  Its parent chain *is* the history; `history_list` walks it from HEAD, so no
+  index file exists to fall out of sync with the pointer.
+- **A Tree is the snapshot**: a Merkle root over semantic objects, not over
+  file bytes. `document_order`, `paragraphs/<id>`, `format/*`, `styles`,
+  `template`, `package_metadata`. Because the keys are our paragraph
+  identities, inserting a paragraph does not churn the objects of the
+  paragraphs after it — a byte-offset chunking of `typed.md` would.
+- **A paragraph object carries its own state together** — `{text: <sha>,
+  format: <sha>}`. `typed.md`'s block and the `format.json` record that
+  describes it are one unit: the record holds `token_ids` pointing into a
+  global token table (`N146…N162`: revision open/close, rpr-change,
+  comment anchors, commentReference — a real paragraph references 17 of them),
+  so a half-swapped paragraph is exactly the dangling-reference failure to
+  avoid. The token table is its own object, versioned per commit.
+- **Object identity** is `sha256(object_type + schema + canonical bytes)` over
+  the uncompressed canonical form. The physical layer (loose file today,
+  zstd/packfile/delta later) can change without any version id changing.
+- **Write order** is objects → commit object → single CAS on HEAD. A crash
+  before the CAS leaves unreferenced objects (harmless, collectable); there is
+  no window in which a pointer names an incomplete commit, which is the
+  coordination problem the JSONL layout would have had.
+- **Derived files are never stored**: `edit.md`, `regions.md`, `revisions.md`,
   and `.review/snapshots/*` are regenerated on materialisation (ADR 0041).
-  This is where most of the 5.33 MB goes today.
-- **Failure semantics.** A missing blob is *detectable*: the log names the
-  hash it needs, verification is a hash comparison, and a restore fails closed
-  with `version-content-missing` naming the version. One `history_verify`
-  command sweeps the pool against the log (a `git fsck`, no new concept). The
-  log is the only record that must not be lost, so it is append-only, fsynced,
-  and small; the live workdir always holds the newest state, so losing it
-  costs history, not the document.
-- **One history file per document, not two.** The collaboration snapshot
-  metadata (id, parent, origin, changed paragraph ids) is part of the same log
-  record — it already describes the same event. `.review/` keeps only what is
-  genuinely live collaboration (queued human patches, inbox, writer state) and
-  its render snapshots are regenerated on demand instead of accumulated. After
-  this step a document has exactly one history authority to back up.
-- **Migration**: existing generations are imported by writing their state
-  files as blobs and appending a record per generation, in order.
+- **`Snapshot` stays as a name, not a second object.** The collaboration layer
+  keeps its `C<n>` display id and its live session, but the authoritative
+  binding of a snapshot becomes its **tree hash** (the record carries it), so
+  there is one content truth and the review API keeps working.
+- **Restore of a whole version is near zero-copy in storage terms**: the new
+  commit points at the *old tree* (`parent = HEAD, tree = T18,
+  restored_from = V18`). Materialising a working copy, validating, and
+  regenerating derived views is work — but it is working-copy work, not history
+  duplication.
+- **Diff is derived from trees, not stored**: comparing two commits skips
+  identical subtrees by hash and descends only into what differs. No delta
+  chain, no patch log, nothing to corrupt in the middle of history.
 
-## Measured (throwaway prototype, ten real generations of a 3000-paragraph doc)
+## Measured (throwaway prototype over ten real generations)
 
-The layout above was prototyped over the history produced by the restore
-prototype, deriving a pool purely from what was already on disk:
-
-| | loose-file layout today | blobs + one log |
+| | loose-file layout today | objects + one commit graph |
 |---|---|---|
-| state payload | 23.8 MB in 88 files | **2.73 MB in 6421 blobs** (8.7× dedup) |
-| history index | one `generation.json` per version | **8.5 KB in one file** |
-| bytes a version adds | ~4.4 MB average | **5–44 KB** (first is the base state) |
+| state payload | 23.8 MB in 88 files | **2.73 MB of objects** (8.7× dedup) |
+| history index | one `generation.json` per version | **none** — the parent chain |
+| bytes a version adds | ~4.4 MB | **5–44 KB** (first is the base state) |
+| blob lost | silent | detected and named (version, path, chunk) |
 
-Two things the prototype corrected in this ADR's own first draft:
+Two corrections the prototype forced, kept here as design constraints:
 
 1. **The index is the cost, not the content.** Inlining every chunk hash into
-   each log record produced a 6.4 MB log for 2 MB of content. Fanning the
-   manifest into buckets (Git's trees-of-trees, one level) took the same
-   history to 8.5 KB.
-2. **Bucket size is the knob.** 64 entries per leaf costs ~25 KB per version
-   (one format.json leaf rewritten); smaller leaves trade fewer bytes per
-   version for more index hashes. Pick it from the measured write pattern, not
-   from taste.
-
-Failure drill: deleting one blob was detected across every version that
-references it, and reported as `(generation, path, chunk key)` — the loss is
-named, not silent.
+   each record produced a 6.4 MB log for 2 MB of content. Fanning the manifest
+   into buckets took the same history to 8.5 KB of index.
+2. **Bucket size is the per-version knob.** 64 entries per leaf ≈ 25 KB per
+   version (one `format.json` leaf rewritten); smaller leaves cost fewer bytes
+   per version and more index objects. Choose it from the measured write
+   pattern.
 
 ## Consequences
 
-- Moving parts in the store go **down**, not up: three paths
-  (`objects/`, `history.jsonl`, `refs/current`) instead of an unbounded number
-  of directories, each with twenty files. Reads and writes have one shape:
-  hash → store-if-absent → append record → swap ref.
-- GC becomes one mark-and-sweep over the log plus the retention policy (ADR
-  0042's root set is unchanged — it is simply read from the log instead of from
-  per-generation manifests).
-- Restore is unchanged in behaviour (ADR 0039): resolve the record, verify the
-  hashes, materialise, publish. It now reads blobs instead of copying a
-  directory.
-- Cost model on the large fixture: a one-paragraph version adds ~1 KB of new
-  content plus its metadata, against ~4.4 MB today.
-- This is deliberately **not** a general-purpose object database: no packfiles,
-  no delta chains, no compression, no branching. Bucketed manifests exist only
-  because one file (`format.json`) dominates and changes locally.
+- Fewer moving parts than before the change, not more: `objects/`, the
+  existing pointer, and the existing transaction lane. The store's durability
+  machinery (`generations/`, journals, recovery, the fault-injection tests) is
+  untouched — it keeps doing transactions, while history moves to the graph.
+- GC is one mark-and-sweep over the graph plus retention (ADR 0042): reachable
+  objects survive, the rest are collected. Retention trims *content*, never
+  commit metadata, so trimming downgrades a restore to `version-trimmed`
+  rather than making a version vanish from the list.
+- Migration: existing generations are imported as objects + one commit each,
+  in order, then the graph takes over.
+- Deliberately still excluded: packfiles, delta chains, compression, branches.
+  The object id is defined over canonical bytes precisely so those can be added
+  later without touching the model.

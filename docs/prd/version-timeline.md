@@ -22,9 +22,12 @@ list, diff, and restore — without storing a DOCX per version.**
 Three levels, already present in the code, now made explicit (ADR 0040):
 
 ```text
-Generation   one mutation          → hundreds, durability unit, not user language
-Snapshot     one save boundary     → review/preflight baseline, renderable view
-Version      one user savepoint    → what the user lists, diffs, restores
+Generation   one mutation          → Store-internal durability lane (still copied,
+                                     still GC-able); not user history
+Snapshot     one save boundary     → review/preflight baseline; keeps its C<n> name,
+                                     bound to content by its TREE hash
+Version      one user savepoint    → commit object; parent chain = history
+Tree         the snapshot content  → Merkle root over semantic objects
 ```
 
 ### What creates a Version
@@ -54,20 +57,28 @@ different door).
 
 ### Data contract
 
-`.review/versions.jsonl` — append-only, one record per version, written in the
-same writer transaction that publishes the snapshot:
+A version **is a content-addressed commit object**; its parent chain is the
+history (ADR 0043). There is no versions file to keep in sync with the pointer:
 
 ```json
-{"schema": "docx2typed-version-1",
- "version": "V12", "snapshot": "C12", "generation": "6428591d0704…",
- "typed_sha256": "2e84d3e4…", "parent_version": "V11",
- "kind": "major", "label": "统一“血浆凝胶”术语",
+{"type": "version", "schema": "docx2typed-version-1",
+ "seq": 21, "parent": "<V20 object id>", "tree": "<Merkle root>",
  "created_at": "2026-09-11T01:22:47+00:00", "author": "Lin",
- "operation": "commit_sync", "operation_id": "45d66892…",
- "changed_paragraph_ids": ["P5", "P7"],
- "restored_from": null,
- "export": {"path": "…/final.docx", "sha256": "ade8dab8…", "built_at": "…"}}
+ "origin": "commit_sync", "operation_id": "45d66892…",
+ "label": "统一“血浆凝胶”术语", "restored_from": null,
+ "changed_paragraph_ids": ["P5", "P7"]}
 ```
+
+The tree is a Merkle root over semantic objects — `document_order`,
+`paragraphs/<id>` (each carrying its `typed.md` block *and* its `format.json`
+record, because the record's `token_ids` point into a global token table),
+`format/tokens`, `format/global`, `styles`, `template`, `package_metadata`.
+Keys are paragraph identities, so inserting a paragraph does not churn the
+objects after it.
+
+Export receipts are **evidence, not part of the record**: a version is
+immutable and an export happens later, so the receipt (path + sha256 + version)
+is appended to the operation evidence and joined on demand.
 
 - `version` numbering: `V<n>` assigned at creation (v1: `n` equals the
   snapshot ordinal), stored explicitly, never recomputed.
@@ -83,11 +94,18 @@ same writer transaction that publishes the snapshot:
 Two new tools, one extension:
 
 ```text
-history_list(limit=20, offset=0)      → versions + current + retained/trimmed counts
-history_restore(version, operation_id?)  → restores forward, returns the new version
-diff_preview(from_version?, to_version?) → paragraph-level delta between versions
-workdir_status()                      → gains version.current / version.previous /
-                                        dirty / stale_exports / versions.retained
+history_list(limit=20, offset=0)          → versions (walked from HEAD) + retained/trimmed
+history_restore(version, operation_id?,   → whole-version restore (near zero-copy in
+                paragraphs=[…]?)             storage; paragraphs= is the guarded
+                                             cherry-pick of ADR 0045)
+diff_preview(from_version?, to_version?)  → Merkle-accelerated: skip identical
+                                             subtrees, descend only into what differs
+workdir_status()                          → version.current / version.previous /
+                                             draft_dirty / version_dirty /
+                                             versions.retained / stale_exports
+build_docx(version="V12")                 → export a historical version without
+                                             restoring it
+commit_sync(label="…")                    → the only place a version is created
 ```
 
 - `diff_preview` is extended rather than duplicated: its hunk-level diff, style
@@ -105,13 +123,13 @@ history_restore("V18")
  1. resolve V18 → generation G18; both hashes must verify, else fail closed
     (version-content-missing / version-trimmed)
  2. require a clean draft and a clean preflight (existing gates)
- 3. Store.mutate(generation=True):
-      overlay the CANONICAL files from G18 (typed.md, format.json,
-      styles.json, revisions.json, _template.docx)
-      then drop the bound pair edit.md + edit.state.json and regenerate it
-      with refresh_edit_projection(target, init=True) — copying the pair raw
-      fails closed as edit-header-tampered (see prototype findings)
-      → classify_edit_state → validate_workdir
+ 3. The version the restore creates points at the OLD TREE
+    (`parent = HEAD, tree = T18, restored_from = V18`) — storage costs one
+    commit object; everything else is shared. A new internal generation is
+    materialised from that tree for the working copy, validated, and its
+    derived views regenerated (`refresh_edit_projection(init=True)`; copying
+    the bound pair edit.md + edit.state.json raw is rejected as
+    edit-header-tampered — see prototype findings).
  4. publish_current(origin="restore", restored_from="V18",
                      changed_paragraph_ids=<delta vs the pre-restore state>)
     → new snapshot C<n+1>; without it the restore strands the session in
@@ -149,7 +167,7 @@ instead of from per-generation manifests.
 
 ## Phases
 
-**P0 — version records at the save boundary.**
+**P0 — version records at the save boundary, and the two dirty facts.**
 Hook: `review_collab._publish_current_locked` (single place every publish
 passes through; it already appends `history.jsonl` and persists the renderable
 snapshot). Add `generation` to its inputs (the caller has it as the generation
@@ -158,7 +176,7 @@ writers per the table above. Tests: one publish → one version; a two-step
 save (`batch_edit` + `commit_sync`) → one version; a `commit_sync` with no
 change → no version.
 
-**P1 — list, status, restore.**
+**P1 — version dirty + export gating, then list/status/restore.**
 `history_list`, `workdir_status` extension, then `history_restore` with the
 hash checks and the restore proof. `diff_preview(from,to)` last, since it is
 the only piece that needs new comparison code (materialise both states in temp
@@ -166,19 +184,24 @@ via `store.read_root` and reuse the existing diff).
 Failure codes: `version-not-found`, `version-trimmed`, `version-content-missing`,
 `restore-draft-dirty`, `restore-review-pending`.
 
-**P2 — the storage move of ADR 0043.** `objects/` + `history.jsonl` +
-`refs/current`; import existing generations as blobs; stop storing derived
-files; bucket the manifests; add `history_verify`. This is the phase that makes
-long histories affordable and removes the loose-file blast radius, so it is
-worth doing before P3.
+**P2 — the storage move of ADR 0043.** `objects/` + commit graph +
+`workdir.json` as HEAD; import existing generations as objects; stop storing
+derived files; bucket the maps; add `history_verify`. The Store's own
+`generations/` lane keeps its current job (transactions, recovery, fault
+injection) and stops carrying history. This is the phase that makes long
+histories affordable and removes the loose-file blast radius.
 
-**P3 — baseline transitions.** Absorb `decide_all` / `table_*` new-workdir
+**P3 — cherry-pick (ADR 0045).** The narrow, guarded version first: plain
+paragraphs only, `partial-restore-needs-dependent-state` for the coupled ones,
+never a silent fallback to a whole-version restore.
+
+**P4 — baseline transitions.** Absorb `decide_all` / `table_*` new-workdir
 output into the same timeline: new generation + version with
 `baseline_epoch` bumped and template/source fingerprints switched, instead of a
 disjoint workdir. This is what finally removes "workspace sprawl" for
 structural operations.
 
-**P4 — external DOCX ingest (out of scope now).** A human edits the DOCX in
+**P5 — external DOCX ingest (out of scope now).** A human edits the DOCX in
 Word; ingest their file and show what changed. This is the one place an OOXML
 differ earns its keep (docx4j `Differencer`, `OpenXmlDiff`, Docxodus IR diff);
 it is a comparison feature, not a restore mechanism (ADR 0041).

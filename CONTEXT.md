@@ -306,6 +306,22 @@ _Avoid_: 保存, 提交, save
 一个逻辑文档长期复用的 workdir；用户面对的是"这个文档 + 它的版本时间线"，不是一堆并列的 wd/final(2)。
 _Avoid_: 临时目录, 工作副本
 
+**Tree**:
+一个 Version 的完整状态，用内容寻址的语义对象（段落、格式记录、token 表、样式、模板）组成的 Merkle 根；两个 Version 未改动的部分共享同一批对象。
+_Avoid_: 目录快照, 文件树
+
+**Version dirty**:
+canonical 状态已偏离 HEAD 所指的 Version（格式/决策类操作直接改 canonical 而不立即成版本）；与 draft dirty（投影偏离 canonical）互相独立。
+_Avoid_: 未保存, 脏草稿
+
+**Export receipt**:
+一次导出的凭据（产物路径、sha256、所依据的 Version）；作为操作证据累积，不写回不可变的 Version 记录。
+_Avoid_: 导出记录（写在版本里）
+
+**Cherry-pick**:
+把指定段落回到某个历史 Version 内容的语义操作；因段落会引用全局 token/锚点，只在那段落可自证无害时成立，否则 fail-closed。
+_Avoid_: 局部恢复, 段落回退
+
 **Baseline transition**:
 同一文档进入新基线纪元的 Version（模板/源指纹切换、重新 extract）；用户仍只看到"下一个版本"。
 _Avoid_: 新 workdir, 重抽取
