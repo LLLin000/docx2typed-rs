@@ -7,9 +7,11 @@ change later (zstd, packs) without any version id changing.
 
 What a tree stores is the CANONICAL state only — ``typed.md`` (per paragraph),
 ``format.json`` (per paragraph record), ``revisions.json``, ``styles.json``,
-``_template.docx``. Derived views (``edit.md``, ``regions.md``,
-``revisions.md``, ``.review/snapshots/*``) are regenerated on materialisation
-and never stored: that is where most of the old per-generation bytes went.
+``edit.md``, ``regions.md``, and ``revisions.md`` are derived views, not object
+pool assets; materialisation regenerates them. The generation transaction lane
+may carry immutable ``.review/snapshots/*`` entries as hard links (or copies on
+filesystems without hard-link support) so review history stays available
+without duplicating the snapshot payload.
 
 Objects:
     blob:<sha>      raw bytes of one asset or one chunk

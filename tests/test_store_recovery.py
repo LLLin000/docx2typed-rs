@@ -135,6 +135,52 @@ def test_mutation_timings_are_opt_in(tmp_path, monkeypatch):
     } <= {phase["name"] for phase in row["phases"]}
 
 
+def test_generation_copy_shares_immutable_review_snapshots(tmp_path):
+    from scripts import store as store_module
+
+    source = tmp_path / "source"
+    snapshot_dir = source / ".review" / "snapshots"
+    snapshot_dir.mkdir(parents=True)
+    snapshot = snapshot_dir / "C0.json"
+    snapshot.write_bytes(b"immutable snapshot")
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+
+    store_module._copy_tree(source, first)
+    store_module._copy_tree(first, second)
+    first_snapshot = first / ".review" / "snapshots" / "C0.json"
+    second_snapshot = second / ".review" / "snapshots" / "C0.json"
+    assert first_snapshot.is_file() and second_snapshot.is_file()
+    try:
+        shared = os.path.samefile(first_snapshot, second_snapshot)
+    except OSError:
+        shared = False
+    if not shared:
+        pytest.skip("filesystem does not support hard links")
+    assert second_snapshot.read_bytes() == first_snapshot.read_bytes()
+    assert second_snapshot.stat().st_nlink >= 2
+
+
+def test_generation_copy_falls_back_when_hardlinks_are_unavailable(tmp_path, monkeypatch):
+    from scripts import store as store_module
+
+    source = tmp_path / "source"
+    snapshot_dir = source / ".review" / "snapshots"
+    snapshot_dir.mkdir(parents=True)
+    snapshot = snapshot_dir / "C0.json"
+    snapshot.write_bytes(b"immutable snapshot")
+    target = tmp_path / "target"
+
+    def fail_link(*_args, **_kwargs):
+        raise OSError("hard links unavailable")
+
+    monkeypatch.setattr(store_module.os, "link", fail_link)
+    store_module._copy_tree(source, target)
+    copied = target / ".review" / "snapshots" / "C0.json"
+    assert copied.read_bytes() == snapshot.read_bytes()
+    assert not os.path.samefile(snapshot, copied)
+
+
 def _free_port() -> int:
     import socket
 

@@ -66,8 +66,11 @@ History **is** the version commit graph. No history file, no separate ledger:
   before the CAS leaves unreferenced objects (harmless, collectable); there is
   no window in which a pointer names an incomplete commit, which is the
   coordination problem the JSONL layout would have had.
-- **Derived files are never stored**: `edit.md`, `regions.md`, `revisions.md`,
-  and `.review/snapshots/*` are regenerated on materialisation (ADR 0041).
+- **Derived views are not object-pool assets**: `edit.md`, `regions.md`,
+  `revisions.md`, and `.review/snapshots/*` are regenerated on materialisation.
+  The transaction generation may retain immutable review snapshots as hard
+  links (falling back to byte copies when the filesystem cannot link them), so
+  review history remains available without repeating their payload bytes.
 - **`Snapshot` stays as a name, not a second object.** The collaboration layer
   keeps its `C<n>` display id and its live session, but the authoritative
   binding of a snapshot becomes its **tree hash** (the record carries it), so

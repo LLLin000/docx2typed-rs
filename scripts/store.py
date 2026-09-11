@@ -351,9 +351,31 @@ def _fsync_tree(root: Path) -> None:
 
 
 def _copy_tree(source: Path, target: Path) -> None:
-    """Copy one generation snapshot (files + structure, byte-exact)."""
+    """Copy one generation snapshot, sharing immutable review snapshots.
+
+    Review snapshots are append-only render artifacts: existing files are never
+    rewritten, while each new round gets a new ``C<n>`` name. Hard-linking them
+    removes the large per-generation byte copy without sharing mutable assets.
+    Filesystems without hard-link support fall back to the old byte copy.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, target, dirs_exist_ok=False)
+
+    def copy_file(src: str, dst: str) -> str:
+        relative = Path(src).relative_to(source)
+        if relative.parts[:2] == (".review", "snapshots"):
+            try:
+                os.link(src, dst)
+                return dst
+            except OSError:
+                pass
+        return shutil.copy2(src, dst)
+
+    shutil.copytree(
+        source,
+        target,
+        dirs_exist_ok=False,
+        copy_function=copy_file,
+    )
 
 
 def _walk_files(root: Path) -> list[Path]:

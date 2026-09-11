@@ -191,11 +191,18 @@ Measured on the 3000-paragraph fixture (976 KB source):
 | bytes a version adds | ~4.4 MB | **5–44 KB** |
 | blob lost | silent | detected + named (version, path, chunk) |
 
-Where the 5.33 MB goes: `.review/snapshots/C*.json` 0.66 MB **each** (derived,
-accumulated inside every later generation), `format.json` 1.21 MB,
-`_template.docx` 0.95 MB (identical everywhere), `typed.md` 0.20 MB. A
-one-paragraph edit changes 1 of 3100 `format.json` records (0.3 KB) and one
+The 5.33 MB figure is the pre-object-pool generation baseline:
+`.review/snapshots/C*.json` was 0.66 MB **per generation** because each later
+generation copied every prior render; `format.json` was 1.21 MB,
+`_template.docx` 0.95 MB (identical everywhere), and `typed.md` 0.20 MB. A
+one-paragraph edit changed 1 of 3100 `format.json` records (0.3 KB) and one
 line of `typed.md` (0.2 KB).
+
+Current generation copy hard-links immutable review snapshot files where the
+filesystem supports it and falls back to byte copying otherwise. A local
+40-generation probe with 45 × 128 KiB snapshots kept 1,800 paths but reduced
+the unique snapshot payload from 235.9 MB to 5.9 MB; this is a storage
+optimization, not a change to review-history semantics.
 
 History moves to content-addressed objects whose version commit parent chain
 is anchored by `workdir.json` HEAD: `objects/<sha256>` plus commit, tree, map,
