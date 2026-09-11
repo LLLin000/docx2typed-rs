@@ -28,9 +28,12 @@ from scripts.extract import extract  # noqa: E402
 from scripts.mcp_server import (  # noqa: E402
     build_docx,
     commit_sync,
+    decide_all,
     document_patch,
     format_span,
+    history_gc,
     history_list,
+    history_verify,
     history_restore,
     session,
     verify_output,
@@ -301,3 +304,137 @@ def test_c8b_cherry_pick_refuses_a_coupled_paragraph(tmp_path):
     detail = (refusal.structuredContent["diagnostics"][0].get("message") or "")
     assert coupled in detail and "token" in detail
     assert head_version(workdir)["version"] == before     # nothing was written
+
+
+# ---------------------------------------------------------------------------
+# P2 — history lives in the object pool (ADR 0043)
+# ---------------------------------------------------------------------------
+
+def test_p2_state_round_trips_through_the_object_pool(tmp_path):
+    """A tree stores canonical state only; materialising it must be byte-exact
+    (the split is paragraph-keyed, and a state the splitter cannot round-trip
+    falls back to whole blobs)."""
+    import scripts.objectstore as objects
+
+    workdir = _open(tmp_path, "pool")
+    _edit(workdir, CONFUSING[6:12], "池化版本")
+    _save(workdir, "V1")
+
+    tree_id = head_version(workdir)["tree_object"]
+    assert tree_id, "a saved version must carry a tree object"
+    materialised = tmp_path / "materialised"
+    objects.materialize(workdir, tree_id, materialised)
+    for name in ("typed.md", "format.json", "revisions.json", "styles.json", "_template.docx"):
+        assert (materialised / name).read_bytes() == (workdir / name).read_bytes(), name
+    assert objects.verify(workdir, tree_id)["ok"] is True
+
+
+def test_p2_version_content_survives_its_generation_being_reclaimed(tmp_path):
+    """The point of the pool: history stops depending on a full copy of the
+    workspace surviving per version."""
+    import shutil as _shutil
+
+    workdir = _open(tmp_path, "poolrestore")
+    _edit(workdir, CONFUSING[6:12], "第一版")
+    _save(workdir, "V1")
+    _edit(workdir, "第一版", "第二版", operation_id="edit-2")
+    _save(workdir, "V2")
+
+    first = next(v for v in store_history_list(workdir)["versions"] if v["version"] == "V1")
+    generation = store_dir_path(workdir) / "generations" / str(first["generation"])
+    assert generation.is_dir()
+    _shutil.rmtree(generation)
+
+    restored = history_restore("V1", operation_id="pool-restore")
+    assert not _fails(restored), restored
+    assert head_version(workdir)["tree"] == first["head_tree"]
+
+    exported = build_docx(output=str(tmp_path / "v1.docx"), version="V1", operation_id="pool-export")
+    assert not _fails(exported), exported
+
+
+def test_p2_a_missing_object_is_detected_not_silently_substituted(tmp_path):
+    """Deleting one blob must surface as version-content-missing naming it."""
+    import scripts.objectstore as objects
+
+    workdir = _open(tmp_path, "pooldamage")
+    _edit(workdir, CONFUSING[6:12], "会损坏的一版")
+    _save(workdir, "V1")
+    _edit(workdir, "会损坏的一版", "下一版", operation_id="edit-2")
+    _save(workdir, "V2")
+
+    first = next(v for v in store_history_list(workdir)["versions"] if v["version"] == "V1")
+    tree = objects.read_tree(workdir, first["tree_object"])
+    whole = (tree["parts"].get("styles.json") or {}).get("whole")
+    assert whole
+    objects.object_path(workdir, "blob", whole).unlink()
+
+    assert objects.verify(workdir, first["tree_object"])["ok"] is False
+    refused = history_restore("V1", operation_id="damaged")
+    assert _fails(refused) == "version-content-missing"
+
+
+def test_p2_retention_reclaims_generations_but_never_commit_metadata(tmp_path):
+    """history_gc trims content past retention; the versions still list, and a
+    labelled version is kept whatever the count limit says."""
+    workdir = _open(tmp_path, "poolgc")
+    for index in range(3):
+        text = CONFUSING[6:12] if index == 0 else f"第{index}版"
+        _edit(workdir, text, f"第{index + 1}版", operation_id=f"edit-{index}")
+        _save(workdir, f"第{index + 1}版")
+
+    before = len([d for d in (store_dir_path(workdir) / "generations").iterdir() if d.is_dir()])
+    plan = json.loads(history_gc(keep_last=1, dry_run=True))
+    assert plan["generations_reclaimable"] >= 1
+    done = json.loads(history_gc(keep_last=1, dry_run=False))
+    after = len([d for d in (store_dir_path(workdir) / "generations").iterdir() if d.is_dir()])
+    assert after < before, (before, after)
+
+    # every version still lists, and every one is still restorable from the pool
+    versions = store_history_list(workdir)["versions"]
+    assert [v["version"] for v in versions] == ["V3", "V2", "V1"]
+    assert all(v["content"] == "retained" for v in versions)
+    assert json.loads(history_verify())["ok"] is True
+    assert not _fails(history_restore("V1", operation_id="gc-restore"))
+
+
+# ---------------------------------------------------------------------------
+# P3 — structural operations become baseline transitions (one workspace)
+# ---------------------------------------------------------------------------
+
+def test_p3_accept_all_is_adopted_as_the_next_version(tmp_path):
+    """decide_all without workdir_out must not create a sibling workdir: the new
+    baseline becomes this workspace's next version, with the epoch bumped."""
+    source = ROOT / "corpus" / "release" / "revisions.docx"
+    workdir = tmp_path / "adopt"
+    assert extract([str(source), "-o", str(workdir)]) == 0
+    _reset()
+    asserts_open = workdir_open(str(workdir), track=True)
+    assert not _fails(asserts_open), asserts_open
+
+    records = json.loads((workdir / "format.json").read_text(encoding="utf-8"))["paragraphs"]
+    free = next(r["id"] for r in records if not r.get("token_ids"))
+    text = _paragraph_text(workdir, free)
+    _edit_paragraph(workdir, free, text[:4], text[:3] + "改")
+    _save(workdir, "改一版")
+    before = head_version(workdir)
+
+    decided = tmp_path / "decided.docx"
+    result = decide_all(action="accept", output=str(decided), operation_id="p3-accept")
+    assert not _fails(result), result
+    assert _j(result)["adopted"] is True
+
+    after = head_version(workdir)
+    assert after["version"] != before["version"]
+    assert after["baseline_epoch"] == (before.get("baseline_epoch") or 1) + 1
+    assert after["dirty"] is False
+    assert decided.is_file()
+
+    # no sibling workdir was created, the workspace still works, and the
+    # transition is visible in the timeline
+    assert sorted(p.name for p in tmp_path.iterdir() if p.is_dir()) == ["adopt"]
+    assert not _fails(commit_sync(operation_id="p3-after"))  # no-op save
+    version = next(v for v in store_history_list(workdir)["versions"] if v["version"] == after["version"])
+    assert version["origin"] == "baseline-transition"
+    assert version["baseline_epoch"] == after["baseline_epoch"]
+    assert not _fails(build_docx(output=str(tmp_path / "after.docx"), operation_id="p3-build"))

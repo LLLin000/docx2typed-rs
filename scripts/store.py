@@ -482,7 +482,15 @@ def _probe_or_reuse(store_dir: Path) -> dict[str, Any]:
 # Pointer, generation manifest, journal records
 # --------------------------------------------------------------------------
 
-VERSION_POINTER_FIELDS = ("head_version", "head_version_generation", "head_tree", "version_seq")
+VERSION_POINTER_FIELDS = (
+    "head_version",
+    "head_version_generation",
+    "head_tree",
+    "head_tree_object",
+    "head_commit",
+    "baseline_epoch",
+    "version_seq",
+)
 
 
 def _pointer_payload(
@@ -512,6 +520,9 @@ def _pointer_payload(
         payload["head_version"] = version["version"]
         payload["head_version_generation"] = generation
         payload["head_tree"] = version["head_tree"]
+        payload["head_tree_object"] = version.get("tree_object")
+        payload["head_commit"] = version.get("commit")
+        payload["baseline_epoch"] = version.get("baseline_epoch") or 1
         payload["version_seq"] = version["seq"]
     return payload
 
@@ -1650,17 +1661,38 @@ class Store:
                     boundary = transaction.save_boundary
                     predecessor = _read_pointer(self.root) or {}
                     sequence = int(predecessor.get("version_seq") or 0) + 1
+                    digest = _canonical_tree_digest(gen_dir)
+                    # history lives in the object pool, not in the generation
+                    # directory: the content is deduplicated, verifiable, and
+                    # survives the generation being reclaimed (ADR 0043)
+                    from .objectstore import build_tree, write_commit
+
+                    tree_result = build_tree(self.root, gen_dir, digest=digest)
                     version_record = {
                         "version": f"V{sequence}",
                         "seq": sequence,
                         "parent_version": predecessor.get("head_version"),
                         "parent_generation": predecessor.get("head_version_generation"),
-                        "head_tree": _canonical_tree_digest(gen_dir),
+                        "parent_commit": predecessor.get("head_commit"),
+                        "head_tree": digest,
+                        "tree_object": tree_result["tree"],
+                        "baseline_epoch": int(
+                            boundary.get("baseline_epoch") or predecessor.get("baseline_epoch") or 1
+                        ),
                         "origin": boundary.get("origin") or "commit_sync",
                         "label": boundary.get("label"),
                         "restored_from": boundary.get("restored_from"),
                         "created_at": _now_iso(),
                     }
+                    version_record["commit"] = write_commit(
+                        self.root,
+                        {
+                            key: value
+                            for key, value in version_record.items()
+                            if key != "commit"
+                        }
+                        | {"generation": generation_id},
+                    )
                 if generation:
                     manifest = _generation_manifest(
                         gen_dir,
@@ -1933,6 +1965,7 @@ class Transaction:
         origin: str,
         label: str | None = None,
         restored_from: str | None = None,
+        baseline_epoch: int | None = None,
     ) -> None:
         """Declare that THIS mutation creates a user Version (ADR 0044).
 
@@ -1943,6 +1976,7 @@ class Transaction:
             "origin": origin,
             "label": label,
             "restored_from": restored_from,
+            "baseline_epoch": baseline_epoch,
         }
 
     @property
@@ -2011,7 +2045,10 @@ def head_version(root: str | Path) -> dict[str, Any]:
         "version": pointer.get("head_version"),
         "generation": pointer.get("head_version_generation"),
         "seq": pointer.get("version_seq"),
+        "commit": pointer.get("head_commit"),
         "tree": recorded,
+        "tree_object": pointer.get("head_tree_object"),
+        "baseline_epoch": pointer.get("baseline_epoch"),
         "canonical_tree": current,
         # no recorded tree yet == the document has never been saved: it counts
         # as dirty so the first commit creates V1
@@ -2019,13 +2056,12 @@ def head_version(root: str | Path) -> dict[str, Any]:
     }
 
 
-def _version_chain(root: Path) -> list[dict[str, Any]]:
-    """Version records from HEAD backwards, newest first (the commit graph)."""
-    pointer = _read_pointer(root) or {}
+def _legacy_chain(root: Path, generation: str | None) -> list[dict[str, Any]]:
+    """Version records that live in generation manifests (pre-object-pool
+    workdirs). Newer saves write commit objects instead (ADR 0043)."""
     generations_dir = root / STORE_DIR_NAME / "generations"
     chain: list[dict[str, Any]] = []
     seen: set[str] = set()
-    generation = pointer.get("head_version_generation")
     while isinstance(generation, str) and generation and generation not in seen:
         seen.add(generation)
         manifest_path = generations_dir / generation / "generation.json"
@@ -2042,6 +2078,40 @@ def _version_chain(root: Path) -> list[dict[str, Any]]:
         record["content"] = "retained"
         chain.append(record)
         generation = record.get("parent_generation")
+    return chain
+
+
+def _version_chain(root: Path) -> list[dict[str, Any]]:
+    """Version records from HEAD backwards, newest first.
+
+    The commit chain in the object pool is the history; a workdir saved before
+    the pool existed falls back to its generation manifests, and the two are
+    joined at the point where the newest commit names a legacy parent."""
+    pointer = _read_pointer(root) or {}
+    try:
+        from .objectstore import has as _has_object, read_commit as _read_commit
+    except ImportError:  # pragma: no cover - direct script execution
+        from objectstore import has as _has_object, read_commit as _read_commit
+
+    chain: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    commit = pointer.get("head_commit")
+    while isinstance(commit, str) and commit and commit not in seen:
+        seen.add(commit)
+        record = _read_commit(root, commit)
+        if record is None:
+            break
+        record["commit"] = commit
+        tree_object = record.get("tree_object")
+        if isinstance(tree_object, str):
+            record["content"] = "retained" if _has_object(root, "tree", tree_object) else "trimmed"
+        else:
+            record["content"] = "retained"  # content still rides in its generation
+        chain.append(record)
+        commit = record.get("parent_commit")
+    tail = chain[-1] if chain else {}
+    legacy_generation = tail.get("parent_generation") if chain else pointer.get("head_version_generation")
+    chain.extend(_legacy_chain(root, legacy_generation))
     return chain
 
 
@@ -2114,6 +2184,111 @@ def state(root: str | Path) -> dict[str, Any]:
         "reserve_depleted": (root_path / STORE_DIR_NAME / "reserve-depleted.json").exists(),
         "filesystem_qualified": True,
     }
+
+
+def history_verify(root: str | Path) -> dict[str, Any]:
+    """Every retained version's content, still present and hash-correct?
+
+    A missing object is detected and named — never silently different content."""
+    root_path = Path(root).resolve()
+    try:
+        from .objectstore import has as _has_object, verify as _verify_tree
+    except ImportError:  # pragma: no cover - direct script execution
+        from objectstore import has as _has_object, verify as _verify_tree
+
+    results: list[dict[str, Any]] = []
+    ok = True
+    for record in _version_chain(root_path):
+        tree_object = record.get("tree_object")
+        if isinstance(tree_object, str) and tree_object:
+            report = (
+                _verify_tree(root_path, tree_object)
+                if _has_object(root_path, "tree", tree_object)
+                else {"ok": False, "missing": ["tree"], "checked": 0}
+            )
+            results.append({
+                "version": record.get("version"),
+                "content": "retained" if report["ok"] else "missing",
+                "missing": report["missing"][:5],
+            })
+            ok = ok and report["ok"]
+            continue
+        generation = root_path / STORE_DIR_NAME / "generations" / str(record.get("generation") or "")
+        present = generation.is_dir()
+        results.append({
+            "version": record.get("version"),
+            "content": "retained" if present else "missing",
+            "missing": [] if present else ["generation"],
+        })
+        ok = ok and present
+    return {"schema": "docx2typed-history-verify-1", "ok": ok, "versions": results}
+
+
+def history_gc(
+    root: str | Path,
+    *,
+    keep_last: int = 50,
+    reclaim_generations: bool = True,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Retention: reclaim content past the limit; commit metadata is never dropped.
+
+    A trimmed version still lists (ADR 0042) and its restore fails closed. With
+    the object pool holding a version's content, the generation it was saved
+    from is reclaimable — that is what stops history from costing a full copy
+    per version (ADR 0043)."""
+    root_path = Path(root).resolve()
+    store = Store(root_path)
+    with store.writer(timeout_ms=0):
+        chain = _version_chain(root_path)
+        retained = [r for index, r in enumerate(chain) if index < keep_last or r.get("label")]
+        keep_trees = {r["tree_object"] for r in retained if r.get("tree_object")}
+        keep_generations = {r.get("generation") for r in chain if not r.get("tree_object")}
+        pointer = _read_pointer(root_path) or {}
+        if pointer.get("generation"):
+            keep_generations.add(pointer["generation"])
+        if store.transactions_dir.is_dir():
+            for tx_dir in store.transactions_dir.iterdir():
+                for record in _read_phases_soft(tx_dir) or []:
+                    if isinstance(record.get("generation"), str):
+                        keep_generations.add(record["generation"])
+
+        reclaimable: list[str] = []
+        if reclaim_generations and store.generations_dir.is_dir():
+            for gen_dir in sorted(store.generations_dir.iterdir()):
+                if not gen_dir.is_dir() or gen_dir.name in keep_generations:
+                    continue
+                try:
+                    manifest = json.loads((gen_dir / "generation.json").read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                tree_object = ((manifest.get("version") or {}) or {}).get("tree_object")
+                if isinstance(tree_object, str) and tree_object in keep_trees:
+                    reclaimable.append(gen_dir.name)
+
+        report: dict[str, Any] = {
+            "schema": "docx2typed-history-gc-1",
+            "versions_total": len(chain),
+            "versions_retained": len(retained),
+            "trees_kept": len(keep_trees),
+            "generations_reclaimable": len(reclaimable),
+            "dry_run": dry_run,
+            "swept_objects": 0,
+            "freed_bytes": 0,
+        }
+        if dry_run:
+            return report
+        try:
+            from .objectstore import sweep as _sweep
+        except ImportError:  # pragma: no cover - direct script execution
+            from objectstore import sweep as _sweep
+
+        swept = _sweep(root_path, keep_trees=keep_trees)
+        report["swept_objects"] = swept["removed"]
+        report["freed_bytes"] = swept["freed"]
+        for generation in reclaimable:
+            shutil.rmtree(store.generations_dir / generation, ignore_errors=True)
+        return report
 
 
 def _copy_root_assets(root: Path, gen_dir: Path) -> None:

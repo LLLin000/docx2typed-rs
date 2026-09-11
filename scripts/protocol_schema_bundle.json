@@ -1883,12 +1883,6 @@
     },
     "decide_all": {
       "input": {
-        "type": "object",
-        "required": [
-          "action",
-          "output",
-          "workdir_out"
-        ],
         "properties": {
           "action": {
             "type": "string"
@@ -1897,16 +1891,32 @@
             "type": "string"
           },
           "workdir_out": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "operation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
-        "additionalProperties": false
+        "required": [
+          "action",
+          "output"
+        ]
       },
       "output": {
         "$ref": "docx2typed-result-1"
@@ -1914,13 +1924,6 @@
     },
     "table_insert_row": {
       "input": {
-        "type": "object",
-        "required": [
-          "table_ref",
-          "after",
-          "output",
-          "workdir_out"
-        ],
         "properties": {
           "table_ref": {
             "type": "string"
@@ -1932,16 +1935,33 @@
             "type": "string"
           },
           "workdir_out": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "operation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
-        "additionalProperties": false
+        "required": [
+          "table_ref",
+          "after",
+          "output"
+        ]
       },
       "output": {
         "$ref": "docx2typed-result-1"
@@ -1949,13 +1969,6 @@
     },
     "table_delete_row": {
       "input": {
-        "type": "object",
-        "required": [
-          "table_ref",
-          "row",
-          "output",
-          "workdir_out"
-        ],
         "properties": {
           "table_ref": {
             "type": "string"
@@ -1967,16 +1980,33 @@
             "type": "string"
           },
           "workdir_out": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "operation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
-        "additionalProperties": false
+        "required": [
+          "table_ref",
+          "row",
+          "output"
+        ]
       },
       "output": {
         "$ref": "docx2typed-result-1"
@@ -1984,13 +2014,6 @@
     },
     "table_insert_col": {
       "input": {
-        "type": "object",
-        "required": [
-          "table_ref",
-          "after",
-          "output",
-          "workdir_out"
-        ],
         "properties": {
           "table_ref": {
             "type": "string"
@@ -2002,16 +2025,33 @@
             "type": "string"
           },
           "workdir_out": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "operation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
-        "additionalProperties": false
+        "required": [
+          "table_ref",
+          "after",
+          "output"
+        ]
       },
       "output": {
         "$ref": "docx2typed-result-1"
@@ -2019,13 +2059,6 @@
     },
     "table_delete_col": {
       "input": {
-        "type": "object",
-        "required": [
-          "table_ref",
-          "col",
-          "output",
-          "workdir_out"
-        ],
         "properties": {
           "table_ref": {
             "type": "string"
@@ -2037,16 +2070,33 @@
             "type": "string"
           },
           "workdir_out": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "operation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
-        "additionalProperties": false
+        "required": [
+          "table_ref",
+          "col",
+          "output"
+        ]
       },
       "output": {
         "$ref": "docx2typed-result-1"
@@ -2054,15 +2104,6 @@
     },
     "table_merge_cells": {
       "input": {
-        "type": "object",
-        "required": [
-          "table_ref",
-          "row",
-          "col",
-          "span",
-          "output",
-          "workdir_out"
-        ],
         "properties": {
           "table_ref": {
             "type": "string"
@@ -2080,22 +2121,39 @@
             "type": "string"
           },
           "workdir_out": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "discard_content": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "default": false,
+            "type": "boolean"
           },
           "operation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
-        "additionalProperties": false
+        "required": [
+          "table_ref",
+          "row",
+          "col",
+          "span",
+          "output"
+        ]
       },
       "output": {
         "$ref": "docx2typed-result-1"
@@ -2103,15 +2161,6 @@
     },
     "table_split_cells": {
       "input": {
-        "type": "object",
-        "required": [
-          "table_ref",
-          "row",
-          "col",
-          "span",
-          "output",
-          "workdir_out"
-        ],
         "properties": {
           "table_ref": {
             "type": "string"
@@ -2129,16 +2178,35 @@
             "type": "string"
           },
           "workdir_out": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "operation_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
-        "additionalProperties": false
+        "required": [
+          "table_ref",
+          "row",
+          "col",
+          "span",
+          "output"
+        ]
       },
       "output": {
         "$ref": "docx2typed-result-1"
@@ -2768,6 +2836,27 @@
         "required": [
           "version"
         ]
+      }
+    },
+    "history_verify": {
+      "input": {
+        "properties": {},
+        "required": []
+      }
+    },
+    "history_gc": {
+      "input": {
+        "properties": {
+          "keep_last": {
+            "default": 50,
+            "type": "integer"
+          },
+          "dry_run": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": []
       }
     }
   }

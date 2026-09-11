@@ -120,7 +120,9 @@ try:
         find_version,
         has_store,
         head_version as store_head_version,
+        history_gc as store_history_gc,
         history_list as store_history_list,
+        history_verify as store_history_verify,
         read_root,
         store_dir_path,
     )
@@ -5011,21 +5013,55 @@ def _probe_commit_buildability(workdir: Path) -> None:
         shutil.rmtree(scratch_root, ignore_errors=True)
 
 
-def _materialize_version(generation_dir: Path, destination: Path) -> None:
-    """Copy a version's stored state into a plain workdir (for exporting or
-    verifying it) without touching the live workdir or its store."""
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.mkdir(parents=True)
-    for path in sorted(generation_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(generation_dir).as_posix()
-        if rel == "generation.json" or rel.startswith(".docx2typed-store/"):
-            continue
-        target = destination / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, target)
+def _adopt_baseline(baseline: Path, target: Path) -> list[str]:
+    """Adopt a freshly extracted baseline as the next state of THIS workspace.
+
+    A structural operation (accept-all, table edit) changes the template and the
+    source fingerprint, so the whole canonical state is replaced rather than
+    patched. Doing that here, in the store lane, is what turns "a new workdir
+    appears" into "the document gains its next version" (P3, PRD
+    version-timeline): the user keeps one workspace and one timeline.
+    """
+    adopted: list[str] = []
+    for name in (*CANONICAL_ASSETS, "revisions.json"):
+        origin = baseline / name
+        if origin.is_file():
+            shutil.copyfile(origin, target / name)
+            adopted.append(name)
+    for name in ("edit.md", "edit.state.json"):
+        (target / name).unlink(missing_ok=True)
+    refresh_edit_projection(target, init=True)
+    classify_edit_state(target)
+    validate_workdir(target)
+    return adopted
+
+
+def _version_state_dir(workdir: Path, record: dict[str, Any], scratch: Path) -> Path:
+    """The canonical state of a version: materialised from the object pool when
+    the version has a tree there (ADR 0043), else copied from the generation that
+    still carries it (a workdir saved before the pool existed)."""
+    from . import objectstore
+
+    tree_object = record.get("tree_object")
+    if isinstance(tree_object, str) and tree_object and objectstore.has(workdir, "tree", tree_object):
+        report = objectstore.verify(workdir, tree_object)
+        if not report["ok"]:
+            raise ToolError(
+                "version-content-missing",
+                f"{record.get('version')} content is incomplete: {', '.join(report['missing'][:3])}",
+            )
+        objectstore.materialize(workdir, tree_object, scratch)
+        # the pool carries canonical state only: rebuild the bound
+        # projection/sidecar pair so the directory is a usable workdir
+        refresh_edit_projection(scratch, init=True)
+        return scratch
+    generation = store_dir_path(workdir) / "generations" / str(record.get("generation") or "")
+    if generation.is_dir():
+        return generation
+    raise ToolError(
+        "version-trimmed",
+        f"{record.get('version')} has neither pooled content nor a generation left",
+    )
 
 
 def _paragraph_records(workdir: Path) -> dict[str, dict]:
@@ -5194,6 +5230,32 @@ def _commit_sync_impl(
 
 
 @mcp.tool()
+def history_verify() -> str:
+    """Check that every retained version's content is still present and correct.
+
+    Read-only. A missing object is reported per version by name — the
+    counterpart of `git fsck`, and the reason a lost file degrades loudly
+    instead of silently returning different content (ADR 0043)."""
+    with session.lock:
+        workdir = session.require()
+        return _json(store_history_verify(workdir))
+
+
+@mcp.tool()
+def history_gc(keep_last: int = 50, dry_run: bool = True) -> str:
+    """Reclaim history content past retention; commit metadata is never dropped.
+
+    Keeps the most recent ``keep_last`` versions plus every labelled one. With
+    a version's content in the object pool, the generation it was saved from is
+    reclaimable — which is what stops history from costing a full copy per
+    version. A trimmed version still lists and its restore fails closed
+    (ADR 0042). ``dry_run`` (default) reports without deleting."""
+    with session.lock:
+        workdir = session.require()
+        return _json(store_history_gc(workdir, keep_last=keep_last, dry_run=dry_run))
+
+
+@mcp.tool()
 def history_list(limit: int = 20, offset: int = 0) -> str:
     """The version timeline: versions from HEAD backwards, newest first.
 
@@ -5247,8 +5309,9 @@ def history_restore(
                 f"{version} is not in this document's history; call history_list",
                 operation_id=operation_id,
             )
+        pooled = isinstance(record.get("tree_object"), str) and record.get("tree_object")
         source_generation = store_dir_path(workdir) / "generations" / str(record.get("generation") or "")
-        if not source_generation.is_dir():
+        if not pooled and not source_generation.is_dir():
             return _failure_result(
                 "history_restore",
                 "version-trimmed",
@@ -5277,9 +5340,14 @@ def history_restore(
         manifest_before = _workdir_manifest_sha256(workdir)
 
         def run(target, tx=None):
-            recorded = _recorded_assets(source_generation)
+            scratch_state = (
+                tx.staging("version-state") if tx is not None
+                else Path(tempfile.mkdtemp(prefix="docx2typed-version-")) / "state"
+            )
+            source_state = _version_state_dir(workdir, record, scratch_state)
+            recorded = _recorded_assets(source_state)
             for name in CANONICAL_ASSETS:
-                origin = source_generation / name
+                origin = source_state / name
                 if not origin.is_file():
                     raise ToolError("version-content-missing", f"{version} has no recorded {name}")
                 expected = recorded.get(name)
@@ -5297,10 +5365,10 @@ def history_restore(
                 current_root = read_root(workdir)
                 shutil.copyfile(current_root / "typed.md", target / "typed.md")
                 shutil.copyfile(current_root / "format.json", target / "format.json")
-                refusal = _cherry_pick_guard(source_generation, target, selection)
+                refusal = _cherry_pick_guard(source_state, target, selection)
                 if refusal is not None:
                     raise ToolError("partial-restore-needs-dependent-state", refusal)
-                picked = _apply_cherry_pick(source_generation, target, selection)
+                picked = _apply_cherry_pick(source_state, target, selection)
             # the projection and its sidecar are a hash-bound pair: regenerate
             # them from the restored canonical state instead of copying half a
             # binding (copying the pair raw fails as edit-header-tampered)
@@ -5640,22 +5708,31 @@ def delete_comment(comment_id: str, operation_id: str | None = None) -> CallTool
         )
 
 
-def _table_op_tool(operation: str, table_ref: str, output: str, workdir_out: str, *numbers: int, operation_id: str, discard_content: bool = False) -> CallToolResult:
+def _table_op_tool(operation: str, table_ref: str, output: str, workdir_out: str | None, *numbers: int, operation_id: str, discard_content: bool = False) -> CallToolResult:
+    """Structural table edit. Without ``workdir_out`` the new baseline is
+    ADOPTED as this workspace's next version (P3): one workspace, one timeline,
+    no sibling workdir. With it, the old behaviour (a separate baseline
+    workdir) is preserved."""
     from .decisions import _apply_table_op
 
     with session.lock:
         if session.workdir is None:
             return _failure_result(f"table_{operation}", "workdir-not-open", "no workdir open; call workdir_open first", operation_id=operation_id)
         workdir = session.workdir
-        new_workdir = Path(workdir_out).resolve()
+        adopt = workdir_out is None
+        epoch_before = int((store_head_version(workdir) or {}).get("baseline_epoch") or 1)
         manifest_before = _workdir_manifest_sha256(workdir)
 
         def run(target, tx=None):
+            baseline_dir = Path(str(workdir_out)).resolve() if workdir_out else (
+                tx.staging("baseline") if tx is not None
+                else Path(tempfile.mkdtemp(prefix="docx2typed-baseline-")) / "baseline"
+            )
             if tx is not None:
                 output_staged = tx.staging("decided.docx")
                 created = _apply_table_op(
                     target, table_ref, operation, list(numbers),
-                    output_staged, Path(workdir_out),
+                    output_staged, baseline_dir,
                     discard_content=discard_content,
                 )
                 tx.stage_external(Path(output).resolve(), output_staged, mode="create")
@@ -5667,11 +5744,26 @@ def _table_op_tool(operation: str, table_ref: str, output: str, workdir_out: str
             else:
                 created = _apply_table_op(
                     target, table_ref, operation, list(numbers),
-                    Path(output), Path(workdir_out),
+                    Path(output), baseline_dir,
                     discard_content=discard_content,
                 )
                 output_real = Path(output).resolve()
                 docx_evidence = {"sha256": file_sha256(output_real)}
+            if adopt:
+                _adopt_baseline(created, target)
+                collaboration = document_state(target)
+                publish_current(
+                    target,
+                    expected_parent_snapshot=collaboration["current_snapshot"]["id"],
+                    origin="baseline-transition",
+                    changed_paragraph_ids=[],
+                )
+                if tx is not None:
+                    tx.mark_save_boundary(
+                        origin="baseline-transition",
+                        label=f"table {operation} (baseline E{epoch_before + 1})",
+                        baseline_epoch=epoch_before + 1,
+                    )
             payload = {
                 **base_evidence_payload(),
                 "inputs": {"workdir": {"manifest_sha256": manifest_before}},
@@ -5684,7 +5776,12 @@ def _table_op_tool(operation: str, table_ref: str, output: str, workdir_out: str
             }
             return (
                 "success",
-                {"operation": operation, "table": table_ref, "workdir": str(created)},
+                {
+                    "operation": operation,
+                    "table": table_ref,
+                    "adopted": adopt,
+                    "workdir": str(workdir) if adopt else str(created),
+                },
                 "mutation",
                 payload,
                 [],
@@ -5701,47 +5798,47 @@ def _table_op_tool(operation: str, table_ref: str, output: str, workdir_out: str
                 "args": list(numbers),
                 "discard_content": discard_content,
             },
-            new_workdir,
+            workdir if adopt else Path(str(workdir_out)).resolve(),
             directory=True,
-            evidence_path=new_workdir / "run.evidence.json",
+            evidence_path=(workdir / "run.evidence.json") if adopt else (Path(str(workdir_out)).resolve() / "run.evidence.json"),
             run=run,
             store_workdir=workdir,
-            store_generation=False,
+            store_generation=adopt,
             require_agent_preflight=True,
         )
 
 
 @mcp.tool()
-def table_insert_row(table_ref: str, after: int, output: str, workdir_out: str, operation_id: str | None = None) -> CallToolResult:
+def table_insert_row(table_ref: str, after: int, output: str, workdir_out: str | None = None, operation_id: str | None = None) -> CallToolResult:
     """Insert an empty row after ``after`` (0-based) in ``table_ref`` (T0).
-    Produces a new DOCX and clean-baseline workdir; the source is untouched.
+    Without ``workdir_out`` the new baseline is ADOPTED as this workspace's next version (a baseline transition: one workspace, one timeline); with it, a separate baseline workdir is produced instead. The source is never mutated in place.
     Mutating: ``operation_id`` is optional; omitted IDs are generated."""
     return _table_op_tool("insert-row", table_ref, output, workdir_out, after, operation_id=operation_id)
 
 
 @mcp.tool()
-def table_delete_row(table_ref: str, row: int, output: str, workdir_out: str, operation_id: str | None = None) -> CallToolResult:
+def table_delete_row(table_ref: str, row: int, output: str, workdir_out: str | None = None, operation_id: str | None = None) -> CallToolResult:
     """Delete row ``row`` (0-based) from ``table_ref``.
     Mutating: ``operation_id`` is optional; omitted IDs are generated."""
     return _table_op_tool("delete-row", table_ref, output, workdir_out, row, operation_id=operation_id)
 
 
 @mcp.tool()
-def table_insert_col(table_ref: str, after: int, output: str, workdir_out: str, operation_id: str | None = None) -> CallToolResult:
+def table_insert_col(table_ref: str, after: int, output: str, workdir_out: str | None = None, operation_id: str | None = None) -> CallToolResult:
     """Insert an empty column after ``after`` (0-based) in every row.
     Mutating: ``operation_id`` is optional; omitted IDs are generated."""
     return _table_op_tool("insert-col", table_ref, output, workdir_out, after, operation_id=operation_id)
 
 
 @mcp.tool()
-def table_delete_col(table_ref: str, col: int, output: str, workdir_out: str, operation_id: str | None = None) -> CallToolResult:
+def table_delete_col(table_ref: str, col: int, output: str, workdir_out: str | None = None, operation_id: str | None = None) -> CallToolResult:
     """Delete column ``col`` (0-based) from ``table_ref``.
     Mutating: ``operation_id`` is optional; omitted IDs are generated."""
     return _table_op_tool("delete-col", table_ref, output, workdir_out, col, operation_id=operation_id)
 
 
 @mcp.tool()
-def table_merge_cells(table_ref: str, row: int, col: int, span: int, output: str, workdir_out: str, discard_content: bool = False, operation_id: str | None = None) -> CallToolResult:
+def table_merge_cells(table_ref: str, row: int, col: int, span: int, output: str, workdir_out: str | None = None, discard_content: bool = False, operation_id: str | None = None) -> CallToolResult:
     """Merge ``span`` cells horizontally starting at (row, col) via gridSpan.
 
     Fail-closed: when a spanned cell (beyond the first) carries text, the
@@ -5752,7 +5849,7 @@ def table_merge_cells(table_ref: str, row: int, col: int, span: int, output: str
 
 
 @mcp.tool()
-def table_split_cells(table_ref: str, row: int, col: int, span: int, output: str, workdir_out: str, operation_id: str | None = None) -> CallToolResult:
+def table_split_cells(table_ref: str, row: int, col: int, span: int, output: str, workdir_out: str | None = None, operation_id: str | None = None) -> CallToolResult:
     """Split the cell at (row, col) into ``span`` cells.
     Mutating: ``operation_id`` is optional; omitted IDs are generated."""
     return _table_op_tool("split-cells", table_ref, output, workdir_out, row, col, span, operation_id=operation_id)
@@ -5762,13 +5859,17 @@ def table_split_cells(table_ref: str, row: int, col: int, span: int, output: str
 def decide_all(
     action: str,
     output: str,
-    workdir_out: str,
+    workdir_out: str | None = None,
     operation_id: str | None = None,
 ) -> CallToolResult:
-    """Accept or reject every revision and produce a new clean-baseline
-    project: build a decided DOCX at ``output`` and re-extract it into a new
-    workdir at ``workdir_out`` (normalization governance). The original
-    workdir is never mutated. ``action``: accept | reject.
+    """Accept or reject every revision and produce a clean baseline.
+
+    With ``workdir_out`` the decided DOCX is re-extracted into a NEW workdir
+    (normalization governance) and this workspace is left alone. WITHOUT it —
+    the recommended form — the baseline is ADOPTED by this workspace as its
+    next version: the template/source fingerprint switch is recorded as a
+    baseline transition, so the user keeps one workspace and one timeline
+    instead of accumulating sibling workdirs. ``action``: accept | reject.
 
     Mutating: ``operation_id`` may be omitted (the server generates a fresh
     id). Identical retries replay the original result; changed input or a
@@ -5780,24 +5881,44 @@ def decide_all(
         workdir = session.workdir
         if action not in ("accept", "reject"):
             return _failure_result("decide_all", "invalid-action", "action must be accept or reject", operation_id=operation_id)
-        new_workdir = Path(workdir_out).resolve()
+        adopt = workdir_out is None
+        epoch_before = int((store_head_version(workdir) or {}).get("baseline_epoch") or 1)
         manifest_before = _workdir_manifest_sha256(workdir)
 
         def run(target, tx=None):
             from .decisions import _decide_all
 
+            baseline_dir = Path(workdir_out).resolve() if workdir_out else (
+                tx.staging("baseline") if tx is not None
+                else Path(tempfile.mkdtemp(prefix="docx2typed-baseline-")) / "baseline"
+            )
             if tx is not None:
                 output_staged = tx.staging("decided.docx")
-                created = _decide_all(target, action, output_staged, Path(workdir_out))
+                created = _decide_all(target, action, output_staged, baseline_dir)
                 tx.stage_external(Path(output).resolve(), output_staged, mode="create")
                 # Publish happens after the prepared journal: the final path
                 # does not exist yet, so hash the staged artifact.
                 output_real = Path(output).resolve()
                 docx_evidence = {"sha256": file_sha256(output_staged), "path": str(output_real)}
             else:
-                created = _decide_all(target, action, Path(output), Path(workdir_out))
+                created = _decide_all(target, action, Path(output), baseline_dir)
                 output_real = Path(output).resolve()
                 docx_evidence = {"sha256": file_sha256(output_real)}
+            if adopt:
+                _adopt_baseline(created, target)
+                collaboration = document_state(target)
+                publish_current(
+                    target,
+                    expected_parent_snapshot=collaboration["current_snapshot"]["id"],
+                    origin="baseline-transition",
+                    changed_paragraph_ids=[],
+                )
+                if tx is not None:
+                    tx.mark_save_boundary(
+                        origin="baseline-transition",
+                        label=f"{action} all revisions (baseline E{epoch_before + 1})",
+                        baseline_epoch=epoch_before + 1,
+                    )
             report = json.loads((created / "decisions.json").read_text(encoding="utf-8"))
             payload = {
                 **base_evidence_payload(),
@@ -5815,14 +5936,21 @@ def decide_all(
                 {
                     "action": action,
                     "output": str(output_real),
-                    "workdir": str(created),
-                    "note": "original workdir untouched; decisions.json in the new workdir",
+                    "adopted": adopt,
+                    "workdir": str(workdir) if adopt else str(created),
+                    "note": (
+                        "baseline adopted by this workspace as its next version "
+                        f"(baseline epoch {epoch_before + 1}); no sibling workdir was created"
+                        if adopt
+                        else "original workdir untouched; decisions.json in the new workdir"
+                    ),
                 },
                 "mutation",
                 payload,
                 [],
             )
 
+        anchor = workdir if adopt else Path(str(workdir_out)).resolve()
         return _mutation_tool(
             operation_id,
             "decide_all",
@@ -5832,12 +5960,12 @@ def decide_all(
                 "output": output,
                 "workdir_out": workdir_out,
             },
-            new_workdir,
+            anchor,
             directory=True,
-            evidence_path=new_workdir / "run.evidence.json",
+            evidence_path=(workdir / "run.evidence.json") if adopt else (anchor / "run.evidence.json"),
             run=run,
             store_workdir=workdir,
-            store_generation=False,
+            store_generation=adopt,
             require_agent_preflight=True,
         )
 
@@ -6326,7 +6454,7 @@ def build_docx(
             return _failure_result("build_docx", "workdir-not-open", "no workdir open; call workdir_open first", operation_id=operation_id)
         workdir = session.workdir
         exported_version: str | None = None
-        version_source: Path | None = None
+        version_record: dict[str, Any] | None = None
         if version is not None:
             record = find_version(workdir, version)
             if record is None:
@@ -6336,14 +6464,16 @@ def build_docx(
                     f"{version} is not in this document's history; call history_list",
                     operation_id=operation_id,
                 )
-            version_source = store_dir_path(workdir) / "generations" / str(record.get("generation") or "")
-            if not version_source.is_dir():
+            pooled = isinstance(record.get("tree_object"), str) and record.get("tree_object")
+            generation_dir = store_dir_path(workdir) / "generations" / str(record.get("generation") or "")
+            if not pooled and not generation_dir.is_dir():
                 return _failure_result(
                     "build_docx",
                     "version-trimmed",
                     f"{version} content has been trimmed by retention and can no longer be exported",
                     operation_id=operation_id,
                 )
+            version_record = record
             exported_version = version
         manifest_before = _workdir_manifest_sha256(workdir)
         resolved_output = (
@@ -6378,14 +6508,13 @@ def build_docx(
 
         def run(target, tx=None):
             source = target
-            if version_source is not None:
+            if version_record is not None:
                 # export a historical version: materialise its state into a
                 # scratch workdir and build there, so HEAD and the live
                 # workdir are untouched
-                scratch = (tx.staging("version-workdir") if tx is not None else Path(
-                    tempfile.mkdtemp(prefix="docx2typed-export-")) / "wd")
-                _materialize_version(version_source, scratch)
-                source = scratch
+                scratch = (tx.staging("version-state") if tx is not None else Path(
+                    tempfile.mkdtemp(prefix="docx2typed-export-")) / "state")
+                source = _version_state_dir(workdir, version_record, scratch)
             if tx is not None:
                 staged = tx.staging("build.docx")
                 built = _build_workdir_to_staging(source, staged)
@@ -6610,6 +6739,8 @@ _PROFILES: dict[str, set[str] | None] = {
         "commit_sync",
         "history_list",
         "history_restore",
+        "history_verify",
+        "history_gc",
         "build_docx",
         "verify_output",
     },

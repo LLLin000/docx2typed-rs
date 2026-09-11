@@ -1,14 +1,18 @@
 # PRD: Version timeline (persistent workspace, savepoints, restore)
 
-Status: **P0 + P1 implemented** · 2026-09-11 · branch `feature/agent-editor-facade`
+Status: **P0–P3 implemented** · 2026-09-11 · branch `feature/agent-editor-facade`
 
 Landed: the save boundary (`commit_sync` is the only place a version is
 created), `version dirty` with its export gate, `history_list`,
-`history_restore` (whole version and the guarded cherry-pick), and
-`build_docx(version=…)`. Storage is still the pre-P2 generation layout with
-the version chain as the retention root; the object graph is P2.
-Acceptance: `tests/test_version_timeline.py` (C1–C8) plus the interface
-suite; both green.
+`history_restore` (whole version and the guarded cherry-pick),
+`build_docx(version=…)`; the **object pool** (commits + trees + bucketed
+maps, per-paragraph chunks) so a version no longer depends on a full copy of
+the workspace surviving, with `history_verify` and `history_gc`; and
+**baseline transitions** — `decide_all` / `table_*` without `workdir_out`
+adopt their new baseline as this workspace's next version instead of
+creating a sibling workdir.
+Acceptance: `tests/test_version_timeline.py` (C1–C8, P2 pool, P3 adoption)
+plus the full suite; all green.
 
 ## Problem Statement
 
@@ -192,22 +196,29 @@ via `store.read_root` and reuse the existing diff).
 Failure codes: `version-not-found`, `version-trimmed`, `version-content-missing`,
 `restore-draft-dirty`, `restore-review-pending`.
 
-**P2 — the storage move of ADR 0043.** `objects/` + commit graph +
-`workdir.json` as HEAD; import existing generations as objects; stop storing
-derived files; bucket the maps; add `history_verify`. The Store's own
-`generations/` lane keeps its current job (transactions, recovery, fault
-injection) and stops carrying history. This is the phase that makes long
-histories affordable and removes the loose-file blast radius.
+**P2 — the storage move of ADR 0043. DONE.** `objects/{blob,map,tree,version}`
+with `sha256(type + "\0" + canonical bytes)` ids; a save writes the canonical
+state as per-paragraph chunks behind bucketed maps, then a tree object, then a
+commit object; `workdir.json` carries `head_commit` / `head_tree_object`.
+Restore and export materialise from the pool and only fall back to a
+generation for workdirs saved before the pool existed. `history_verify`
+checks every retained version object by object; `history_gc` trims content
+past `keep_last` (labelled versions are kept) and reclaims the generations
+whose content the pool already holds — commit metadata is never dropped.
+The Store's `generations/` lane keeps its job (transactions, recovery, fault
+injection).
 
 **P3 — cherry-pick (ADR 0045).** The narrow, guarded version first: plain
 paragraphs only, `partial-restore-needs-dependent-state` for the coupled ones,
 never a silent fallback to a whole-version restore.
 
-**P4 — baseline transitions.** Absorb `decide_all` / `table_*` new-workdir
-output into the same timeline: new generation + version with
-`baseline_epoch` bumped and template/source fingerprints switched, instead of a
-disjoint workdir. This is what finally removes "workspace sprawl" for
-structural operations.
+**P3 — baseline transitions. DONE.** `decide_all(action, output)` and every
+`table_*` op take an optional `workdir_out`; omitting it adopts the freshly
+extracted baseline into this workspace: canonical state replaced wholesale,
+projection rebuilt, snapshot published with `origin="baseline-transition"`,
+and a save boundary marked with the epoch bumped (`mark_save_boundary(
+baseline_epoch=…)`). Passing `workdir_out` keeps the old sibling-workdir
+behaviour for callers that want it.
 
 **P5 — external DOCX ingest (out of scope now).** A human edits the DOCX in
 Word; ingest their file and show what changed. This is the one place an OOXML
