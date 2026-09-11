@@ -89,7 +89,7 @@ Edit tools (region-scoped, zero guessing):
 | `batch_edit(paragraph_id, edits)` | Multi-region edit, atomic, immediate |
 | `insert_paragraph(after_id, text, inherit?)` | Insert a new paragraph in the draft |
 | `delete_paragraph(paragraph_id)` | Mark a paragraph deleted (protected structure rejected at commit) |
-| `commit_sync()` | Apply the draft to the canonical typed AST under the session edit mode, re-validate, publish |
+| `commit_sync(label?, pin?)` | Save boundary: sync a dirty draft, create a Version only when canonical differs from HEAD; `label` is metadata and `pin` is independent retention policy |
 
 Build/verify tools:
 

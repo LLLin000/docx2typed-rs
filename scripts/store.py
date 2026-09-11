@@ -16,10 +16,12 @@ Layout of a store-backed workdir (``<root>``)::
             <workdir assets>                typed.md, format.json, ..., .review/, ...
         transactions/<operation_id>/        hash-chained phase records:
             intent.json                     (prev = pointer hash) operation started
-            prepared.json                   generation/evidence/externals staged
+            prepared.json                   generation/retention decision staged
+            retention-marked.json           trim ledger is durable
+            retention-swept.json            objects/generations swept
             external-published.json         external outputs atomically published
             generation-committed.json       pointer CAS committed
-            completed.json                  ledger durable; transaction finished
+            completed.json                  operation durable; transaction finished
         staging/<operation_id>/             prepared external outputs before publish
         recovery/<run_id>.json              recovery Run evidence (immutable, one per event)
         quarantine/<name>/                  ambiguous state, never guessed into repair
@@ -28,14 +30,16 @@ The generation directory is authoritative and immutable. Root-level workdir
 files are the materialized mirror of the current generation (kept for external
 editors and the hash-bound ``edit.md`` draft ingress). Tool reads pin the
 generation directory; mutations build a new generation snapshot, journal every
-phase, and swap the pointer under the Writer lane.
+phase, and swap the pointer under the Writer lane. Retention uses the same
+durable journal lane before it marks the trim ledger or sweeps content.
 
 Guarantee boundary: every cut point (kill before/after journal write/flush/
-rename, external publish, pointer swap, materialize; ENOSPC; short write; flush
-failure; corruption; CAS race; lock-holder death) yields only the complete old
-generation, the complete new generation, or explicit ``needs-recovery`` —
-never a mixed generation, evidence-free mutation, duplicated Operation-ID
-effect, or half-published external output.
+rename, retention mark/sweep, external publish, pointer swap, materialize;
+ENOSPC; short write; flush failure; corruption; CAS race; lock-holder death)
+yields only the complete old generation, the complete new generation, or
+explicit ``needs-recovery`` — never a mixed generation, evidence-free mutation,
+duplicated Operation-ID effect, half-published external output, or unjournaled
+content trim.
 """
 from __future__ import annotations
 
@@ -78,10 +82,13 @@ RESERVE_BYTES = 1024 * 1024  # 1 MiB recovery reserve, genuinely allocated
 PHASE_ORDER = (
     "intent",
     "prepared",
+    "retention-marked",
+    "retention-swept",
     "external-published",
     "generation-committed",
     "completed",
 )
+RETENTION_KIND = "history-gc"
 # Root files that stay mutable Draft ingress: reads take them from the root,
 # mutations overlay them into the generation copy before running.
 INGRESS_FILES = ("typed.md", "edit.md")
@@ -1211,6 +1218,9 @@ class Store:
             # landed): trivially rolled back.
             self._roll_back_generation(tx_dir, operation_id, None, result)
             return
+        if records[0].get("kind") == RETENTION_KIND:
+            self._recover_retention_tx(tx_dir, records, result, auto=auto)
+            return
         last = records[-1]
         prepared = next((r for r in records if r["phase"] == "prepared"), None)
         parent = prepared.get("parent") if prepared else None
@@ -1256,6 +1266,131 @@ class Store:
             return
         self._ambiguous(
             tx_dir, operation_id, result, "prepared generation differs from pointer"
+        )
+
+    def _complete_retention_tx(
+        self,
+        tx_dir: Path,
+        records: list[dict[str, Any]],
+        prepared: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Finish a journaled history trim after its decision is durable."""
+        operation_id = str(prepared.get("operation_id") or tx_dir.name)
+        retention = prepared.get("retention")
+        if not isinstance(retention, dict):
+            raise StoreInvalid("history-gc prepared record has no retention decision")
+        trimmed_records = retention.get("trimmed_records") or []
+        keep_trees_raw = retention.get("keep_trees") or []
+        reclaimable_raw = retention.get("reclaimable") or []
+        if (
+            not isinstance(trimmed_records, list)
+            or not all(isinstance(item, dict) for item in trimmed_records)
+            or not isinstance(keep_trees_raw, list)
+            or not all(isinstance(item, str) for item in keep_trees_raw)
+            or not isinstance(reclaimable_raw, list)
+            or not all(isinstance(item, str) for item in reclaimable_raw)
+        ):
+            raise StoreInvalid("history-gc retention decision has invalid lists")
+        records = _read_phases(tx_dir)
+        marked = next((r for r in records if r["phase"] == "retention-marked"), None)
+        if marked is None:
+            _fire("retention-mark")
+        _append_trim_log(self.root, trimmed_records)
+        if marked is None:
+            records = _read_phases(tx_dir)
+            marked = _journal_record(
+                "retention-marked",
+                {
+                    "operation_id": operation_id,
+                    "kind": RETENTION_KIND,
+                    "trimmed": [item.get("version") for item in trimmed_records],
+                },
+                prev_hash=records[-1]["record_sha256"],
+            )
+            _fire("retention-marked")
+            _write_journal_record(tx_dir, marked)
+            records.append(marked)
+
+        swept_phase = next((r for r in records if r["phase"] == "retention-swept"), None)
+        if swept_phase is None:
+            swept = _sweep_retention(
+                self.root,
+                keep_trees=set(keep_trees_raw),
+                reclaimable=reclaimable_raw,
+            )
+            records = _read_phases(tx_dir)
+            swept_phase = _journal_record(
+                "retention-swept",
+                {
+                    "operation_id": operation_id,
+                    "kind": RETENTION_KIND,
+                    "swept": swept,
+                    "reclaimed_generations": reclaimable_raw,
+                },
+                prev_hash=records[-1]["record_sha256"],
+            )
+            _fire("retention-swept")
+            _write_journal_record(tx_dir, swept_phase)
+        swept = swept_phase.get("swept") or {}
+        report = dict(retention.get("report") or {})
+        report["swept_objects"] = int(swept.get("removed") or 0)
+        report["freed_bytes"] = int(swept.get("freed") or 0)
+        report["generations_reclaimed"] = len(reclaimable_raw)
+
+        records = _read_phases(tx_dir)
+        if not any(r["phase"] == "completed" for r in records):
+            _fire("retention-completed")
+            completed = _journal_record(
+                "completed",
+                {
+                    "operation_id": operation_id,
+                    "kind": RETENTION_KIND,
+                    "outcome": "success",
+                    "retention": report,
+                },
+                prev_hash=records[-1]["record_sha256"],
+            )
+            _write_journal_record(tx_dir, completed)
+        shutil.rmtree(tx_dir, ignore_errors=True)
+        return report
+
+    def _recover_retention_tx(
+        self,
+        tx_dir: Path,
+        records: list[dict[str, Any]],
+        result: dict[str, Any],
+        *,
+        auto: bool,
+    ) -> None:
+        """Recover history GC from its durable decision, never from mtimes."""
+        del auto
+        operation_id = records[0].get("operation_id") or tx_dir.name
+        if any(record["phase"] == "completed" for record in records):
+            shutil.rmtree(tx_dir, ignore_errors=True)
+            result["recovered"].append(
+                {"operation_id": operation_id, "action": "completed", "kind": RETENTION_KIND}
+            )
+            return
+        prepared = next((r for r in records if r["phase"] == "prepared"), None)
+        if prepared is None:
+            self._roll_back_generation(tx_dir, operation_id, None, result)
+            return
+        try:
+            report = self._complete_retention_tx(tx_dir, records, prepared)
+        except Exception as exc:
+            self._ambiguous(
+                tx_dir,
+                operation_id,
+                result,
+                f"retention recovery failed: {exc}",
+            )
+            return
+        result["recovered"].append(
+            {
+                "operation_id": operation_id,
+                "action": "retention-completed",
+                "versions_trimmed": report.get("versions_trimmed", []),
+            }
         )
 
     def _external_decision(
@@ -2271,52 +2406,79 @@ def _trim_log_path(root: Path) -> Path:
     return root / STORE_DIR_NAME / TRIM_LOG
 
 
-def _append_trim_log(root: Path, versions: list[dict[str, Any]]) -> None:
-    """Durably record content trims before sweeping their objects.
-
-    This marker is load-bearing: if it cannot be written, the caller must
-    abort before deleting content, rather than silently making verification
-    confuse an expected trim with corruption."""
-    if not versions:
-        return
+def _read_trim_records(root: Path) -> list[dict[str, Any]]:
     path = _trim_log_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        for record in versions:
-            handle.write(
-                json.dumps(
-                    {
-                        "version": record.get("version"),
-                        "tree_object": record.get("tree_object"),
-                        "trimmed_at": _now_iso(),
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-                + "\n"
-            )
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def trimmed_versions(root: str | Path) -> set[str]:
-    """Version names retention has trimmed (empty when nothing was trimmed)."""
-    path = _trim_log_path(Path(root).resolve())
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return set()
-    names: set[str] = set()
-    for line in lines:
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeError) as exc:
+        raise StoreInvalid(f"history trim ledger cannot be read: {path}") from exc
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            raise StoreInvalid(f"history trim ledger line {number} is invalid JSON") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("version"), str):
+            raise StoreInvalid(f"history trim ledger line {number} has no version")
+        version = payload["version"]
+        if version in seen:
             continue
-        if isinstance(payload.get("version"), str):
-            names.add(payload["version"])
-    return names
+        seen.add(version)
+        records.append(payload)
+    return records
+
+
+def _append_trim_log(root: Path, versions: list[dict[str, Any]]) -> None:
+    """Durably mark content trims before sweeping their objects.
+
+    The ledger is append-only logically but rewritten atomically to make
+    retries idempotent and to prevent a torn JSONL tail from becoming state."""
+    path = _trim_log_path(root)
+    existing = _read_trim_records(root)
+    known = {record["version"] for record in existing}
+    existing_by_version = {record["version"]: record for record in existing}
+    if not versions:
+        return
+    merged = list(existing)
+    for record in versions:
+        version = record.get("version")
+        if not isinstance(version, str) or not version:
+            raise StoreInvalid("history trim record has no version")
+        if version in known:
+            recorded_tree = existing_by_version[version].get("tree_object")
+            requested_tree = record.get("tree_object")
+            if recorded_tree and requested_tree and recorded_tree != requested_tree:
+                raise StoreInvalid(f"history trim tree mismatch for {version}")
+            continue
+        merged.append(
+            {
+                "version": version,
+                "tree_object": record.get("tree_object"),
+                "trimmed_at": _now_iso(),
+            }
+        )
+        known.add(version)
+    if len(merged) == len(existing):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = b"".join(_canonical_bytes(record) + b"\n" for record in merged)
+    _write_durable(
+        path,
+        payload,
+        write_fault="retention-mark-write",
+        flush_fault="retention-mark-flush",
+        rename_fault="retention-mark-rename",
+    )
+
+
+def trimmed_versions(root: str | Path) -> set[str]:
+    """Version names retention has trimmed (empty when nothing was trimmed)."""
+    return {record["version"] for record in _read_trim_records(Path(root).resolve())}
 
 
 def history_verify(root: str | Path) -> dict[str, Any]:
@@ -2364,6 +2526,107 @@ def history_verify(root: str | Path) -> dict[str, Any]:
     return {"schema": "docx2typed-history-verify-1", "ok": ok, "versions": results}
 
 
+def _retention_plan(
+    root_path: Path,
+    store: Store,
+    *,
+    keep_last: int,
+    reclaim_generations: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    chain = _version_chain(root_path)
+    trimmed_names = trimmed_versions(root_path)
+    retained = [
+        record
+        for index, record in enumerate(chain)
+        if record.get("version") not in trimmed_names
+        and (index < keep_last or record.get("pin"))
+    ]
+    retained_names = {record.get("version") for record in retained}
+    keep_trees = {r["tree_object"] for r in retained if r.get("tree_object")}
+    trimmed: list[dict[str, Any]] = []
+    for record in chain:
+        version = record.get("version")
+        if version in trimmed_names:
+            trimmed.append(record)
+        elif version not in retained_names and record.get("tree_object") not in keep_trees:
+            # A version sharing a retained tree still has restorable content.
+            trimmed.append(record)
+    trimmed_version_names = {r.get("version") for r in trimmed}
+    keep_generations = {
+        r.get("generation")
+        for r in chain
+        if not r.get("tree_object") and r.get("version") not in trimmed_version_names
+    }
+    pointer = _read_pointer(root_path) or {}
+    if pointer.get("generation"):
+        keep_generations.add(pointer["generation"])
+    if store.transactions_dir.is_dir():
+        for tx_dir in store.transactions_dir.iterdir():
+            for record in _read_phases_soft(tx_dir) or []:
+                if isinstance(record.get("generation"), str):
+                    keep_generations.add(record["generation"])
+
+    reclaimable: list[str] = []
+    if reclaim_generations and store.generations_dir.is_dir():
+        for gen_dir in sorted(store.generations_dir.iterdir()):
+            if not gen_dir.is_dir() or gen_dir.name in keep_generations:
+                continue
+            try:
+                manifest = json.loads((gen_dir / "generation.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            version = manifest.get("version") or {}
+            tree_object = version.get("tree_object")
+            version_name = version.get("version")
+            if isinstance(tree_object, str) and tree_object in keep_trees:
+                reclaimable.append(gen_dir.name)
+            elif version_name in trimmed_version_names:
+                reclaimable.append(gen_dir.name)
+
+    report: dict[str, Any] = {
+        "schema": "docx2typed-history-gc-1",
+        "versions_total": len(chain),
+        "versions_retained": len(chain) - len(trimmed),
+        "trees_kept": len(keep_trees),
+        "generations_reclaimable": len(reclaimable),
+        "dry_run": dry_run,
+        "swept_objects": 0,
+        "freed_bytes": 0,
+        "versions_trimmed": [r.get("version") for r in trimmed],
+    }
+    newly_trimmed = [
+        record for record in trimmed if record.get("version") not in trimmed_names
+    ]
+    return {
+        "report": report,
+        "trimmed_records": trimmed,
+        "keep_trees": sorted(keep_trees),
+        "reclaimable": reclaimable,
+        "newly_trimmed": newly_trimmed,
+    }
+
+
+def _sweep_retention(
+    root_path: Path,
+    *,
+    keep_trees: set[str],
+    reclaimable: list[str],
+) -> dict[str, Any]:
+    _fire("retention-sweep")
+    try:
+        from .objectstore import sweep as _sweep
+    except ImportError:  # pragma: no cover - direct script execution
+        from objectstore import sweep as _sweep
+
+    swept = _sweep(root_path, keep_trees=keep_trees)
+    store_root = store_dir_path(root_path)
+    for generation in reclaimable:
+        _fire("retention-generation")
+        shutil.rmtree(store_root / "generations" / generation, ignore_errors=True)
+    return swept
+
+
 def history_gc(
     root: str | Path,
     *,
@@ -2371,87 +2634,80 @@ def history_gc(
     reclaim_generations: bool = True,
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Retention: reclaim content past the limit; commit metadata is never dropped.
+    """Journal retention decisions before marking, sweeping, and reclaiming.
 
-    A trimmed version still lists (ADR 0042) and its restore fails closed. With
-    the object pool holding a version's content, the generation it was saved
-    from is reclaimable — that is what stops history from costing a full copy
-    per version (ADR 0043)."""
+    The trim ledger is a durable marker, not a history authority. Applied
+    decisions recover through ``retention-marked``, ``retention-swept``, and
+    ``completed`` phases; ``dry_run`` never creates those records."""
     root_path = Path(root).resolve()
     store = Store(root_path)
     with store.writer(timeout_ms=0):
-        chain = _version_chain(root_path)
-        trimmed_names = trimmed_versions(root_path)
-        # a version is pinned by an intentional name, not by a descriptive
-        # system label — otherwise every restore would live forever
-        retained = [
-            record
-            for index, record in enumerate(chain)
-            if record.get("version") not in trimmed_names
-            and (index < keep_last or record.get("pin"))
-        ]
-        keep_trees = {r["tree_object"] for r in retained if r.get("tree_object")}
-        keep_generations = {
-            r.get("generation")
-            for r in chain
-            if not r.get("tree_object") and r.get("version") not in trimmed_names
-        }
-        pointer = _read_pointer(root_path) or {}
-        if pointer.get("generation"):
-            keep_generations.add(pointer["generation"])
-        if store.transactions_dir.is_dir():
-            for tx_dir in store.transactions_dir.iterdir():
-                for record in _read_phases_soft(tx_dir) or []:
-                    if isinstance(record.get("generation"), str):
-                        keep_generations.add(record["generation"])
-
-        trimmed = [r for r in chain if r not in retained]
-        trimmed_version_names = {r.get("version") for r in trimmed}
-        newly_trimmed = [r for r in trimmed if r.get("version") not in trimmed_names]
-        reclaimable: list[str] = []
-        if reclaim_generations and store.generations_dir.is_dir():
-            for gen_dir in sorted(store.generations_dir.iterdir()):
-                if not gen_dir.is_dir() or gen_dir.name in keep_generations:
-                    continue
-                try:
-                    manifest = json.loads((gen_dir / "generation.json").read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                version = manifest.get("version") or {}
-                tree_object = version.get("tree_object")
-                version_name = version.get("version")
-                if isinstance(tree_object, str) and tree_object in keep_trees:
-                    reclaimable.append(gen_dir.name)
-                elif version_name in trimmed_version_names:
-                    # its content was just trimmed: the generation must go too,
-                    # otherwise a restore would resurrect what retention dropped
-                    reclaimable.append(gen_dir.name)
-
-        report: dict[str, Any] = {
-            "schema": "docx2typed-history-gc-1",
-            "versions_total": len(chain),
-            "versions_retained": len(retained),
-            "trees_kept": len(keep_trees),
-            "generations_reclaimable": len(reclaimable),
-            "dry_run": dry_run,
-            "swept_objects": 0,
-            "freed_bytes": 0,
-        }
-        report["versions_trimmed"] = [r.get("version") for r in trimmed]
         if dry_run:
-            return report
-        _append_trim_log(root_path, newly_trimmed)
-        try:
-            from .objectstore import sweep as _sweep
-        except ImportError:  # pragma: no cover - direct script execution
-            from objectstore import sweep as _sweep
+            return _retention_plan(
+                root_path,
+                store,
+                keep_last=keep_last,
+                reclaim_generations=reclaim_generations,
+                dry_run=True,
+            )["report"]
 
-        swept = _sweep(root_path, keep_trees=keep_trees)
-        report["swept_objects"] = swept["removed"]
-        report["freed_bytes"] = swept["freed"]
-        for generation in reclaimable:
-            shutil.rmtree(store.generations_dir / generation, ignore_errors=True)
-        return report
+        store._require_reserve()
+        recovery = store._recover_all(
+            {"recovered": [], "rolled_back": [], "needs_recovery": [], "cleaned": []},
+            auto=True,
+        )
+        if recovery["needs_recovery"]:
+            raise NeedsRecovery(
+                "workdir needs recovery: "
+                + "; ".join(
+                    f"{item['operation_id']} ({item.get('reason', 'ambiguous')})"
+                    for item in recovery["needs_recovery"]
+                )
+            )
+        plan = _retention_plan(
+            root_path,
+            store,
+            keep_last=keep_last,
+            reclaim_generations=reclaim_generations,
+            dry_run=False,
+        )
+        if not plan["newly_trimmed"] and not plan["reclaimable"]:
+            return plan["report"]
+
+        pointer = _read_pointer(root_path) or {}
+        operation_id = f"history-gc-{uuid.uuid4().hex}"
+        canonical = semantic_sha256(
+            {
+                "operation": "history_gc",
+                "keep_last": keep_last,
+                "reclaim_generations": reclaim_generations,
+                "dry_run": False,
+                "versions_trimmed": plan["report"]["versions_trimmed"],
+                "keep_trees": plan["keep_trees"],
+                "reclaimable": plan["reclaimable"],
+            }
+        )
+        tx_dir, intent = store._begin_journal(
+            operation_id,
+            canonical,
+            pointer.get("generation"),
+            canonical,
+            RETENTION_KIND,
+        )
+        _fire("retention-decision")
+        prepared = _journal_record(
+            "prepared",
+            {
+                "operation_id": operation_id,
+                "kind": RETENTION_KIND,
+                "parent": pointer.get("generation"),
+                "retention": plan,
+            },
+            prev_hash=intent["record_sha256"],
+        )
+        _write_journal_record(tx_dir, prepared)
+        _fire("retention-prepared")
+        return store._complete_retention_tx(tx_dir, [intent, prepared], prepared)
 
 
 def _copy_root_assets(root: Path, gen_dir: Path) -> None:

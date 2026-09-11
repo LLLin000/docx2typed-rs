@@ -20,6 +20,7 @@ import pytest
 from scripts import main
 from scripts.protocol import canonical_operation_input, new_operation_id, operation_ledger
 from scripts.store import history_gc, history_verify, head_version
+from scripts.store import history_list as store_history_list
 from scripts.store import Store, _Kill, clear_faults, kill_at, set_fault  # noqa: F401
 
 
@@ -163,6 +164,77 @@ def test_gc_does_not_break_operation_replay(tmp_path):
     # the changed-input contract still holds after the GC
     other = canonical_operation_input("commit_sync", {"workdir": str(workdir), "label": "different"})
     assert other != first_envelope["input_sha256"]
+
+
+
+
+@pytest.mark.parametrize(
+    "cut",
+    [
+        "journal-write-prepared",
+        "retention-prepared",
+        "retention-mark",
+        "retention-mark-write",
+        "retention-marked",
+        "retention-sweep",
+        "retention-generation",
+        "retention-swept",
+        "journal-write-retention-swept",
+        "retention-completed",
+        "journal-write-completed",
+    ],
+)
+def test_history_gc_crash_cuts_recover_from_journal(tmp_path, cut):
+    """Every retention phase is recoverable and never leaves half-trimmed state."""
+    from scripts.mcp_server import commit_sync, document_patch, session, workdir_open
+
+    session.workdir = None
+    workdir = _extract(tmp_path)
+    assert not _failed(workdir_open(str(workdir), track=False))
+    previous = "目标插入语"
+    for index in range(1, 4):
+        current = f"GC版本{index}"
+        assert not _failed(
+            document_patch(
+                hunks=[{"paragraph_id": "P1", "old": previous, "new": current}],
+                operation_id=f"gc-edit-{index}",
+            )
+        )
+        assert not _failed(
+            commit_sync(
+                operation_id=f"gc-save-{index}",
+                label=f"说明{index}",
+                pin=False,
+            )
+        )
+        previous = current
+    session.workdir = None
+
+    kill_at(cut)
+    with pytest.raises(_Kill):
+        history_gc(workdir, keep_last=1, dry_run=False)
+    clear_faults()
+    pending = Store.open(workdir).pending_transactions()
+    assert len(pending) == 1, pending
+
+    recovered = Store.open(workdir).recover()
+    assert recovered["needs_recovery"] == []
+    assert Store.open(workdir).pending_transactions() == []
+
+    # Intent-only cuts roll back the uncommitted decision; all other cuts may
+    # already have completed. Re-running the same policy settles either state.
+    history_gc(workdir, keep_last=1, dry_run=False)
+    versions = store_history_list(workdir)["versions"]
+    assert [(item["version"], item["content"]) for item in versions] == [
+        ("V3", "retained"),
+        ("V2", "trimmed"),
+        ("V1", "trimmed"),
+    ]
+    assert history_verify(workdir)["ok"] is True
+    trim_log = workdir / ".docx2typed-store" / "history-trim.jsonl"
+    rows = [json.loads(line) for line in trim_log.read_text(encoding="utf-8").splitlines()]
+    assert [row["version"] for row in rows] == ["V2", "V1"]
+    session.workdir = None
 
 
 def test_gc_keeps_an_export_receipt_for_a_version(tmp_path):

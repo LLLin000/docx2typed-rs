@@ -1,4 +1,4 @@
-# 0045 — Selective restore is a semantic cherry-pick, not an object swap
+# 0045 — Selective restore is a guarded source restore, not an object swap
 
 ## Status
 
@@ -29,33 +29,39 @@ bytes would be wrong — the exact failure mode this system refuses.
 
 ## Decision
 
-Selective restore (`history_restore(version, paragraphs=[…])`) is a
-**semantic cherry-pick** with a dependency gate, and v1 admits only the case
-the gate can prove:
+Selective restore (`history_restore(version, paragraphs=[…])`) is a guarded
+source restore. It is conceptually closest to
+`git restore --source V12 -- path` followed by `git commit`, not a strict
+commit-level `git cherry-pick`: the operation selects paragraph paths inside
+one document and creates a new document Version.
+
+v1 admits only the case the dependency gate can prove:
 
 - Eligible in v1: a paragraph whose old and new states both reference **no
-  tokens** (no revision nodes, no anchors, no ranges, no format-history
-  records) and whose style ids exist in the current style registry.
+  tokens** (dependency-free / zero-token) and whose style ids exist in the
+  current style registry.
 - Refused, with `partial-restore-needs-dependent-state` naming the reason and
-  the paragraph: anything with revision tokens, comment/bookmark anchors,
-  ranges, content controls, or table structure coupling.
+  the paragraph: anything with revision tokens, comment or bookmark anchors,
+  ranges, structured document tags (SDTs), content controls, or table
+  topology coupling.
 - A refusal reports what it *would* need (the token ids, the anchor pairs, the
-  counterpart paragraph) so the caller can either restore the whole version or
-  patch the paragraph explicitly.
+  counterpart paragraph) so the caller can either restore the whole version
+  or patch the paragraph explicitly.
 - The refused path never silently falls back to a whole-version restore.
-- Complex paragraphs get their cherry-pick by composing the normal editing
-  path (a patch whose `old` is the target version's text), which already runs
-  the boundary, style-ownership, and CAS checks — a slow, honest route instead
-  of a fast, wrong one.
+- Coupled paragraphs use the normal editing path (a patch whose `old` is the
+  target version's text), which already runs the boundary, style-ownership,
+  and CAS checks — a slow, honest route instead of a fast, wrong one.
 
 ## Consequences
 
 - The feature ships with a small, provable surface instead of a broad, unsafe
-  one; the guard is cheap because the token ids are already recorded per
-  paragraph in `format.json`.
+  one; the guard is cheap because token ids are already recorded per paragraph
+  in `format.json`.
 - The interesting cases (revision-bearing paragraphs, cross-paragraph ranges,
-  comment pairs) are named rather than approximated, which keeps the
-  fail-closed contract intact and gives the next iteration a precise target.
-- Cherry-pick is not a restore primitive: it produces a normal version through
-  the normal commit lane, published with `origin="cherry-pick"` and
-  `restored_from` naming both the version and the paragraphs it took.
+  comment pairs, SDTs, and table topology) are named rather than approximated,
+  which keeps the fail-closed contract intact and gives the next iteration a
+  precise target.
+- Selective restore produces a normal Version through the normal commit lane.
+  The internal `origin="cherry-pick"` value is historical wire metadata; the
+  user-facing operation is a guarded source restore, not a Git commit
+  cherry-pick.

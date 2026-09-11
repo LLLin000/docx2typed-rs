@@ -4,7 +4,7 @@ Status: **P0–P3 implemented** · 2026-09-11 · branch `feature/agent-editor-fa
 
 Landed: the save boundary (`commit_sync` is the only place a version is
 created), `version dirty` with its export gate, `history_list`,
-`history_restore` (whole version and the guarded cherry-pick),
+`history_restore` (whole version and guarded selective restore),
 `build_docx(version=…)`; the **object pool** (commits + trees + bucketed
 maps, per-paragraph chunks) so a version no longer depends on a full copy of
 the workspace surviving, with `history_verify` and `history_gc`; and
@@ -63,6 +63,29 @@ collaboration snapshot, but they fold into the next `commit_sync`;
 `document_patch` and `document_replace` remain draft-only. A `commit_sync` with
 no draft, canonical, or publication drift is a true no-op.
 
+### Dirty-state contract
+
+`workdir_status` reports two independent facts:
+
+| State | Comparison | Meaning |
+|---|---|---|
+| `draft_dirty` | `edit.md` projection vs canonical tree | `document_patch` and other draft edits still need `commit_sync` to sync |
+| `version.dirty` | canonical tree vs `HEAD.tree` | canonical changes still need a new Version |
+
+The save boundary follows this truth table:
+
+| `draft_dirty` | `version.dirty` | `publish_pending` | `commit_sync` |
+|---:|---:|---:|---|
+| false | false | false | true no-op |
+| false | false | true | publish the current snapshot; no Version |
+| true | either | either | sync draft, then compare canonical tree with HEAD |
+| false | true | either | create a Version |
+
+`format_span`, review decisions, and other canonical writers may therefore
+leave the draft clean while making `version.dirty` true. `document_patch` first
+makes `draft_dirty` true; after the canonical tree is saved, a later draft edit
+does not make `version.dirty` true until that draft is synced.
+
 ### Data contract
 
 A version **is a content-addressed commit object**; its parent chain is the
@@ -73,7 +96,7 @@ history (ADR 0043). There is no versions file to keep in sync with the pointer:
  "seq": 21, "parent": "<V20 object id>", "tree": "<Merkle root>",
  "created_at": "2026-09-11T01:22:47+00:00", "author": "Lin",
  "origin": "commit_sync", "operation_id": "45d66892…",
- "label": "统一“血浆凝胶”术语", "restored_from": null,
+ "label": "统一“血浆凝胶”术语", "pin": false, "restored_from": null,
  "changed_paragraph_ids": ["P5", "P7"]}
 ```
 
@@ -93,10 +116,10 @@ is appended to the operation evidence and joined on demand.
 - The content binding is the **tree hash**. The collaboration record keeps its
   own `typed_sha256` for the live drift check (`draft dirty`), which is a
   different question from what a version contains (ADR 0044).
-- An explicitly named version's tree is retained beyond the count limit
-  (`commit_sync(label=…)` sets `pin=true`). System-generated labels on restore
-  and baseline transitions are descriptive and do not pin; commit metadata is
-  retained regardless (ADR 0042).
+- `label` is descriptive metadata; `pin=true` is the independent retention root
+  (`commit_sync(label="…", pin=true)`). Naming alone does not pin, and system
+  labels on restore and baseline transitions remain descriptive; commit metadata
+  is retained regardless (ADR 0042).
 
 ### Tool surface (deliberately small)
 
@@ -106,7 +129,8 @@ Two new tools, one extension:
 history_list(limit=20, offset=0)          → versions (walked from HEAD) + retained/trimmed
 history_restore(version, operation_id?,   → whole-version restore (near zero-copy in
                 paragraphs=[…]?)             storage; paragraphs= is the guarded
-                                             cherry-pick of ADR 0045)
+                                             dependency-free selective restore
+                                             of ADR 0045)
 diff_preview(from_version?, to_version?)  → Merkle-accelerated: skip identical
                                              subtrees, descend only into what differs
 workdir_status()                          → version.current / version.previous /
@@ -114,7 +138,7 @@ workdir_status()                          → version.current / version.previous
                                              versions.retained / stale_exports
 build_docx(version="V12")                 → export a historical version without
                                              restoring it
-commit_sync(label="…")                    → the only place a version is created
+commit_sync(label="…", pin=false)           → the only place a version is created
 ```
 
 - `diff_preview` is extended rather than duplicated: its hunk-level diff, style
@@ -151,6 +175,11 @@ history_restore("V18")
 
 Nothing rewinds: the pointer advances, V18 stays, every later version stays.
 
+Git analogy: whole restore is closest to
+`git restore --source V18 -- .` followed by `git commit`: it restores a forward
+snapshot and advances history. It is not `git revert`, which applies an inverse
+patch, and it never rewinds the pointer.
+
 ### Storage (ADR 0041/0042/0043)
 
 Measured on the 3000-paragraph fixture (976 KB source):
@@ -173,7 +202,8 @@ is anchored by `workdir.json` HEAD: `objects/<sha256>` plus commit, tree, map,
 leaf, and blob objects. `ledger.jsonl` is only the durable idempotency plane,
 not history. Derived views regenerate on materialisation; retention roots come
 from the commit chain, and applied content trims are recorded separately in
-`history-trim.jsonl` so deliberate loss is distinguishable from corruption.
+`history-trim.jsonl` behind the same transaction journal so deliberate loss is
+distinguishable from corruption.
 
 ## Phases
 
@@ -203,15 +233,20 @@ generation for workdirs saved before the pool existed. `history_verify`
 checks every retained version object by object; `history_gc` trims content
 past `keep_last` (explicitly pinned versions are kept), records applied trims
 in `history-trim.jsonl`, and reclaims the generations whose content the pool
-already holds — commit metadata is never dropped. A deliberate trim remains
-listed as `content: trimmed`, is accepted by `history_verify`, and refuses
-restore/export with `version-trimmed`.
+already holds — commit metadata is never dropped. The trim decision is first
+written to the transaction journal, then durable `retention-marked`,
+`retention-swept`, and `completed` phases make crash recovery finish the same
+decision rather than infer it from filesystem timestamps. A deliberate trim
+remains listed as `content: trimmed`, is accepted by `history_verify`, and
+refuses restore/export with `version-trimmed`.
 The Store's `generations/` lane keeps its job (transactions, recovery, fault
 injection).
 
-**P3 — cherry-pick (ADR 0045).** The narrow, guarded version first: plain
-paragraphs only, `partial-restore-needs-dependent-state` for the coupled ones,
-never a silent fallback to a whole-version restore.
+**P3 — guarded selective restore (ADR 0045).** v1 is a dependency-free,
+zero-token paragraph restore only. Revision/comment/bookmark/range anchors,
+content controls/SDTs, and table topology are coupled state and refuse with
+`partial-restore-needs-dependent-state`; the tool never silently falls back to
+whole-version restore.
 
 **P3 — baseline transitions. DONE.** `decide_all(action, output)` and every
 `table_*` op take an optional `workdir_out`; omitting it adopts the freshly

@@ -46,11 +46,13 @@ G20 (current) ──restore(V18)──> G21
 
 ## Consequences
 
-- "Undo" is `git revert`-shaped, never `git reset --hard`-shaped; this is the
-  invariant every later history feature must preserve.
+- The whole restore is closest to
+  `git restore --source V18 -- .` followed by `git commit`: it restores a
+  forward snapshot and advances history. It is **not** `git revert`, which
+  applies an inverse patch.
 - The alternative — pointer rewind, or a `git checkout`-style detached
   current — was rejected: it requires a second history to be survivable, and
-  it breaks the ledger/preflight contracts above.
+  it breaks the ledger/preflight contracts above. The pointer never rewinds.
 - Storage-wise a restore costs one generation like any other mutation; it is
   not free to call in a loop, but it is cheap enough (see ADR 0041) that a
   user can restore, look, and restore again.

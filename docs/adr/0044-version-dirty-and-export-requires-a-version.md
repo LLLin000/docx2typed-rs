@@ -32,11 +32,25 @@ draft dirty     edit.md differs from canonical        (existing; unchanged)
 version dirty   canonical tree != HEAD.tree           (new)
 ```
 
+The save decision is explicit:
+
+| `draft_dirty` | `version_dirty` | `publish_pending` | Result |
+|---:|---:|---:|---|
+| false | false | false | true no-op |
+| true | either | either | sync draft, then compare canonical tree with HEAD |
+| false | true | either | create a Version |
+| false | false | true | publish the current snapshot; no Version |
+
+Thus `document_patch` makes the draft dirty without moving the saved
+canonical tree; after a clean save, another draft patch leaves `version_dirty`
+false until it is synced. Conversely, `format_span`, review decisions, and
+other canonical writers can leave the draft clean while making `version_dirty`
+true.
+
 - `commit_sync` becomes the only place a version is created, and its rule is
   the tree rule: draft dirty → sync it; then, **create a version only if
   `canonical_tree != HEAD.tree`**; otherwise no-op. Several canonical writers
-  in a row therefore collapse into one version — `format_span`, `format_span`,
-  `accept_revision`, `commit_sync(label=…)` is one V21, not four.
+  in a row therefore collapse into one version.
 - `workdir_status` reports both, plus `version.current` / `version.previous`.
 - **Export requires a saved version.** `build_docx` fails closed with
   `version-save-required` when `version dirty` is true, naming `commit_sync`
