@@ -80,14 +80,14 @@ Export receipts are **evidence, not part of the record**: a version is
 immutable and an export happens later, so the receipt (path + sha256 + version)
 is appended to the operation evidence and joined on demand.
 
-- `version` numbering: `V<n>` assigned at creation (v1: `n` equals the
-  snapshot ordinal), stored explicitly, never recomputed.
-- `generation` + `typed_sha256` are the double binding (ADR 0040); a restore
-  verifies both.
-- `export` is filled when a `build_docx` of that version completes, so
-  "perfect restore" is provable (ADR 0041).
-- A labelled version is retained beyond the count limit (pinning without a
-  second mechanism).
+- `V<n>` is a display id: `seq` is the truth and is never recomputed; `V<n>`
+  is derived from it so the name stays stable for a human.
+- The content binding is the **tree hash**. The collaboration record keeps its
+  own `typed_sha256` for the live drift check (`draft dirty`), which is a
+  different question from what a version contains (ADR 0044).
+- A labelled version's tree is retained beyond the count limit (pinning
+  without a second mechanism); its commit metadata is retained regardless
+  (ADR 0042).
 
 ### Tool surface (deliberately small)
 

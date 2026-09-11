@@ -51,3 +51,12 @@ A **Version** is a named, listable reference to a collaboration snapshot:
   GC honest about which generations are retained).
 - A version does not own content; it references it. Content ownership stays
   with the store, which already guarantees immutability.
+
+## Updates (2026-09-11, review)
+
+The **binding** is now the tree hash rather than the store generation id: the
+version commit object points at a Merkle root (ADR 0043), which is what a
+restore verifies. The collaboration record keeps its `typed_sha256` for the
+live drift check only. Keeping a version "on the snapshot chain" still holds in
+the sense that matters here: a version is created at a save boundary, by the
+same write path that publishes the snapshot — never by a separate ledger.
