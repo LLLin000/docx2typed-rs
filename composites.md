@@ -41,10 +41,11 @@ Edit ordinary prose; formatting, structure, anchors stay locked.
    `edit refresh <workdir>`.
 4. `build <workdir> -o <output.docx>` — fails closed on any rule violation.
 5. `verify <workdir> <output.docx>` — independent re-derivation.
-6. Interop: convert the output with LibreOffice (see `verification.md`).
+6. Interop: open the output in Microsoft Word; when a rendered artifact is
+   required, export it through Word (see `verification.md`).
 
-**Completion criterion**: verify PASS, LibreOffice opens the output without
-repairs, and every intended text change is present with its original style;
+**Completion criterion**: verify PASS, Microsoft Word opens the output without
+repair prompts, and every intended text change is present with its original style;
 nothing else in the document changed.
 
 ## Workflow 2 — Tracked edit (修订式编辑)
@@ -58,7 +59,7 @@ Same as Workflow 1, but insertions/deletions/replacements become real
    mode — pass `track=true` (or `--track`) to open in track mode.
 2. Steps 2–4 of Workflow 1 with `edit sync --track` (or MCP `workdir_open`
    with `track=true`). Replace = delete + insert revision.
-3. `build` + `verify` + LibreOffice as in Workflow 1.
+3. `build` + `verify` + Word interoperability check as in Workflow 1.
 
 **Completion criterion**: the output carries the new revisions with session
 author/date; existing revisions are untouched; verify PASS.
@@ -78,7 +79,7 @@ Accept or reject tracked revisions, singly or wholesale.
    produces a new DOCX + fresh clean-baseline workdir; the source workdir is
    never mutated. Paragraph-mark revisions settle too (the paragraph itself
    is never removed by settlement).
-4. `verify <wd2> after.docx` + LibreOffice.
+4. `verify <wd2> after.docx` + Microsoft Word check.
 
 **Completion criterion**: `revisions.json` in the new baseline lists 0
 pending revisions (for accept-all/reject-all) or the decided key is gone and
@@ -101,7 +102,7 @@ when the user explicitly instructs it (or confirms the teacher resolved it).
 3. Leave the comment untouched. `delete_comment` exists for the user; an
    agent calls it only on explicit instruction.
 4. `build` + `verify` (the structured evidence includes surviving comment
-   ids) + LibreOffice.
+   ids) + Microsoft Word check.
 
 **Completion criterion**: for every comment, the requested editing task
 has either (a) corresponding tracked edits, or (b) a reported reason no
@@ -132,12 +133,12 @@ never rewritten.
 > `merge-would-discard-content` unless `--discard-content` (CLI) or
 > `discard_content=true` (MCP) is explicit; the first cell's content is
 > always kept. Split restores empty cells with gridSpan cleared.
-4. `verify <wd2> <out.docx>` + LibreOffice.
+4. `verify <wd2> <out.docx>` + Microsoft Word check.
 
 **Completion criterion**: the new baseline has the expected row/col/cell
 counts, inserted structure is empty (never duplicates existing text), all
-original cell content is byte-intact, verify PASS, LibreOffice opens without
-repairs.
+original cell content is byte-intact, verify PASS, and Microsoft Word opens
+without repair prompts.
 
 ## Workflow 6 — Unicode normalization audit (归一化审计)
 
@@ -188,7 +189,7 @@ decision.
    — writes a NEW DOCX/workdir + `normalization.audit.json`; the source
    workdir is never mutated. Stale workdir/model/catalog/scanner/scan
    bindings fail before transformation.
-6. `verify` + LibreOffice.
+6. `verify` + Microsoft Word check.
 
 **Completion criterion**: every scan candidate has a decision, the policy is
 `approved` with a valid approval record, `audit apply` succeeded, the
@@ -220,9 +221,9 @@ Settle every revision and clear comments, then export and prove the result.
 2. Workflow 4: if the user wants comments gone too, verify the new baseline
    carries none (`revisions.json` / comments inventory) or delete
    individually.
-3. Workflow 1 tail: `build <wd2> -o final.docx` + `verify` + LibreOffice.
+3. Workflow 1 tail: `build <wd2> -o final.docx` + `verify` + Microsoft Word check.
 4. Report: settled count, remaining revisions = 0, comments = 0, verify
-   PASS, LibreOffice conversion clean.
+   PASS, Word interoperability check clean.
 
 **Completion criterion**: every gate green, and the counts you report match
 what the inventory files say.
@@ -248,7 +249,7 @@ Drive the whole edit loop through the MCP server.
    `prev_id`/`next_id` anchors come back, no per-paragraph reads.
 3. `document_patch` (hunks or unified diff, `base_revision` from the
    read/search token) → `diff_preview` → `commit_sync`.
-4. `build_docx` → `verify_output` → LibreOffice check.
+4. `build_docx` → `verify_output` → Microsoft Word check.
    Fallback only: `get_paragraph` + `batch_edit` for explicitly
    requesting exact per-region style ownership or refusal diagnosis.
 
@@ -278,8 +279,9 @@ owns scope, review decisions, and final acceptance.
    refreshes the review surface, and reports the new snapshot plus remaining
    queue. Repeat step 4 until the human's requested scope is satisfied.
 6. **Deliver**: require a clean workdir, build a new DOCX, run independent
-   `verify`, run the LibreOffice/Word interoperability check, and return the
-   output path with a compact evidence summary. If any gate fails, stay in the
+   `verify`, open it in Microsoft Word, and render through Word when a PDF is
+   required. Return the output path with a compact evidence summary. LibreOffice
+   checks are optional and non-gating.
    round loop and do not present a partial DOCX as final.
 
 **Completion criterion**: the human can tell what the agent is doing, what is

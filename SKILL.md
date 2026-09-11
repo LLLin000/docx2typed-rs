@@ -122,6 +122,11 @@ Rules:
   closed lane's refusal carries `capability` + `fallback`, so never guess why.
 - `format_span` needs a CLEAN draft (styles live in the committed AST):
   commit_sync (or revert) first, then format.
+- `workdir_status` reports `draft_dirty` (`edit.md` vs canonical) separately
+  from `version.dirty` (canonical tree vs `HEAD.tree`). `document_patch` first
+  makes only the draft dirty; `format_span` and review decisions can make only
+  the Version dirty. `commit_sync` syncs a dirty draft, then creates a Version
+  only when canonical still differs from HEAD; clean/no-drift state is a no-op.
 - MCP profiles keep tool selection small: set `DOCX2TYPED_MCP_PROFILE=editor`
   (27 tools) for ordinary editing plus save/history/structural transitions,
   `review` (27) when per-revision/comments and review collaboration are in
@@ -264,8 +269,9 @@ as a unit — never combine sidecars from different documents.
   regions, and every package part — it does not trust `build`.
 - **byte fidelity**: a no-op build must be byte-identical to the input;
   untouched paragraphs replay raw bytes.
-- **interop**: outputs must open in LibreOffice/Word (convert to PDF with
-  `soffice --headless --convert-to pdf` before delivering).
+- **interop**: outputs must open in Microsoft Word without repair prompts and
+  pass the Word/DOCX delivery check. LibreOffice checks are optional and
+  non-gating.
 
 ## Agent setup and runtime
 
@@ -311,8 +317,9 @@ Keep implementation details behind the browser and the handoff summary.
    or patches transactionally, preserve original comments, refresh the review
    surface, and report the new snapshot plus remaining queue.
 8. **Delivery gate** — after the final round, build a new output DOCX, run
-   independent verification, convert it through LibreOffice/Word-compatible
-   tooling, and return the output path with a compact evidence summary.
+   independent verification, open it in Microsoft Word (and render through
+   Word when a PDF is required), and return the output path with a compact
+   evidence summary. LibreOffice checks are optional and non-gating.
 
 Never call the document "finished" because the browser shows a final view or
 because an event was sent. Finished means the delivery gate is green. If a
