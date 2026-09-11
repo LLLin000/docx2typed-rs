@@ -6743,6 +6743,17 @@ _PROFILES: dict[str, set[str] | None] = {
         "history_gc",
         "build_docx",
         "verify_output",
+        # Structural and baseline operations edit THIS workspace as its next
+        # version (P3), so they belong to the editing surface, not only to the
+        # full one. Single revision decisions and comment tools stay in the
+        # review profile: those are per-item review actions.
+        "decide_all",
+        "table_insert_row",
+        "table_delete_row",
+        "table_insert_col",
+        "table_delete_col",
+        "table_merge_cells",
+        "table_split_cells",
     },
     "review": {
         "engine_info",
