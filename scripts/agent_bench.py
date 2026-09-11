@@ -12,6 +12,10 @@ Tasks: capabilities/tasks/agent.json. Run:
     python -m scripts.agent_bench --list
     python -m scripts.agent_bench --serve          # persistent MCP driver
     python -m scripts.agent_bench --grade <task-id> <output.docx> <workdir>
+
+The serve loop is line-oriented on stdin. When driving it through the Windows
+hub process manager, launch the process with ``pty=true``; ``pty=false`` can
+print the ready banner while delaying or dropping request delivery.
 """
 from __future__ import annotations
 

@@ -16,7 +16,7 @@
     }
   ],
   "run_protocol": [
-    "Start one persistent agent_bench --serve process per task and variant.",
+    "Start one persistent agent_bench --serve process per task and variant; when using the Windows hub process manager, launch it with pty=true so JSON requests reach stdin reliably. pty=false can emit the ready banner while delaying or dropping request delivery.",
     "Pass --trace-out, --variant, and --task-id to record tool timing without document text.",
     "Keep the workdir seed and input DOCX identical between A and B.",
     "Analyze each trace with python -m scripts.agent_bench --metrics TRACE_JSON.",
