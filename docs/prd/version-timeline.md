@@ -54,18 +54,14 @@ becomes canonical. Measured today:
 | `format_span` | yes | **no** — fold into the next save (see P0) |
 | `review_settle`, `accept_revision`, `reject_revision` | `review_settle` yes; single decisions write canonical without publishing | **no** — they prepare state; the next `commit_sync` versions it |
 | `document_patch`, `document_replace`, `replace_text`, `insert_paragraph`, `delete_paragraph`, `revert` | no (draft) | no |
-| `decide_all`, `table_*` | produces a **new workdir** | P3 (baseline transition) |
+| `decide_all`, `table_*` | without `workdir_out`, adopts a new baseline in this workspace | **yes** — baseline transition; with `workdir_out`, sibling-workdir compatibility |
 | `build_docx` / `verify_output` | no | no (export, not save) |
 
-**P0 must align this.** Today `format_span` and `batch_edit` publish
-immediately while single revision decisions do not, so one user-visible save
-can produce two versions (batch → commit) or one (accept → commit). The rule
-to enforce: *only the save boundary publishes a version; every other canonical
-writer leaves state that the next save boundary versions.* The
-collaboration-drift guard must keep working under that rule (a mutation that
-leaves `typed.md` ahead of the session must still be resolvable by
-`commit_sync` — the dead end fixed in `8dd135e` must not come back through a
-different door).
+**P0 is implemented.** Only the save boundary creates a Version. `format_span`,
+`batch_edit`, and review decisions may update canonical state or the
+collaboration snapshot, but they fold into the next `commit_sync`;
+`document_patch` and `document_replace` remain draft-only. A `commit_sync` with
+no draft, canonical, or publication drift is a true no-op.
 
 ### Data contract
 
@@ -237,11 +233,11 @@ it is a comparison feature, not a restore mechanism (ADR 0041).
 | SharePoint / OneDrive versioning | major/minor semantics, "restoring a version makes it the new current version", count+age retention with automatic thinning | vocabulary + retention policy shape (ADR 0042); v1 is major-only |
 | Liveblocks / editor version history | list + preview + restore-of-a-rendering, restore as an undoable change | our `.review/snapshots/C<n>.json` already *is* the renderable snapshot; reuse it as the version preview |
 | Jodit Collab storage | snapshot + tail-log model, `history(from,to)`, `prune(keepSnapshots)` | confirms our generation/snapshot split; the prune contract maps to retention |
-| borg / restic / casync (CDC dedup) | content-defined chunking for dedup | **not adopted** — that is an object database; revisit only with measured need |
-| zstd `--patch-from` | delta a file against a previous version as a dictionary | the escape hatch for P2 if deltas are wanted, one call, no new format |
+| borg / restic / casync (CDC dedup) | content-defined chunking for dedup | not adopted; P2 uses a simpler content-addressed object pool with paragraph-keyed chunks and bucketed maps |
+| zstd `--patch-from` | delta a file against a previous version as a dictionary | not adopted; a future storage optimization only |
 | ReFS block cloning / NTFS CoW | cheap full copies at the filesystem level | not a contract (volume-format and OS dependent); do not build on it |
 | docx4j `Differencer`, `OpenXmlDiff`, Docxodus IR diff | OOXML-aware comparison producing tracked changes / patch reports | P4 only; cannot reconstruct editing state (ADR 0041) |
-| Existing repo pieces | `publish_current`, `document_state`, `_persist_snapshot`, `generation.json` assets manifest, `Store.mutate`, `verify_output` byte checks, build determinism | everything above is built from these; no new ledger, no new commit path, no new diff engine |
+| Existing repo pieces | `publish_current`, `document_state`, `_persist_snapshot`, `generation.json` assets manifest, `Store.mutate`, `verify_output` byte checks, build determinism | everything above is built from these; no new history authority or commit path, no new diff engine |
 
 ## Prototype findings (2026-09-11)
 
@@ -298,5 +294,5 @@ is load-bearing, not cosmetic.
 - No Git: no branches, no merge, no detached states, no second history
   authority (ADR 0040).
 - No per-version DOCX storage, no OOXML delta format (ADR 0041).
-- No object database, no chunk-level dedup in v1 (ADR 0042).
+- Object storage is adopted in P2 (ADR 0043), but packfiles, delta chains, and compression remain out of scope.
 - No new tool per history verb: `diff_preview` is extended, not duplicated.
