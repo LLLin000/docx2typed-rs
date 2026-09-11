@@ -273,3 +273,39 @@ settle/table 操作产出的新 DOCX + 重新 extract 的干净基线 workdir；
 
 **Freestanding anchor**:
 位于段落/单元格之间的 bookmark/comment 锚点（Word 常把 range end 放在 `</w:p>` 之后或 tc 之间）；按字节位置归属其前一段，保持锚点配对完整。
+
+**Store**:
+workdir 私有的、承载不可变 generation 与 current 指针的账本；事务与 CAS 的实现处，不是用户语言。
+_Avoid_: 版本库, 仓库
+
+**Generation**:
+一次 mutation 产生的不可变整份编辑状态快照，带父代与逐文件指纹；事务与 GC 的单位。
+_Avoid_: 版本（用户版本是 Version）, snapshot
+
+**Snapshot**:
+每个保存边界发布的 canonical round 记录，含内容哈希、父快照与可渲染视图；协作、评审与 preflight 的基准。
+_Avoid_: 版本, commit
+
+**Save boundary**:
+草稿成为 canonical 状态的时刻（`commit_sync`，以及直接改写 canonical 状态的格式/决策/表格操作）；只有它产生 Version。
+_Avoid_: 提交点, checkpoint
+
+**Version**:
+用户可见的可回退保存点，指向一个 Snapshot 并锚定其内容；id 创建时确定且永不复用。
+_Avoid_: 修订（该词已属于 revisions.json 的 Word 修订）, commit, checkpoint, 版本号 C{n}
+
+**Restore**:
+把某个历史 Version 的内容复制为一个新 Version 的操作；current 只向前，历史永不回拨。
+_Avoid_: 回滚, revert, reset, 检出
+
+**Export**:
+把当前状态物化成可交付 DOCX；不产生 Version，也不改变 canonical 状态。
+_Avoid_: 保存, 提交, save
+
+**Workspace**:
+一个逻辑文档长期复用的 workdir；用户面对的是"这个文档 + 它的版本时间线"，不是一堆并列的 wd/final(2)。
+_Avoid_: 临时目录, 工作副本
+
+**Baseline transition**:
+同一文档进入新基线纪元的 Version（模板/源指纹切换、重新 extract）；用户仍只看到"下一个版本"。
+_Avoid_: 新 workdir, 重抽取
