@@ -128,10 +128,12 @@ Nothing rewinds: the pointer advances, V18 stays, every later version stays.
 
 Measured on the 3000-paragraph fixture (976 KB source):
 
-| | today | with ADR 0043 |
+| | today | with ADR 0043 (prototyped) |
 |---|---|---|
-| one version | 5.33 MB in 20 loose files | ~1 KB delta + metadata |
-| ten versions | 43.9 MB in 182 files | shared blobs, one log |
+| ten versions, state payload | 23.8 MB in 88 files | **2.73 MB in 6421 blobs** |
+| history index | one `generation.json` per version | **8.5 KB in one file** |
+| bytes a version adds | ~4.4 MB | **5–44 KB** |
+| blob lost | silent | detected + named (version, path, chunk) |
 
 Where the 5.33 MB goes: `.review/snapshots/C*.json` 0.66 MB **each** (derived,
 accumulated inside every later generation), `format.json` 1.21 MB,

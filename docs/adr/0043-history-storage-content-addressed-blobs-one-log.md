@@ -61,8 +61,40 @@ Borrow Git's shape, at our scale, and drop the per-generation directory:
   log is the only record that must not be lost, so it is append-only, fsynced,
   and small; the live workdir always holds the newest state, so losing it
   costs history, not the document.
+- **One history file per document, not two.** The collaboration snapshot
+  metadata (id, parent, origin, changed paragraph ids) is part of the same log
+  record — it already describes the same event. `.review/` keeps only what is
+  genuinely live collaboration (queued human patches, inbox, writer state) and
+  its render snapshots are regenerated on demand instead of accumulated. After
+  this step a document has exactly one history authority to back up.
 - **Migration**: existing generations are imported by writing their state
   files as blobs and appending a record per generation, in order.
+
+## Measured (throwaway prototype, ten real generations of a 3000-paragraph doc)
+
+The layout above was prototyped over the history produced by the restore
+prototype, deriving a pool purely from what was already on disk:
+
+| | loose-file layout today | blobs + one log |
+|---|---|---|
+| state payload | 23.8 MB in 88 files | **2.73 MB in 6421 blobs** (8.7× dedup) |
+| history index | one `generation.json` per version | **8.5 KB in one file** |
+| bytes a version adds | ~4.4 MB average | **5–44 KB** (first is the base state) |
+
+Two things the prototype corrected in this ADR's own first draft:
+
+1. **The index is the cost, not the content.** Inlining every chunk hash into
+   each log record produced a 6.4 MB log for 2 MB of content. Fanning the
+   manifest into buckets (Git's trees-of-trees, one level) took the same
+   history to 8.5 KB.
+2. **Bucket size is the knob.** 64 entries per leaf costs ~25 KB per version
+   (one format.json leaf rewritten); smaller leaves trade fewer bytes per
+   version for more index hashes. Pick it from the measured write pattern, not
+   from taste.
+
+Failure drill: deleting one blob was detected across every version that
+references it, and reported as `(generation, path, chunk key)` — the loss is
+named, not silent.
 
 ## Consequences
 
