@@ -16,6 +16,9 @@ sha2 = "0.10"
 hex = "0.4"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+# Identity minting (`f_`/`ws_` + uuid4 hex) — same dep/feature set the
+# protocol crate already uses for `new_operation_id()`.
+uuid = { version = "1", features = ["v4"] }
 # Issue #58: per-part XML well-formedness gate (full parser, not the
 # byte-walker's nesting check).
 roxmltree = "0.21"
