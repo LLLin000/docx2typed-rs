@@ -630,14 +630,54 @@ pub struct Pointer {
     pub manifest_sha256: Option<String>,
 }
 
-fn pointer_payload(generation: &str, operation_id: Option<&str>, manifest_sha256: &str) -> Value {
-    json!({
+/// The version HEAD's fields, spelled exactly as the Python reference spells
+/// them (`store.VERSION_POINTER_FIELDS`). Kept in one place because the
+/// readers in `versions.rs` address them by name.
+const VERSION_POINTER_FIELDS: [&str; 7] = [
+    "head_version",
+    "head_version_generation",
+    "head_tree",
+    "head_tree_object",
+    "head_commit",
+    "baseline_epoch",
+    "version_seq",
+];
+
+/// Pointer payload = HEAD: the current generation plus the version HEAD names.
+///
+/// A plain mutation **carries the version fields forward** — canonical may
+/// drift ahead of HEAD, and that drift is what `version_dirty` names (ADR
+/// 0044) — while only a save boundary replaces them. Writing them off here is
+/// not "no opinion": it erases a timeline, and leaves the objects it named in
+/// the pool with nothing referencing them.
+fn pointer_payload(
+    root: &Path,
+    generation: &str,
+    operation_id: Option<&str>,
+    manifest_sha256: &str,
+) -> Value {
+    let mut payload = json!({
         "schema": POINTER_SCHEMA,
         "generation": generation,
         "operation_id": operation_id,
         "manifest_sha256": manifest_sha256,
         "written_at": now_iso(),
-    })
+    });
+    let previous = read_json_file(&root.join(POINTER_FILE)).ok();
+    if let Some(previous) = previous {
+        if previous.get("schema").and_then(Value::as_str) == Some(POINTER_SCHEMA) {
+            if let Some(object) = payload.as_object_mut() {
+                for field in VERSION_POINTER_FIELDS {
+                    if let Some(carried) = previous.get(field) {
+                        if !carried.is_null() {
+                            object.insert(field.to_string(), carried.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    payload
 }
 
 fn read_pointer(root: &Path) -> Option<Pointer> {
@@ -1139,6 +1179,7 @@ impl Store {
             );
             write_journal_record(&tx_dir, &prepared)?;
             let pointer = pointer_payload(
+                &store.root,
                 &generation,
                 Some(operation_id),
                 manifest
@@ -1629,7 +1670,7 @@ impl Store {
         operation_id: &str,
         manifest_sha256: &str,
     ) -> Result<(), StoreError> {
-        let pointer = pointer_payload(generation, Some(operation_id), manifest_sha256);
+        let pointer = pointer_payload(&self.root, generation, Some(operation_id), manifest_sha256);
         let mut bytes = canonical_json(&pointer).into_bytes();
         bytes.push(b'\n');
         write_durable(

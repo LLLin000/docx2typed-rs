@@ -13,7 +13,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use docx2typed_protocol::new_operation_id;
+use docx2typed_protocol::{canonical_json, new_operation_id};
 use docx2typed_store::store::{
     clear_faults, kill_at, set_fault, Fault, KillPanic, Store, StoreMutateRequest, Transaction,
     GENERATION_CONFLICT, NEEDS_RECOVERY, OPERATION_ID_REUSED, RESERVE_BYTES, RESERVE_DEPLETED,
@@ -856,4 +856,73 @@ fn startup_recovery_runs_at_next_mutation_entry() {
     // No pending transactions remain.
     let state = Store::open(&root).unwrap();
     assert!(state.pending_transactions().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// HEAD carries the version it names. A plain mutation carries those fields
+// forward (canonical may drift ahead of HEAD -- that drift is `version_dirty`,
+// ADR 0044); only a save boundary replaces them.
+// ---------------------------------------------------------------------------
+
+/// A pointer that names a version, as the Python reference writes it at a save
+/// boundary. Returns the seeded pointer for comparison.
+fn seed_version_head(root: &Path) -> Value {
+    let path = root.join("workdir.json");
+    let mut pointer: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    pointer["head_version"] = json!("V1");
+    pointer["head_version_generation"] = pointer["generation"].clone();
+    pointer["version_seq"] = json!(1);
+    pointer["head_tree"] = json!("tree-digest");
+    pointer["head_tree_object"] = json!("tree-object-digest");
+    pointer["head_commit"] = json!("commit-digest");
+    pointer["baseline_epoch"] = json!(1);
+    fs::write(&path, canonical_json(&pointer)).unwrap();
+    pointer
+}
+
+#[test]
+fn a_mutation_carries_the_version_head_forward() {
+    let _guard = suite_lock();
+    let root = scratch("carry-forward");
+    let store = init_store(&root);
+    let before = seed_version_head(&root);
+
+    mutate(&store, &op()).expect("mutate");
+
+    let after: Value =
+        serde_json::from_str(&fs::read_to_string(root.join("workdir.json")).unwrap()).unwrap();
+    for field in [
+        "head_version",
+        "head_version_generation",
+        "version_seq",
+        "head_tree",
+        "head_tree_object",
+        "head_commit",
+        "baseline_epoch",
+    ] {
+        assert_eq!(
+            after[field], before[field],
+            "{field} must be carried forward by a plain mutation"
+        );
+    }
+    // The mutation committed a new generation; it did not claim a new version.
+    assert_ne!(after["generation"], before["generation"]);
+}
+
+#[test]
+fn a_mutation_does_not_invent_a_version_head() {
+    let _guard = suite_lock();
+    let root = scratch("no-version");
+    let store = init_store(&root);
+
+    mutate(&store, &op()).expect("mutate");
+
+    let after: Value =
+        serde_json::from_str(&fs::read_to_string(root.join("workdir.json")).unwrap()).unwrap();
+    for field in ["head_version", "version_seq", "head_tree", "head_commit"] {
+        assert!(
+            after.get(field).is_none(),
+            "{field} must not be invented: a mutation is not a save"
+        );
+    }
 }
