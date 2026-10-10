@@ -786,6 +786,61 @@ fn patch(
 }
 
 #[test]
+fn document_patch_edits_the_exact_span_a_search_reference_names() {
+    // The search -> patch loop: a caller edits the spot `document_search`
+    // pointed at WITHOUT copying its text, and a reference that no longer
+    // addresses what it was issued for is refused rather than landing on
+    // whatever now sits at those offsets.
+    let wd = workdir("patch-match-ref", "plain");
+    draft::ensure_projection(&wd).expect("projection");
+    let found = docx2typed_core::document_search::document_search(
+        &wd,
+        "本发明",
+        3000,
+        false,
+        20,
+        0,
+        "body",
+    )
+    .expect("search");
+    let reference = found
+        .matches
+        .iter()
+        .flat_map(|block| block.occurrences.iter())
+        .map(|occurrence| occurrence.match_ref.clone())
+        .next()
+        .expect("a match reference");
+
+    // Edit through the reference alone.
+    let applied = patch(
+        &wd,
+        &json!([{ "match_ref": reference, "new": "我们" }]),
+        None,
+    )
+    .expect("match_ref hunk applies");
+    assert_eq!(applied["draft"], "dirty");
+
+    // The same reference is now stale: its bound text digest no longer
+    // matches what sits at those offsets, and that is a refusal.
+    let error = patch(
+        &wd,
+        &json!([{ "match_ref": reference, "new": "他们" }]),
+        None,
+    )
+    .expect_err("a reused reference must refuse");
+    assert_eq!(error.code, "match-ref-stale", "{}", error.detail);
+
+    // A corrupt reference never resolves to a guessed span either.
+    let error = patch(
+        &wd,
+        &json!([{ "match_ref": "ref_not-base64!!", "new": "x" }]),
+        None,
+    )
+    .expect_err("a corrupt reference must refuse");
+    assert_eq!(error.code, "match-ref-invalid", "{}", error.detail);
+}
+
+#[test]
 fn document_patch_applies_replace_insert_delete_in_one_batch() {
     let wd = workdir("patch-batch", "plain");
     draft::ensure_projection(&wd).expect("projection");

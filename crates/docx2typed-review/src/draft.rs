@@ -956,6 +956,56 @@ fn require_unprotected(
     Ok(())
 }
 
+/// Expand `{"match_ref": …, "new": …}` hunks into ordinary replace hunks.
+///
+/// `document_search` hands out these references so a caller can edit an exact
+/// spot without copying text; resolving one here turns it into
+/// `{paragraph_id, old, new}`, which is what the rest of the lane already
+/// understands. Resolution validates the reference against the current draft,
+/// so a span that moved is reported (`match-ref-stale`, carrying what the
+/// document says at those offsets now) instead of landing on the wrong text.
+fn expand_match_ref_hunks(
+    workdir: &Path,
+    hunks: &[Value],
+) -> Result<Vec<Value>, CollaborationError> {
+    let mut expanded = Vec::with_capacity(hunks.len());
+    for (index, hunk) in hunks.iter().enumerate() {
+        let Some(object) = hunk.as_object() else {
+            // Let normalization report the shape error.
+            expanded.push(hunk.clone());
+            continue;
+        };
+        let Some(reference) = object.get("match_ref").and_then(Value::as_str) else {
+            expanded.push(hunk.clone());
+            continue;
+        };
+        let Some(new) = object.get("new").and_then(Value::as_str) else {
+            return Err(CollaborationError::new(
+                "invalid-arguments",
+                format!("hunks[{index}]: match_ref hunk needs 'new' (the replacement text)"),
+            ));
+        };
+        let resolved = docx2typed_core::document_search::resolve_match_ref(workdir, reference)
+            .map_err(|error| {
+                // Core domain failures carry `code: detail`; split so the
+                // caller sees the stable code rather than one long message.
+                let message = error.to_string();
+                match message.split_once(':') {
+                    Some((code, detail)) if !code.contains(' ') => {
+                        CollaborationError::new(code, detail.trim())
+                    }
+                    _ => CollaborationError::new("workdir-invalid", message),
+                }
+            })?;
+        expanded.push(json!({
+            "paragraph_id": resolved.paragraph_id,
+            "old": resolved.text,
+            "new": new,
+        }));
+    }
+    Ok(expanded)
+}
+
 /// Normalize raw hunk objects into typed hunks (mirror of
 /// `_normalize_patch_hunks`): unknown keys, missing fields, and an unusable
 /// shape are `invalid-arguments` before anything is read or written.
@@ -981,9 +1031,10 @@ fn normalize_patch_hunks(hunks: &[Value]) -> Result<Vec<PatchHunk>, Collaboratio
         }
         let string = |key: &str| object.get(key).and_then(Value::as_str);
         if object.contains_key("match_ref") {
+            // Expanded before normalization (see `expand_match_ref_hunks`);
+            // reaching here means the caller used the key on its own.
             return Err(invalid(format!(
-                "hunks[{index}]: match_ref hunks are not implemented yet; use a replace hunk \
-                 (paragraph_id + old + new)"
+                "hunks[{index}]: match_ref hunk needs 'new' (the replacement text)"
             )));
         } else if object.contains_key("paragraph_id") {
             let paragraph_id = string("paragraph_id").filter(|value| !value.is_empty());
@@ -1659,7 +1710,12 @@ pub fn document_patch(
         ));
     }
     crate::collab::ensure_agent_ready(workdir)?;
-    let normalized = normalize_patch_hunks(hunks.unwrap_or_default())?;
+    // A `match_ref` hunk names a span instead of copying its text, so it is
+    // expanded to an ordinary replace hunk here — against the CURRENT draft,
+    // which is where a stale reference is caught rather than silently applied
+    // to the wrong offset.
+    let expanded = expand_match_ref_hunks(workdir, hunks.unwrap_or_default())?;
+    let normalized = normalize_patch_hunks(&expanded)?;
     if normalized.is_empty() {
         return Err(CollaborationError::new(
             "invalid-arguments",
