@@ -1,0 +1,85 @@
+{
+  "schema": "docx2typed-parity-matrix-1",
+  "reference_commit": "1adcc9403cc830e899efe74c5ec41b11973b8c7c",
+  "target_commit": "324cd055096e841fd5c97757def982b91ed93e15",
+  "missing_tools": [
+    {
+      "tool": "document_patch",
+      "python_site": "mcp_server.py:5232",
+      "rust_owner": "review/draft.rs",
+      "status": "partial"
+    },
+    {
+      "tool": "document_read",
+      "python_site": "mcp_server.py:3462",
+      "rust_owner": "core/document_projection.rs",
+      "status": "partial"
+    },
+    {
+      "tool": "document_replace",
+      "python_site": "mcp_server.py:4947",
+      "rust_owner": null,
+      "status": "missing"
+    },
+    {
+      "tool": "document_search",
+      "python_site": "mcp_server.py:3580",
+      "rust_owner": "core/govern.rs",
+      "status": "partial"
+    },
+    {
+      "tool": "format_span",
+      "python_site": "mcp_server.py:3783",
+      "rust_owner": "core/prose.rs",
+      "status": "partial"
+    },
+    {
+      "tool": "history_blame",
+      "python_site": "mcp_server.py:5886",
+      "rust_owner": null,
+      "status": "missing"
+    },
+    {
+      "tool": "history_diff",
+      "python_site": "mcp_server.py:5865",
+      "rust_owner": null,
+      "status": "missing"
+    },
+    {
+      "tool": "history_gc",
+      "python_site": "mcp_server.py:5917",
+      "rust_owner": "store/store.rs",
+      "status": "missing"
+    },
+    {
+      "tool": "history_list",
+      "python_site": "mcp_server.py:5934",
+      "rust_owner": "review/history.rs:163",
+      "status": "partial"
+    },
+    {
+      "tool": "history_restore",
+      "python_site": "mcp_server.py:5951",
+      "rust_owner": "store/store.rs",
+      "status": "missing"
+    },
+    {
+      "tool": "history_verify",
+      "python_site": "mcp_server.py:5905",
+      "rust_owner": null,
+      "status": "missing"
+    },
+    {
+      "tool": "workspace_adopt",
+      "python_site": "mcp_server.py:2935",
+      "rust_owner": null,
+      "status": "missing"
+    },
+    {
+      "tool": "workspace_fork",
+      "python_site": "mcp_server.py:2984",
+      "rust_owner": null,
+      "status": "missing"
+    }
+  ]
+}
