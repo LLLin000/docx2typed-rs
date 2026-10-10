@@ -4,6 +4,72 @@ Settles the four questions in #33 before any code, in the same shape as
 `01_pr3_structural_closure.md`. The primitive already exists (#28); what is
 missing is a way for the build to **apply** it.
 
+## BLOCKED: the style registry this lane depends on does not exist
+
+Added after starting the implementation. This section corrects the premise the
+rest of the document was written on, so nobody builds from a plan that cannot
+work.
+
+`restyle_run_properties` refuses `format-style-unavailable` unless the derived
+`style_id` is already in `styles.json`. **Rust's extract writes `styles.json`
+with an empty `styles` object**, hardcoded:
+
+```rust
+// crates/docx2typed-core/src/lib.rs:220
+let styles_bytes = serde_json::to_vec(&serde_json::json!({
+    "schema": STYLES_SCHEMA,
+    "canonicalizer_version": CANONICALIZER_VERSION,
+    "styles": {},
+}))
+```
+
+Measured, same document (`corpus/release/styled.docx`):
+
+| engine | `styles.json` entries |
+|---|---|
+| Python | **3** (`s_9f5c04f8681ebd4e` normal, `s_22a1dd1510eee8bd` 宋体, `s_adcd924781ac8b4e` Times New Roman) |
+| Rust | **0** |
+
+So `format_span` as specified here can never succeed on a Rust-extracted
+workdir: every restyle would fail `format-style-unavailable`, including one
+reusing a style that plainly exists in the document. The lane would be inert
+exactly as `history_*` was before #37 — a mechanism with nothing feeding it.
+
+### And the two engines derive style ids differently
+
+`content_style_id` is `s_` + `sha256(canonical_bytes)[:16]`, and Rust's
+`canonical_rpr_bytes` emits **raw XML bytes**. Python's canonical is a
+**JSON-list form**, and its id hashes that string. Verified against the three
+ids above:
+
+```
+Python: sha256('["w:rPr",[],"",[]]')[:16] = 9f5c04f8681ebd4e   == its own id  ✓
+Rust:   sha256(b"")[:16]                  = e3b0c44298fc1c14   != that id     ✗
+```
+
+Each scheme is self-consistent, so a registry populated with Rust's ids would
+work *within* Rust. It would not agree with Python's ids for the same run
+properties — and `styles.json` is in `CANONICAL_ASSETS`, so that difference
+also moves the tree digest and therefore the version chain.
+
+That is a decision, not a mechanical fix, which is why this is filed rather
+than guessed: adopt Python's JSON-list canonical so ids and digests agree
+across engines, or keep Rust's and record the divergence as a known
+non-equivalence.
+
+### What is already built and tested
+
+`prose.rs` now carries the mechanism this document specifies, with five tests
+passing (restyle in place, insert onto a run with no `w:rPr`, one span across
+several runs, a stale paragraph reported not dropped, sidecar round-trip with
+empty-removes-file), and `ProseLeaf` gained the `rpr_start`/`rpr_end`/
+`run_open_end` ranges the in-place rewrite needs. The negative control fires:
+removing the insertion branch fails two of the tests.
+
+It is **not** committed on its own, because with no registry it has no caller —
+a mechanism nothing invokes is a stub, and this repository has enough of those
+recorded as open issues.
+
 ## The gap, precisely
 
 Every build-time edit Rust can express today is one of:
@@ -189,6 +255,10 @@ format_span(paragraph_id, old, attributes|style_id, match_ref?, operation_id?)
    the test proves the build path uses it).
 
 ## What this does not decide
+
+- **The style-id scheme** (see the blocked section above). It gates everything
+  else here: the registry cannot be populated until the canonical form is
+  chosen, and the choice moves `styles.json`'s bytes and so the tree digest.
 
 - `span_index` addressing (Python has it; no Rust caller needs it yet).
 - `rPrChange` synthesis (decision 4).
