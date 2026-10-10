@@ -1,0 +1,57 @@
+{
+  "schema": "docx2typed-parity-lock-1",
+  "created": "2026-10-11",
+  "reference": {
+    "repo": "LLLin000/docx2typed",
+    "commit": "1adcc9403cc830e899efe74c5ec41b11973b8c7c",
+    "role": "feature baseline: the behaviour Rust must reach (current main)"
+  },
+  "oracle": {
+    "repo": "LLLin000/docx2typed",
+    "tag": "v0.1.0-python-final",
+    "commit": "c6a17a16963d36e8860f8952a56465e94b3bb53a",
+    "role": "CI-pinned oracle: what Rust CI compares against at runtime",
+    "pinned_in": ".github/workflows/rust-ci.yml PINNED_PYTHON_REFERENCE_SHA",
+    "note": "DISTINCT from the feature reference: 118 commits behind main and predates the rPr fix (#98). A defect fixed on main is NOT fixed in the oracle; Rust must implement the correct behaviour and the oracle must be bumped deliberately."
+  },
+  "target": {
+    "repo": "LLLin000/docx2typed-rs",
+    "commit": "324cd055096e841fd5c97757def982b91ed93e15"
+  },
+  "surfaces": {
+    "mcp_tools": {
+      "python": 49,
+      "rust": 36
+    },
+    "cli_commands": {
+      "python": 8,
+      "rust": 8
+    }
+  },
+  "mcp_gap": {
+    "missing_in_rust": [
+      "document_patch",
+      "document_read",
+      "document_replace",
+      "document_search",
+      "format_span",
+      "history_blame",
+      "history_diff",
+      "history_gc",
+      "history_list",
+      "history_restore",
+      "history_verify",
+      "workspace_adopt",
+      "workspace_fork"
+    ],
+    "only_in_rust": []
+  },
+  "cli_gap": {
+    "missing_in_rust": [],
+    "only_in_rust": []
+  },
+  "evidence_hashes": {
+    "rust_mcp_schemas": "20cabdf4f596e8fa775c694caf74009560e27bbd025144ea537241682002ec01",
+    "rust_core_prose": "1c1fc2dcf8e50bcf1f5f91ee7c87e7838ad672c4c0421b9c5ed53f65a82be36d"
+  }
+}

@@ -1265,14 +1265,14 @@ pub fn apply_edits(template: &Path, edits: &[IslandEdit]) -> Result<Vec<u8>, Cor
             };
             if edit.tracked {
                 let replacement = tracked_run_replacement(
-                    &part_bytes,
-                    &leaf,
-                    &edit.old,
-                    &edit.new,
-                    &edit.author,
-                    &edit.date,
-                    next_revision_id,
-                    next_revision_id.saturating_add(1),
+                    TrackedEditContext { part: &part_bytes, leaf: &leaf },
+                    TrackedEditContent { old: &edit.old, new: &edit.new },
+                    TrackedEditRevision {
+                        author: &edit.author,
+                        date: &edit.date,
+                        delete_id: next_revision_id,
+                        insert_id: next_revision_id.saturating_add(1),
+                    },
                 )?;
                 next_revision_id = next_revision_id.saturating_add(2);
                 spans.push(replacement);
@@ -1327,17 +1327,31 @@ fn max_revision_id(package: &[u8]) -> u32 {
     max_id
 }
 
-fn tracked_run_replacement(
-    part: &[u8],
-    leaf: &ProseLeaf,
-    old: &str,
-    new: &str,
-    author: &str,
-    date: &str,
+// Grouped parameters to satisfy clippy::too_many_arguments
+struct TrackedEditContext<'a> {
+    part: &'a [u8],
+    leaf: &'a ProseLeaf,
+}
+
+struct TrackedEditContent<'a> {
+    old: &'a str,
+    new: &'a str,
+}
+
+struct TrackedEditRevision<'a> {
+    author: &'a str,
+    date: &'a str,
     delete_id: u32,
     insert_id: u32,
+}
+
+fn tracked_run_replacement(
+    ctx: TrackedEditContext<'_>,
+    content: TrackedEditContent<'_>,
+    revision: TrackedEditRevision<'_>,
 ) -> Result<(usize, usize, Vec<u8>), CoreError> {
-    let before = &part[..leaf.text_start];
+
+    let before = &ctx.part[..ctx.leaf.text_start];
     let mut run_start = None;
     for index in 0..before.len().saturating_sub(3) {
         if &before[index..index + 4] == b"<w:r"
@@ -1350,12 +1364,12 @@ fn tracked_run_replacement(
     }
     let run_start = run_start
         .ok_or_else(|| CoreError::Domain("tracked-edit: owning run not found".to_string()))?;
-    let run_end_rel = part[leaf.text_end..]
+    let run_end_rel = ctx.part[ctx.leaf.text_end..]
         .windows(6)
         .position(|w| w == b"</w:r>")
         .ok_or_else(|| CoreError::Domain("tracked-edit: owning run end not found".to_string()))?;
-    let run_end = leaf.text_end + run_end_rel + 6;
-    let run = &part[run_start..run_end];
+    let run_end = ctx.leaf.text_end + run_end_rel + 6;
+    let run = &ctx.part[run_start..run_end];
     let t_count = run.windows(5).filter(|w| *w == b"<w:t>").count()
         + run.windows(5).filter(|w| *w == b"<w:t ").count();
     if t_count != 1 || run.windows(6).filter(|w| *w == b"</w:t>").count() != 1 {
@@ -1373,13 +1387,13 @@ fn tracked_run_replacement(
                 .map(|end| String::from_utf8_lossy(&run[start..start + end + 8]).into_owned())
         })
         .unwrap_or_default();
-    let prefix = leaf.text.split_once(old).map(|(p, _)| p).unwrap_or("");
-    let suffix = leaf.text.split_once(old).map(|(_, s)| s).unwrap_or("");
+    let prefix = ctx.leaf.text.split_once(content.old).map(|(p, _)| p).unwrap_or("");
+    let suffix = ctx.leaf.text.split_once(content.old).map(|(_, s)| s).unwrap_or("");
     let attrs = |kind: &str, id: u32| {
         format!(
             "<w:{kind} w:id=\"{id}\" w:author=\"{}\" w:date=\"{}\">",
-            xml_attr(author),
-            xml_attr(date)
+            xml_attr(revision.author),
+            xml_attr(revision.date)
         )
     };
     let run_text = |tag: &str, text: &str| {
@@ -1393,7 +1407,7 @@ fn tracked_run_replacement(
             xml_escape(text)
         )
     };
-    if !leaf.text.contains(old) {
+    if !ctx.leaf.text.contains(content.old) {
         return Err(CoreError::Domain(
             "tracked-edit: old text is not in leaf".to_string(),
         ));
@@ -1402,11 +1416,11 @@ fn tracked_run_replacement(
     if !prefix.is_empty() {
         replacement.push_str(&run_text("t", prefix));
     }
-    replacement.push_str(&attrs("del", delete_id));
-    replacement.push_str(&run_text("delText", old));
+    replacement.push_str(&attrs("del", revision.delete_id));
+    replacement.push_str(&run_text("delText", content.old));
     replacement.push_str("</w:del>");
-    replacement.push_str(&attrs("ins", insert_id));
-    replacement.push_str(&run_text("t", new));
+    replacement.push_str(&attrs("ins", revision.insert_id));
+    replacement.push_str(&run_text("t", content.new));
     replacement.push_str("</w:ins>");
     if !suffix.is_empty() {
         replacement.push_str(&run_text("t", suffix));
