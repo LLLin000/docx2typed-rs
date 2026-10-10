@@ -40,14 +40,14 @@ Machine-readable: [`matrix.json`](matrix.json), [`python-lock.json`](python-lock
 
 | Surface | Python | Rust | Gap |
 |---|---|---|---|
-| MCP tools | **49** | **37** | 12 missing, 0 extra |
+| MCP tools | **49** | **40** | 9 missing, 0 extra |
 | CLI commands | **8** | **8** | **at parity** |
 
 The CLI is already at parity: both declare exactly
 `build, decide, edit, extract, inspect, migrate, validate, verify`
 (Python `scripts/protocol.py`, Rust `crates/docx2typed-protocol/src/descriptor.rs`).
 
-## 2. The 12 missing MCP tools
+## 2. The 9 missing MCP tools
 
 Name equality is not functional equality; each row lists the Python definition
 site and the Rust crate that must own the capability. Status values:
@@ -56,19 +56,28 @@ site and the Rust crate that must own the capability. Status values:
 
 | # | Tool | Python site | Rust infrastructure | Status |
 |---|---|---|---|---|
-| 1 | `document_read` | `mcp_server.py:3462` | `core/document_projection.rs`, `core/inspect.rs` | `partial` |
-| 2 | `document_search` | `mcp_server.py:3580` | `core/govern.rs`, `document_projection.rs` | `partial` |
-| 3 | `document_replace` | `mcp_server.py:4947` | — | `missing` |
-| 4 | `document_patch` | `mcp_server.py:5232` | region/leaf machinery in `review/draft.rs` | `partial` |
-| 5 | `format_span` | `mcp_server.py:3783` | run-properties in `core/prose.rs` | `partial` |
-| 6 | ~~`history_list`~~ | `mcp_server.py:5934` | **landed** (#20) | `equivalent` |
-| 7 | `history_diff` | `mcp_server.py:5865` | — | `missing` |
-| 8 | `history_blame` | `mcp_server.py:5886` | — | `missing` |
-| 9 | `history_verify` | `mcp_server.py:5905` | — | `missing` |
-| 10 | `history_restore` | `mcp_server.py:5951` | `store/store.rs` (generations) | `missing` |
-| 11 | `history_gc` | `mcp_server.py:5917` | `store/store.rs` | `missing` |
-| 12 | `workspace_adopt` | `mcp_server.py:2935` | identity substrate landed (#19); tool not yet exposed | `partial` |
-| 13 | `workspace_fork` | `mcp_server.py:2984` | identity substrate landed (#19); tool not yet exposed | `partial` |
+| 1 | `document_replace` | `mcp_server.py:4947` | — | `missing` |
+| 2 | `format_span` | `mcp_server.py:3783` | rPr primitive landed (#28); **MCP surface blocked on #33** | `partial` |
+| 3 | `history_diff` | `mcp_server.py:5865` | `review/history.rs`, `store/versions.rs` | `missing` |
+| 4 | `history_blame` | `mcp_server.py:5886` | same | `missing` |
+| 5 | `history_verify` | `mcp_server.py:5905` | same | `missing` |
+| 6 | `history_restore` | `mcp_server.py:5951` | `store/store.rs` | `missing` |
+| 7 | `history_gc` | `mcp_server.py:5917` | `store/store.rs` | `missing` |
+| 8 | `workspace_adopt` | `mcp_server.py:2935` | identity landed (#19); resolver + tool open | `partial` |
+| 9 | `workspace_fork` | `mcp_server.py:2984` | identity landed (#19); tool open | `partial` |
+
+### Landed since this matrix was first written
+
+| Tool | PR |
+|---|---|
+| `history_list` | #20 |
+| `document_read` | #23 (core) / #32 (tool) |
+| `document_search` | #29 (core) / #31 (tool) |
+| `document_patch` | #30 (core) / #32 (tool) |
+
+Plus `match_ref` addressing (#34), which is not a tool but closes the search →
+patch loop: a caller can hand a `document_search` reference straight to
+`document_patch` without copying text.
 
 ## 3. Workspace identity: substrate landed (#19)
 
@@ -90,7 +99,7 @@ with its adoption-token flow, `workspace_fork` with origin recording).
 Rust also has `review/history.rs` (`list`/`read`/`append`) and
 `store/versions.rs` (the read-only chain reader behind `history_list`).
 
-## 4. Known non-equivalences among the 37 shared tools
+## 4. Known non-equivalences among the 40 shared tools
 
 These must be checked per-tool, not assumed equal. Priority suspects named in
 the plan plus what was verified here:
@@ -133,9 +142,9 @@ All seven CI jobs are green as of #20/#21.
 |---|---|---|---|
 | **1** | this lock + matrix + repro scripts | — | **done** (#17) |
 | **2** | CI health: clippy, fmt, toolchain parity, inspect asset parity | 1 | **done** (#18) |
-| **3** | structural closure: insert/delete paragraph → real DOCX build → verify | 2 | in progress |
-| **4** | high-frequency Agent tools: `document_read/search/patch/replace`, `format_span` | 3 | in progress (`document_read` core) |
-| **5** | versions & workspace: `history_*`, `workspace_adopt/fork` | 3 | partial: `history_list` **done** (#20), identity substrate **done** (#19); `workspace_adopt/fork` + remaining `history_*` open |
+| **3** | structural closure: insert/delete paragraph → real DOCX build → verify | 2 | **done** (#27, with #26 fixed) |
+| **4** | high-frequency Agent tools: `document_read`/`search`/`patch`, `format_span` | 3 | **3 of 4 done** — `document_read` #23/#32, `document_search` #29/#31, `document_patch` #30/#32, `match_ref` #34; `format_span` blocked on #33 |
+| **5** | versions & workspace: `history_*`, `workspace_adopt/fork` | 3 | partial: `history_list` #20, identity substrate #19; `history_diff/blame/verify` + `workspace_adopt/fork` open |
 | **6** | verification evidence + release qualification + real-DOCX acceptance | 4, 5 | pending |
 
 Each PR carries: Python reference location, behaviour spec, positive / refusal /
