@@ -51,10 +51,12 @@ pub const AUTO_OUTLINE_THRESHOLD: usize = 40_000;
 /// Visible characters of each paragraph in the outline view.
 pub const OUTLINE_PREVIEW_CHARS: usize = 80;
 
-const TOKEN_START: char = '\u{27e6}';
-const TOKEN_END: char = '\u{27e7}';
-/// `^ _ { } \` — the characters a vertical tag escapes.
-const VERTICAL_ESCAPES: [char; 5] = ['^', '_', '{', '}', '\\'];
+pub(crate) const TOKEN_START: char = '\u{27e6}';
+pub(crate) const TOKEN_END: char = '\u{27e7}';
+/// `^ _ { } \` — the characters a vertical tag escapes (Python
+/// `_VERTICAL_ESCAPE_CHARS`); `pub(crate)` for `document_search`, which
+/// re-renders matching slices through the same grammar.
+pub(crate) const VERTICAL_ESCAPE_CHARS: [char; 5] = ['^', '_', '{', '}', '\\'];
 
 /// One `document_read` reply (the `docx2typed-result-1` data payload).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -184,7 +186,7 @@ fn domain(message: String) -> CoreError {
 /// `_paragraph_blocks`: leading blank lines are dropped, the header must
 /// start with `<!--@edit`, and a block starts at a `<!--@p` / `<!--@new` /
 /// `<!--@delete` marker line (blank lines are skipped).
-fn split_edit_blocks(text: &str) -> Result<(String, Vec<String>), CoreError> {
+pub(crate) fn split_edit_blocks(text: &str) -> Result<(String, Vec<String>), CoreError> {
     let mut lines = py_splitlines(text);
     while lines
         .first()
@@ -225,7 +227,7 @@ fn split_edit_blocks(text: &str) -> Result<(String, Vec<String>), CoreError> {
 /// `(kind, id)` of a block marker, mirroring Python `_block_ident`:
 /// `("p", id)` for `<!--@p id="...">`, `("new", temp)` for
 /// `<!--@new temp="...">`, `("delete", id)` for `<!--@delete id="...">`.
-fn block_ident(block: &str) -> Option<(String, String)> {
+pub(crate) fn block_ident(block: &str) -> Option<(String, String)> {
     let line = block.lines().next().unwrap_or("").trim();
     let rest = line.strip_prefix("<!--@")?;
     for kind in ["p", "new", "delete"] {
@@ -253,7 +255,7 @@ fn block_ident(block: &str) -> Option<(String, String)> {
 
 /// Body of one block: every line after the marker line (Python
 /// `_block_body`).
-fn block_body(block: &str) -> String {
+pub(crate) fn block_body(block: &str) -> String {
     match block.split_once('\n') {
         Some((_, body)) => body.to_string(),
         None => String::new(),
@@ -286,7 +288,7 @@ fn visible_text(body: &str) -> Result<String, CoreError> {
     }
 }
 
-fn find_char(chars: &[char], needle: char, from: usize) -> Option<usize> {
+pub(crate) fn find_char(chars: &[char], needle: char, from: usize) -> Option<usize> {
     chars
         .iter()
         .skip(from)
@@ -322,7 +324,7 @@ fn token_marker(token: &str) -> String {
 
 /// `re.search(r'kind="([^"]+)"', attrs)` — first `kind="…"` with a non-empty
 /// value.
-fn kind_attribute(attrs: &str) -> Option<&str> {
+pub(crate) fn kind_attribute(attrs: &str) -> Option<&str> {
     let mut cursor = 0usize;
     while let Some(offset) = attrs[cursor..].find("kind=\"") {
         let value_start = cursor + offset + "kind=\"".len();
@@ -339,7 +341,7 @@ fn kind_attribute(attrs: &str) -> Option<&str> {
 /// One plain-prose chunk: escape-validated, vertical tags stripped of their
 /// markers (Python `_plain_prose` = `_validate_escaped_prose` +
 /// `_split_vertical_tags`).
-fn plain_prose(raw: &[char]) -> Result<String, CoreError> {
+pub(crate) fn plain_prose(raw: &[char]) -> Result<String, CoreError> {
     let text = validate_escaped_prose(raw)?;
     let mut out = String::new();
     for segment in split_vertical_tags(&text)? {
@@ -350,7 +352,7 @@ fn plain_prose(raw: &[char]) -> Result<String, CoreError> {
 
 /// Python `_validate_escaped_prose`: `\\` -> `\`, `\u27E6`/`\u27E7` ->
 /// `⟦`/`⟧`, anything else fails closed.
-fn validate_escaped_prose(text: &[char]) -> Result<Vec<char>, CoreError> {
+pub(crate) fn validate_escaped_prose(text: &[char]) -> Result<Vec<char>, CoreError> {
     let mut out: Vec<char> = Vec::with_capacity(text.len());
     let mut index = 0usize;
     while index < text.len() {
@@ -405,7 +407,7 @@ fn split_vertical_tags(text: &[char]) -> Result<Vec<String>, CoreError> {
         if ch == '\\'
             && text
                 .get(index + 1)
-                .is_some_and(|next| VERTICAL_ESCAPES.contains(next))
+                .is_some_and(|next| VERTICAL_ESCAPE_CHARS.contains(next))
         {
             buffer.push(text[index + 1]);
             index += 2;
@@ -435,7 +437,7 @@ fn is_vertical_marker(ch: char) -> bool {
 
 /// Python `_read_vertical_tag`: one tag's prose and the index just past its
 /// closing brace.
-fn read_vertical_tag(text: &[char], start: usize) -> Result<(String, usize), CoreError> {
+pub(crate) fn read_vertical_tag(text: &[char], start: usize) -> Result<(String, usize), CoreError> {
     let mut body = String::new();
     let mut index = start;
     while index < text.len() {
@@ -443,7 +445,7 @@ fn read_vertical_tag(text: &[char], start: usize) -> Result<(String, usize), Cor
         if ch == '\\'
             && text
                 .get(index + 1)
-                .is_some_and(|next| VERTICAL_ESCAPES.contains(next))
+                .is_some_and(|next| VERTICAL_ESCAPE_CHARS.contains(next))
         {
             body.push(text[index + 1]);
             index += 2;
