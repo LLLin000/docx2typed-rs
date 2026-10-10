@@ -171,8 +171,12 @@ pub fn read_draft(workdir: &Path) -> Result<String, CollaborationError> {
 
 /// Read the draft and split it into (header, blocks).
 pub fn read_blocks(workdir: &Path) -> Result<(String, Vec<String>), CollaborationError> {
-    let text = read_draft(workdir)?;
-    let blocks = paragraph_blocks(&text)?;
+    split_blocks(&read_draft(workdir)?)
+}
+
+/// Split projection text into (header, blocks).
+fn split_blocks(text: &str) -> Result<(String, Vec<String>), CollaborationError> {
+    let blocks = paragraph_blocks(text)?;
     let header = text
         .lines()
         .find(|line| line.trim_start().starts_with("<!--@edit"))
@@ -289,6 +293,22 @@ fn next_live_paragraph(blocks: &[String], id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The next free draft temp id (`N<n>`) for a synthesised block: one above
+/// every temp id the draft already carries.
+fn next_temp_id(blocks: &[String]) -> String {
+    let max_temp = blocks
+        .iter()
+        .filter_map(|block| {
+            let (kind, id, _) = marker_of(block)?;
+            (kind == "new")
+                .then(|| id.strip_prefix('N')?.parse::<usize>().ok())
+                .flatten()
+        })
+        .max()
+        .unwrap_or(0);
+    format!("N{}", max_temp + 1)
 }
 
 /// The changed paragraph ids of one draft: the draft body vs the effective
@@ -606,27 +626,25 @@ fn replace_nth_in_body(
     out.push_str(&body[position + old.len()..]);
     Ok(out)
 }
-fn record_island_operation(
+/// The template leaf one island edit lands in, or None for a synthesised
+/// paragraph: it has no baseline leaf to replace (it is rendered from the
+/// inherit paragraph at build time and rewritten in the structure sidecar at
+/// commit instead — PR 3). Fails closed with `cross-leaf-edit` when no single
+/// leaf carries `old`. Read-only: the batch path resolves every hunk's leaf
+/// before anything is written.
+fn island_leaf_for(
     workdir: &Path,
-    edit: TextEdit<'_>,
-    tracking: EditTracking<'_>,
-) -> Result<(), CollaborationError> {
-    let TextEdit {
-        paragraph_id,
-        old,
-        new,
-        leaf_index,
-    } = edit;
-    // A synthesised paragraph has no baseline leaf to replace: it is
-    // rendered from the inherit paragraph at build time, so its body is
-    // rewritten in the structure sidecar at commit instead (PR 3).
+    paragraph_id: &str,
+    old: &str,
+    leaf_index: Option<usize>,
+) -> Result<Option<(String, usize)>, CollaborationError> {
     if docx2typed_core::prose::load_structure(workdir)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?
         .new_paragraphs
         .iter()
         .any(|paragraph| paragraph.paragraph_id == paragraph_id)
     {
-        return Ok(());
+        return Ok(None);
     }
     let package = fs::read(workdir.join("_template.docx"))
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
@@ -648,18 +666,49 @@ fn record_island_operation(
                 format!("{paragraph_id}: replacement must stay within one text leaf"),
             )
         })?;
+    Ok(Some((part, leaf.leaf_index)))
+}
+
+fn record_island_operation(
+    workdir: &Path,
+    edit: TextEdit<'_>,
+    tracking: EditTracking<'_>,
+) -> Result<(), CollaborationError> {
+    let TextEdit {
+        paragraph_id,
+        old,
+        new,
+        leaf_index,
+    } = edit;
+    let Some((part, leaf_index)) = island_leaf_for(workdir, paragraph_id, old, leaf_index)? else {
+        return Ok(());
+    };
+    append_island_edits(
+        workdir,
+        &[docx2typed_core::prose::IslandEdit {
+            part,
+            paragraph_id: paragraph_id.to_string(),
+            leaf_index,
+            old: old.to_string(),
+            new: new.to_string(),
+            tracked: tracking.tracked,
+            author: tracking.author.unwrap_or("").to_string(),
+            date: tracking.date.unwrap_or("").to_string(),
+        }],
+    )
+}
+
+/// Append island edits in ONE sidecar write (load -> extend -> save).
+fn append_island_edits(
+    workdir: &Path,
+    edits: &[docx2typed_core::prose::IslandEdit],
+) -> Result<(), CollaborationError> {
+    if edits.is_empty() {
+        return Ok(());
+    }
     let mut islands = docx2typed_core::prose::load_islands(workdir)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    islands.push(docx2typed_core::prose::IslandEdit {
-        part,
-        paragraph_id: paragraph_id.to_string(),
-        leaf_index: leaf.leaf_index,
-        old: old.to_string(),
-        new: new.to_string(),
-        tracked: tracking.tracked,
-        author: tracking.author.unwrap_or("").to_string(),
-        date: tracking.date.unwrap_or("").to_string(),
-    });
+    islands.extend_from_slice(edits);
     docx2typed_core::prose::save_islands(workdir, &islands)
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))
 }
@@ -697,28 +746,12 @@ pub fn insert_paragraph(
     // copies its inherit paragraph's opening and pPr, so that paragraph
     // must be plain prose (no section properties, revisions, anchors, or
     // opaque interiors).
-    if let Some(reason) =
-        docx2typed_core::prose::paragraph_protection(workdir, &resolved_inherit)
-            .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?
-    {
-        return Err(CollaborationError::new(
-            "invalid-structure",
-            format!(
-                "new paragraph cannot inherit protected structure: {resolved_inherit} ({reason})"
-            ),
-        ));
-    }
-    let mut max_temp = 0usize;
-    for block in &blocks {
-        if let Some((kind, id, _)) = marker_of(block) {
-            if kind == "new" {
-                if let Some(number) = id.strip_prefix('N').and_then(|n| n.parse().ok()) {
-                    max_temp = max_temp.max(number);
-                }
-            }
-        }
-    }
-    let temp = format!("N{}", max_temp + 1);
+    require_unprotected(
+        workdir,
+        &resolved_inherit,
+        "new paragraph cannot inherit protected structure",
+    )?;
+    let temp = next_temp_id(&blocks);
     let block = format!("<!--@new temp=\"{temp}\" inherit=\"{resolved_inherit}\"/>\n{text}");
     blocks.insert(index + 1, block);
     write_draft(workdir, &header, &blocks)?;
@@ -754,16 +787,11 @@ pub fn delete_paragraph(workdir: &Path, paragraph_id: &str) -> Result<Value, Col
     // Fail closed before the draft is touched: a deleted paragraph is
     // simply not rendered, which would silently drop any protected
     // structure it carries (section properties, revisions, anchors).
-    if let Some(reason) = docx2typed_core::prose::paragraph_protection(workdir, paragraph_id)
-        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?
-    {
-        return Err(CollaborationError::new(
-            "invalid-structure",
-            format!(
-                "paragraph with protected structure cannot be deleted: {paragraph_id} ({reason})"
-            ),
-        ));
-    }
+    require_unprotected(
+        workdir,
+        paragraph_id,
+        "paragraph with protected structure cannot be deleted",
+    )?;
     blocks.remove(index);
     blocks.push(format!("<!--@delete id=\"{paragraph_id}\"-->"));
     write_draft(workdir, &header, &blocks)?;
@@ -771,6 +799,913 @@ pub fn delete_paragraph(workdir: &Path, paragraph_id: &str) -> Result<Value, Col
         "paragraph_id": paragraph_id,
         "draft": "dirty",
         "next": "commit_sync",
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// document_patch: the batch edit primitive
+//
+// The file-like editing surface over replace / insert / delete. Exactly one of
+// `hunks` / `diff`; a paragraph may carry several non-overlapping replace hunks
+// (like `git apply`), overlapping spans are rejected, and the whole batch
+// applies or nothing does.
+// ---------------------------------------------------------------------------
+
+/// The hunk keys the tool accepts (Python `_normalize_patch_hunks` known set,
+/// sorted): an unrecognised key would be silently ignored, so it is refused.
+const PATCH_HUNK_KEYS: [&str; 8] = [
+    "delete",
+    "inherit",
+    "insert_after",
+    "match_ref",
+    "new",
+    "old",
+    "paragraph_id",
+    "text",
+];
+
+/// One normalized patch hunk.
+#[derive(Clone, Debug)]
+enum PatchHunk {
+    Replace {
+        paragraph_id: String,
+        old: String,
+        new: String,
+    },
+    Insert {
+        insert_after: String,
+        text: String,
+        inherit: Option<String>,
+    },
+    Delete {
+        paragraph_id: String,
+    },
+}
+
+impl PatchHunk {
+    /// The paragraph this hunk names (the anchor paragraph for an insert).
+    fn paragraph_id(&self) -> &str {
+        match self {
+            PatchHunk::Replace { paragraph_id, .. } => paragraph_id,
+            PatchHunk::Insert { insert_after, .. } => insert_after,
+            PatchHunk::Delete { paragraph_id } => paragraph_id,
+        }
+    }
+}
+
+/// One rejected hunk. A batch reports EVERY broken hunk in one call, so the
+/// caller can fix all of them and resend once (mirror of Python's `failed()`).
+struct HunkProblem {
+    hunk: usize,
+    paragraph_id: String,
+    code: String,
+    message: String,
+}
+
+impl HunkProblem {
+    fn error(&self) -> CollaborationError {
+        CollaborationError::new(
+            self.code.clone(),
+            format!(
+                "hunk #{} ({}): {}",
+                self.hunk, self.paragraph_id, self.message
+            ),
+        )
+    }
+}
+
+fn hunk_problem(
+    problems: &mut Vec<HunkProblem>,
+    hunk: usize,
+    target: &PatchHunk,
+    error: CollaborationError,
+) {
+    problems.push(HunkProblem {
+        hunk,
+        paragraph_id: target.paragraph_id().to_string(),
+        code: error.code,
+        message: error.detail,
+    });
+}
+
+/// One replace span: start offset, old text, new text.
+type ReplaceSpan = (usize, String, String);
+
+/// A paragraph's replace spans in first-appearance order.
+type PendingSpans = Vec<(String, Vec<ReplaceSpan>)>;
+
+/// The validated batch, ready to write: the new block list plus the island
+/// edits its replaces record. Nothing here touches the workdir.
+struct PatchPlan {
+    blocks: Vec<String>,
+    applied: Vec<Value>,
+    islands: Vec<docx2typed_core::prose::IslandEdit>,
+}
+
+/// Python `_require_body_structure_mutable`: container and part paragraphs are
+/// addressed by their container tools, never by a body patch hunk.
+fn require_body_structure_mutable(paragraph_id: &str) -> Result<(), CollaborationError> {
+    if paragraph_id.starts_with('T') || paragraph_id.starts_with('B') || paragraph_id.contains('.')
+    {
+        return Err(CollaborationError::new(
+            "table-structure-immutable",
+            format!(
+                "{paragraph_id}: paragraphs inside tables, text boxes, or parts cannot be patched \
+                 from the body surface; use the container-specific tools"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Python `_require_comment_text_opt_in`: comment paragraphs are annotation
+/// content, not document prose.
+fn require_comment_text_opt_in(
+    paragraph_id: &str,
+    allow_comment_text: bool,
+) -> Result<(), CollaborationError> {
+    if paragraph_id.starts_with("comments.") && !allow_comment_text {
+        return Err(CollaborationError::new(
+            "comment-text-requires-opt-in",
+            format!(
+                "{paragraph_id}: comment text is annotation content, not document prose; pass \
+                 allow_comment_text=true only when the user explicitly asked to edit reviewer \
+                 comment text"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The fail-closed protection gate shared with `insert_paragraph` and
+/// `delete_paragraph`: the build cannot reproduce a protected paragraph's
+/// structure, so a draft carrying one could never commit.
+fn require_unprotected(
+    workdir: &Path,
+    paragraph_id: &str,
+    verb: &str,
+) -> Result<(), CollaborationError> {
+    if let Some(reason) = docx2typed_core::prose::paragraph_protection(workdir, paragraph_id)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?
+    {
+        return Err(CollaborationError::new(
+            "invalid-structure",
+            format!("{verb}: {paragraph_id} ({reason})"),
+        ));
+    }
+    Ok(())
+}
+
+/// Normalize raw hunk objects into typed hunks (mirror of
+/// `_normalize_patch_hunks`): unknown keys, missing fields, and an unusable
+/// shape are `invalid-arguments` before anything is read or written.
+fn normalize_patch_hunks(hunks: &[Value]) -> Result<Vec<PatchHunk>, CollaborationError> {
+    let invalid = |message: String| CollaborationError::new("invalid-arguments", message);
+    let mut normalized: Vec<PatchHunk> = Vec::with_capacity(hunks.len());
+    for (index, hunk) in hunks.iter().enumerate() {
+        let Some(object) = hunk.as_object() else {
+            return Err(invalid(format!("hunks[{index}] must be an object")));
+        };
+        let unknown: Vec<String> = object
+            .keys()
+            .filter(|key| !PATCH_HUNK_KEYS.contains(&key.as_str()))
+            .map(|key| format!("{key:?}"))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(invalid(format!(
+                "hunks[{index}]: unknown key(s) {}; known keys are {} — an unrecognised key would \
+                 be silently ignored, so nothing was applied",
+                unknown.join(", "),
+                PATCH_HUNK_KEYS.join(", ")
+            )));
+        }
+        let string = |key: &str| object.get(key).and_then(Value::as_str);
+        if object.contains_key("match_ref") {
+            return Err(invalid(format!(
+                "hunks[{index}]: match_ref hunks are not implemented yet; use a replace hunk \
+                 (paragraph_id + old + new)"
+            )));
+        } else if object.contains_key("paragraph_id") {
+            let paragraph_id = string("paragraph_id").filter(|value| !value.is_empty());
+            let Some(paragraph_id) = paragraph_id else {
+                return Err(invalid(format!(
+                    "hunks[{index}]: replace hunk needs a non-empty paragraph_id"
+                )));
+            };
+            let Some(new) = string("new") else {
+                return Err(invalid(format!(
+                    "hunks[{index}]: replace hunk needs 'new' (use an empty string only when you \
+                     really mean to delete the text; use a delete hunk to drop a paragraph)"
+                )));
+            };
+            let Some(old) = string("old").filter(|value| !value.is_empty()) else {
+                return Err(invalid(format!(
+                    "hunks[{index}]: replace hunk needs string old (non-empty) and new"
+                )));
+            };
+            normalized.push(PatchHunk::Replace {
+                paragraph_id: paragraph_id.to_string(),
+                old: old.to_string(),
+                new: new.to_string(),
+            });
+        } else if object.contains_key("insert_after") {
+            let Some(insert_after) = string("insert_after").filter(|value| !value.is_empty())
+            else {
+                return Err(invalid(format!(
+                    "hunks[{index}]: insert hunk needs a non-empty insert_after"
+                )));
+            };
+            let Some(text) = string("text").filter(|value| !value.is_empty()) else {
+                return Err(invalid(format!(
+                    "hunks[{index}]: insert hunk needs non-empty text"
+                )));
+            };
+            let inherit = match object.get("inherit") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let Some(inherit) = value.as_str().filter(|value| !value.is_empty()) else {
+                        return Err(invalid(format!(
+                            "hunks[{index}]: insert hunk inherit must be a string"
+                        )));
+                    };
+                    Some(inherit.to_string())
+                }
+            };
+            normalized.push(PatchHunk::Insert {
+                insert_after: insert_after.to_string(),
+                text: text.to_string(),
+                inherit,
+            });
+        } else if object.contains_key("delete") {
+            let Some(paragraph_id) = string("delete").filter(|value| !value.is_empty()) else {
+                return Err(invalid(format!(
+                    "hunks[{index}]: delete hunk needs a non-empty paragraph id"
+                )));
+            };
+            normalized.push(PatchHunk::Delete {
+                paragraph_id: paragraph_id.to_string(),
+            });
+        } else {
+            return Err(invalid(format!(
+                "hunks[{index}]: needs one of paragraph_id (replace), insert_after, or delete"
+            )));
+        }
+    }
+    Ok(normalized)
+}
+
+/// The `⟦...⟧` inline token chunks of a draft body: flat visible text plus the
+/// zero-width boundaries an inline token cuts into it (mirror of
+/// `_body_boundaries`, offsets in characters). A draft that carries no token —
+/// every draft this build produces — has no boundary at all.
+fn body_boundaries(body: &str) -> (String, Vec<(usize, String)>) {
+    let mut flat = String::new();
+    let mut boundaries: Vec<(usize, String)> = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find('\u{27e6}') {
+        flat.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let Some(end) = tail.find('\u{27e7}') else {
+            break; // unclosed token: the rest is text, not a boundary
+        };
+        boundaries.push((
+            flat.chars().count(),
+            token_boundary_kind(&tail[..end + '\u{27e7}'.len_utf8()]),
+        ));
+        rest = &tail[end + '\u{27e7}'.len_utf8()..];
+    }
+    flat.push_str(rest);
+    (flat, boundaries)
+}
+
+/// Python `_token_boundary_kind`: name the flavour of one inline token so a
+/// refusal can say WHAT blocks the span (revision control vs format history vs
+/// an anchor) instead of a bare text-not-found.
+fn token_boundary_kind(token: &str) -> String {
+    let inner = token.trim_start_matches('\u{27e6}');
+    let (closing, name) = match inner.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, inner),
+    };
+    for candidate in ["insert", "move-to", "move-from"] {
+        if let Some(rest) = name.strip_prefix(candidate) {
+            let ends_name = rest
+                .chars()
+                .next()
+                .is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_'));
+            if ends_name {
+                return format!("{candidate}{}", if closing { "-end" } else { "-start" });
+            }
+        }
+    }
+    if inner.starts_with("revision-gap") {
+        return "revision-gap".to_string();
+    }
+    match marker_attr(token, "kind").filter(|kind| !kind.is_empty()) {
+        Some(kind) => format!("token:{kind}"),
+        None => "token:unknown".to_string(),
+    }
+}
+
+/// A refusal when `old` is contiguous only after the inline tokens are
+/// stripped — i.e. it strictly spans a revision-control (or protected) marker.
+/// Boundaries exactly at the span edges do not count: a span covering a whole
+/// revision body is one editable span (mirror of `_span_crosses_boundary`).
+fn span_crosses_boundary(paragraph_id: &str, body: &str, old: &str) -> Option<CollaborationError> {
+    if old.contains('\u{27e6}') || old.contains('\u{27e7}') {
+        return None;
+    }
+    let (flat, boundaries) = body_boundaries(body);
+    if boundaries.is_empty() {
+        return None;
+    }
+    let position = flat.find(old)?;
+    let start = flat[..position].chars().count();
+    let end = start + old.chars().count();
+    let mut crossed: Vec<String> = boundaries
+        .iter()
+        .filter(|(offset, _)| *offset > start && *offset < end)
+        .map(|(_, kind)| kind.clone())
+        .collect();
+    crossed.sort();
+    crossed.dedup();
+    if crossed.is_empty() {
+        return None;
+    }
+    // Revision control, however the projection spells it: bare insert/move
+    // labels, the gap marker, or a revision kind carried inside a range token.
+    // Anchors and format history are NOT revisions, and calling them one sends
+    // the agent hunting for a revision that is not there.
+    let revision_flavours: Vec<&String> = crossed
+        .iter()
+        .filter(|name| match name.strip_prefix("token:") {
+            Some(kind) => matches!(kind, "insert" | "delete" | "move_from" | "move_to"),
+            None => true,
+        })
+        .collect();
+    let (code, why) = if revision_flavours.is_empty() {
+        (
+            "edit-span-crosses-protected-marker",
+            format!(
+                "the span crosses protected inline markers ({}) — format history / anchors are \
+                 atomic, so the visible text on the two sides is not one editable run",
+                crossed.join(", ")
+            ),
+        )
+    } else {
+        (
+            "edit-span-crosses-revision-boundary",
+            format!(
+                "the span crosses revision-control markers ({}), so the engine cannot decide \
+                 which revision owns the new text",
+                revision_flavours
+                    .iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    };
+    Some(CollaborationError::new(
+        code,
+        format!(
+            "{paragraph_id}: old is visible in the paragraph but {why}. Re-issue the edit as hunks \
+             that each copy ONE span's text (never a cross-boundary run); if the new text cannot \
+             be partitioned without guessing, stop and ask the user."
+        ),
+    ))
+}
+
+/// Replace `old` at the recorded offset. Spans are applied in descending
+/// offset order, so every offset validated against the pre-batch body is still
+/// exact when its turn comes (mirror of `_replace_in_body(start_offset=...)`).
+fn replace_at(
+    body: &str,
+    start: usize,
+    old: &str,
+    new: &str,
+    paragraph_id: &str,
+) -> Result<String, CollaborationError> {
+    let Some(rest) = body.get(start..) else {
+        return Err(CollaborationError::new(
+            "text-not-found",
+            format!("{paragraph_id}: offset {start} is outside the paragraph"),
+        ));
+    };
+    if !rest.starts_with(old) {
+        return Err(CollaborationError::new(
+            "text-not-found",
+            format!("{paragraph_id}: text {old:?} is no longer at offset {start}"),
+        ));
+    }
+    let mut out = String::with_capacity(body.len() + new.len());
+    out.push_str(&body[..start]);
+    out.push_str(new);
+    out.push_str(&rest[old.len()..]);
+    Ok(out)
+}
+
+/// Validate EVERY hunk against the in-memory block list, then apply all of them
+/// to a copy of it. Nothing is written here — this is the atomicity mechanism:
+/// a rejected batch fails before the draft is touched, so the outcome is
+/// all-or-nothing by construction instead of by snapshot-and-restore.
+///
+/// Deletes land first, then inserts, then replaces anchored by their start
+/// offset in descending order, so earlier applications never shift later ones
+/// (mirror of Python `_apply_document_hunks`).
+fn plan_patch(
+    workdir: &Path,
+    blocks: &[String],
+    hunks: &[PatchHunk],
+    allow_comment_text: bool,
+    tracking: EditTracking<'_>,
+) -> Result<PatchPlan, CollaborationError> {
+    let mut problems: Vec<HunkProblem> = Vec::new();
+    let mut delete_ids: Vec<String> = Vec::new();
+    let mut insert_specs: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut pending: PendingSpans = Vec::new();
+    let mut islands: Vec<docx2typed_core::prose::IslandEdit> = Vec::new();
+    let mut applied: Vec<Value> = Vec::new();
+
+    for (index, hunk) in hunks.iter().enumerate() {
+        let number = index + 1;
+        match hunk {
+            PatchHunk::Replace {
+                paragraph_id,
+                old,
+                new,
+            } => {
+                let Some(block_index) = find_block(blocks, "p", paragraph_id) else {
+                    hunk_problem(
+                        &mut problems,
+                        number,
+                        hunk,
+                        CollaborationError::new(
+                            "paragraph-not-found",
+                            format!("paragraph {paragraph_id} not found in the draft"),
+                        ),
+                    );
+                    continue;
+                };
+                if let Err(error) = require_comment_text_opt_in(paragraph_id, allow_comment_text) {
+                    hunk_problem(&mut problems, number, hunk, error);
+                    continue;
+                }
+                if delete_ids.contains(paragraph_id) {
+                    hunk_problem(
+                        &mut problems,
+                        number,
+                        hunk,
+                        CollaborationError::new(
+                            "document-patch-paragraph-repeated",
+                            format!(
+                                "{paragraph_id}: cannot replace and delete the same paragraph in \
+                                 one patch"
+                            ),
+                        ),
+                    );
+                    continue;
+                }
+                if old.contains('\u{27e6}') || old.contains('\u{27e7}') {
+                    hunk_problem(
+                        &mut problems,
+                        number,
+                        hunk,
+                        CollaborationError::new(
+                            "placeholder-in-edit-span",
+                            format!(
+                                "{paragraph_id}: old includes a read-only placeholder token; select \
+                                 contiguous editable text on one side of the placeholder instead"
+                            ),
+                        ),
+                    );
+                    continue;
+                }
+                if old == new {
+                    hunk_problem(
+                        &mut problems,
+                        number,
+                        hunk,
+                        CollaborationError::new(
+                            "patch-noop",
+                            format!("{paragraph_id}: old and new are identical; nothing to change"),
+                        ),
+                    );
+                    continue;
+                }
+                let body = block_body(&blocks[block_index]);
+                let visible = visible_text(&body);
+                let count = visible.matches(old.as_str()).count();
+                if count != 1 {
+                    // A span that is contiguous only once the inline tokens are
+                    // stripped is not one editable run: name the boundary
+                    // instead of reporting a bare text-not-found.
+                    if let Some(error) = span_crosses_boundary(paragraph_id, &body, old) {
+                        hunk_problem(&mut problems, number, hunk, error);
+                        continue;
+                    }
+                    let error = if count > 1 {
+                        CollaborationError::new(
+                            "text-ambiguous",
+                            format!(
+                                "{paragraph_id}: {old:?} appears {count} times — resend with a \
+                                 longer unique span"
+                            ),
+                        )
+                    } else {
+                        CollaborationError::new(
+                            "text-not-found",
+                            format!("{paragraph_id}: {old:?} not found in paragraph"),
+                        )
+                    };
+                    hunk_problem(&mut problems, number, hunk, error);
+                    continue;
+                }
+                let start = visible
+                    .find(old.as_str())
+                    .expect("count == 1 implies a match");
+                let spans = match pending.iter().position(|(id, _)| id == paragraph_id) {
+                    Some(index) => &mut pending[index].1,
+                    None => {
+                        pending.push((paragraph_id.clone(), Vec::new()));
+                        &mut pending.last_mut().expect("just pushed a paragraph").1
+                    }
+                };
+                let overlaps = spans.iter().any(|(other_start, other_old, _)| {
+                    start < other_start + other_old.len() && *other_start < start + old.len()
+                });
+                if overlaps {
+                    hunk_problem(
+                        &mut problems,
+                        number,
+                        hunk,
+                        CollaborationError::new(
+                            "patch-hunks-invalid",
+                            format!(
+                                "{paragraph_id}: two replace hunks overlap at offset {start}; \
+                                 merge them into one hunk"
+                            ),
+                        ),
+                    );
+                    continue;
+                }
+                // The build's island record must land inside ONE text leaf, so
+                // the leaf is resolved (read-only) with the rest of validation.
+                match island_leaf_for(workdir, paragraph_id, old, None) {
+                    Ok(Some((part, leaf_index))) => {
+                        islands.push(docx2typed_core::prose::IslandEdit {
+                            part,
+                            paragraph_id: paragraph_id.clone(),
+                            leaf_index,
+                            old: old.clone(),
+                            new: new.clone(),
+                            tracked: tracking.tracked,
+                            author: tracking.author.unwrap_or("").to_string(),
+                            date: tracking.date.unwrap_or("").to_string(),
+                        })
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        hunk_problem(&mut problems, number, hunk, error);
+                        continue;
+                    }
+                }
+                if spans.is_empty() {
+                    applied.push(json!({ "kind": "replace", "paragraph_id": paragraph_id }));
+                }
+                spans.push((start, old.clone(), new.clone()));
+            }
+            PatchHunk::Insert {
+                insert_after,
+                text,
+                inherit,
+            } => {
+                let resolved_inherit = inherit.as_deref().unwrap_or(insert_after);
+                let failure = require_comment_text_opt_in(insert_after, allow_comment_text)
+                    .err()
+                    .or_else(|| require_body_structure_mutable(insert_after).err())
+                    .or_else(|| require_body_structure_mutable(resolved_inherit).err())
+                    // The Rust build synthesises the paragraph from its inherit
+                    // anchor, so a protected anchor is refused HERE rather than
+                    // written into a draft that can never commit.
+                    .or_else(|| {
+                        require_unprotected(
+                            workdir,
+                            resolved_inherit,
+                            "new paragraph cannot inherit protected structure",
+                        )
+                        .err()
+                    })
+                    .or_else(|| {
+                        find_block(blocks, "p", insert_after).is_none().then(|| {
+                            CollaborationError::new(
+                                "paragraph-not-found",
+                                format!("paragraph {insert_after} not found in the draft"),
+                            )
+                        })
+                    });
+                if let Some(error) = failure {
+                    hunk_problem(&mut problems, number, hunk, error);
+                    continue;
+                }
+                insert_specs.push((insert_after.clone(), text.clone(), inherit.clone()));
+            }
+            PatchHunk::Delete { paragraph_id } => {
+                let mut failure = require_comment_text_opt_in(paragraph_id, allow_comment_text)
+                    .err()
+                    .or_else(|| require_body_structure_mutable(paragraph_id).err());
+                if failure.is_none() && pending.iter().any(|(id, _)| id == paragraph_id) {
+                    failure = Some(CollaborationError::new(
+                        "document-patch-paragraph-repeated",
+                        format!(
+                            "{paragraph_id}: cannot replace and delete the same paragraph in one \
+                             patch"
+                        ),
+                    ));
+                }
+                if failure.is_none() && find_block(blocks, "p", paragraph_id).is_none() {
+                    failure = Some(CollaborationError::new(
+                        "paragraph-not-found",
+                        format!("paragraph {paragraph_id} not found in the draft"),
+                    ));
+                }
+                if failure.is_none() {
+                    failure = require_unprotected(
+                        workdir,
+                        paragraph_id,
+                        "paragraph with protected structure cannot be deleted",
+                    )
+                    .err();
+                }
+                if let Some(error) = failure {
+                    hunk_problem(&mut problems, number, hunk, error);
+                    continue;
+                }
+                delete_ids.push(paragraph_id.clone());
+                applied.push(json!({ "kind": "delete", "paragraph_id": paragraph_id }));
+            }
+        }
+    }
+
+    if !problems.is_empty() {
+        // One broken hunk keeps its own diagnostic code; several broken hunks
+        // surface together as one report.
+        if problems.len() == 1 {
+            return Err(problems[0].error());
+        }
+        let listed = problems
+            .iter()
+            .map(|problem| {
+                format!(
+                    "hunk #{} ({}): {}",
+                    problem.hunk, problem.paragraph_id, problem.code
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(CollaborationError::new(
+            "patch-hunks-invalid",
+            format!(
+                "{} of {} hunks are invalid — fix all of them and resend in ONE call: {listed}",
+                problems.len(),
+                hunks.len()
+            ),
+        ));
+    }
+
+    let mut blocks = blocks.to_vec();
+    // Deletes first (ids, never block indices), then inserts, then replaces.
+    for paragraph_id in &delete_ids {
+        let Some(index) = find_block(&blocks, "p", paragraph_id) else {
+            return Err(CollaborationError::new(
+                "paragraph-not-found",
+                format!("paragraph {paragraph_id} not found in the draft"),
+            ));
+        };
+        blocks.remove(index);
+        blocks.push(format!("<!--@delete id=\"{paragraph_id}\"-->"));
+    }
+    let mut insert_offsets: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (after_id, text, inherit) in &insert_specs {
+        let Some(index) = find_block(&blocks, "p", after_id) else {
+            return Err(CollaborationError::new(
+                "paragraph-not-found",
+                format!("paragraph {after_id} not found in the draft"),
+            ));
+        };
+        let resolved_inherit = inherit.as_deref().unwrap_or(after_id);
+        let temp = next_temp_id(&blocks);
+        let offset = insert_offsets.get(after_id).copied().unwrap_or(0);
+        blocks.insert(
+            index + 1 + offset,
+            format!("<!--@new temp=\"{temp}\" inherit=\"{resolved_inherit}\"/>\n{text}"),
+        );
+        insert_offsets.insert(after_id.clone(), offset + 1);
+        applied.push(json!({
+            "kind": "insert",
+            "after_id": after_id,
+            "temp_id": temp,
+        }));
+    }
+    for (paragraph_id, spans) in &pending {
+        let Some(index) = find_block(&blocks, "p", paragraph_id) else {
+            return Err(CollaborationError::new(
+                "paragraph-not-found",
+                format!("paragraph {paragraph_id} not found in the draft"),
+            ));
+        };
+        let marker = blocks[index].split('\n').next().unwrap_or("").to_string();
+        let mut body = block_body(&blocks[index]);
+        let mut ordered: Vec<&ReplaceSpan> = spans.iter().collect();
+        ordered.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+        for (start, old, new) in ordered {
+            body = replace_at(&body, *start, old, new, paragraph_id)?;
+        }
+        blocks[index] = if body.is_empty() {
+            marker
+        } else {
+            format!("{marker}\n{body}")
+        };
+        for entry in applied.iter_mut() {
+            if entry.get("kind").and_then(Value::as_str) == Some("replace")
+                && entry.get("paragraph_id").and_then(Value::as_str) == Some(paragraph_id.as_str())
+            {
+                entry["hunks"] = json!(spans.len());
+            }
+        }
+    }
+    Ok(PatchPlan {
+        blocks,
+        applied,
+        islands,
+    })
+}
+
+/// The draft's opaque revision token: the canonical edit-body hash of
+/// `edit.md` — the value `document_read` returns and `base_revision` checks.
+fn current_revision(workdir: &Path) -> Result<String, CollaborationError> {
+    classify_edit_state(workdir)
+        .map(|state| state.edit_body_sha256)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))
+}
+
+/// The immediately-previous committed view: the projection hash the last commit
+/// bound in `edit.state.json`. A caller that read before that commit still
+/// holds a legitimate (if older) revision token.
+fn base_projection_sha256(workdir: &Path) -> String {
+    fs::read_to_string(workdir.join(STATE_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|state| {
+            state
+                .get("base_projection_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// True when every hunk still resolves in the CURRENT draft, i.e. a stale
+/// base_revision is harmless because the intervening change touched other
+/// paragraphs (mirror of `_hunks_still_applicable`).
+fn hunks_still_applicable(blocks: &[String], hunks: &[PatchHunk]) -> bool {
+    for hunk in hunks {
+        let Some(index) = find_block(blocks, "p", hunk.paragraph_id()) else {
+            return false;
+        };
+        if let PatchHunk::Replace { old, .. } = hunk {
+            let body = block_body(&blocks[index]);
+            if visible_text(&body).matches(old.as_str()).count() != 1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `base_revision` rides INSIDE the transaction: an exact retry of a completed
+/// patch replays from the store ledger without reaching this check, so a lost
+/// response can always be safely re-sent (mirror of Python's in-transaction
+/// check).
+fn check_base_revision(
+    workdir: &Path,
+    token: &str,
+    blocks: &[String],
+    hunks: &[PatchHunk],
+    warnings: &mut Vec<String>,
+) -> Result<(), CollaborationError> {
+    let current = current_revision(workdir)?;
+    if token == current {
+        return Ok(());
+    }
+    let previous = base_projection_sha256(workdir);
+    if token != previous {
+        return Err(CollaborationError::new(
+            "stale-document-view",
+            format!(
+                "base_revision {token:?} matches neither the current draft ({current:?}) nor the \
+                 previous committed view ({previous:?}) — re-read with document_read/document_search \
+                 and re-patch (current_revision is in data.current_revision)"
+            ),
+        ));
+    }
+    if hunks_still_applicable(blocks, hunks) {
+        warnings.push(
+            "stale-document-view-healed: the draft changed since your read but every hunk anchor \
+             still resolves; the patch was applied against the current draft"
+                .to_string(),
+        );
+        return Ok(());
+    }
+    Err(CollaborationError::new(
+        "stale-document-view",
+        format!(
+            "base_revision {token:?} does not match the current draft ({current:?}) and at least \
+             one hunk no longer resolves — re-read with document_read/document_search and re-patch \
+             (current revision is in data.current_revision)"
+        ),
+    ))
+}
+
+/// The `document_patch` tool body: apply a batch of edits to the draft in one
+/// atomic call — the file-like editing surface over replace / insert / delete.
+///
+/// Exactly one of `hunks` / `diff`; the unified-diff form is not implemented in
+/// this build and fails with `invalid-arguments`. A paragraph may carry several
+/// non-overlapping replace hunks (like `git apply`); overlapping spans are
+/// rejected. Every hunk is validated against the in-memory block list before
+/// anything is written, so a rejected batch leaves the draft byte-identical.
+/// Writes the draft only — run diff_preview, then commit_sync.
+pub fn document_patch(
+    workdir: &Path,
+    hunks: Option<&[Value]>,
+    diff: Option<&str>,
+    base_revision: Option<&str>,
+    allow_comment_text: bool,
+    tracking: EditTracking<'_>,
+) -> Result<Value, CollaborationError> {
+    if hunks.is_none() == diff.is_none() {
+        return Err(CollaborationError::new(
+            "invalid-arguments",
+            "provide exactly one of hunks or diff",
+        ));
+    }
+    if diff.is_some() {
+        return Err(CollaborationError::new(
+            "invalid-arguments",
+            "the unified-diff form of document_patch is not implemented yet; pass hunks \
+             (replace: {paragraph_id, old, new}; insert: {insert_after, text}; delete: {delete})",
+        ));
+    }
+    crate::collab::ensure_agent_ready(workdir)?;
+    let normalized = normalize_patch_hunks(hunks.unwrap_or_default())?;
+    if normalized.is_empty() {
+        return Err(CollaborationError::new(
+            "invalid-arguments",
+            "hunks must not be empty",
+        ));
+    }
+    let original = read_draft(workdir)?;
+    let (header, blocks) = split_blocks(&original)?;
+    let revision_before = current_revision(workdir)?;
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(token) = base_revision {
+        check_base_revision(workdir, token, &blocks, &normalized, &mut warnings)?;
+    }
+    let plan = plan_patch(workdir, &blocks, &normalized, allow_comment_text, tracking)?;
+    write_draft(workdir, &header, &plan.blocks)?;
+    if let Err(error) = append_island_edits(workdir, &plan.islands) {
+        // edit.md is the contract surface: a sidecar failure must not leave a
+        // batch the caller believes failed sitting in the draft.
+        let _ = fs::write(workdir.join(PROJECTION_FILE), &original);
+        return Err(error);
+    }
+    let revision_after = current_revision(workdir)?;
+    let mut affected: Vec<String> = plan
+        .applied
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("paragraph_id")
+                .or_else(|| entry.get("temp_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    affected.sort();
+    affected.dedup();
+    Ok(json!({
+        "applied": plan.applied,
+        "affected_paragraph_ids": affected,
+        "document_state": {
+            "revision_before": revision_before,
+            "revision_after": revision_after,
+            "draft": "dirty",
+        },
+        "warnings": warnings,
+        "draft": "dirty",
+        "next": "diff_preview to inspect style ownership, then commit_sync",
     }))
 }
 
@@ -1248,4 +2183,75 @@ fn _bytes_hash(bytes: &[u8]) -> String {
 /// Path normalization used by the store mutation wrappers.
 pub fn absolute(workdir: &Path) -> PathBuf {
     resolve_path(workdir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An inline token cuts the visible text at a zero-width boundary, so a
+    /// span that reads contiguously once the tokens are stripped is not one
+    /// editable run.
+    #[test]
+    fn body_boundaries_cuts_at_inline_tokens() {
+        let (flat, boundaries) =
+            body_boundaries("ab\u{27e6}insert\u{27e7}cd\u{27e6}/insert\u{27e7}ef");
+        assert_eq!(flat, "abcdef");
+        assert_eq!(
+            boundaries,
+            vec![
+                (2, "insert-start".to_string()),
+                (4, "insert-end".to_string())
+            ]
+        );
+        // A body with no token has no boundary at all.
+        assert_eq!(body_boundaries("plain prose").1, Vec::new());
+    }
+
+    #[test]
+    fn span_crosses_boundary_names_the_flavour() {
+        let body = "ab\u{27e6}insert\u{27e7}cd\u{27e6}/insert\u{27e7}ef";
+        // "bc" reads contiguous in the flat text but strictly spans the marker.
+        let error = span_crosses_boundary("P0", body, "bc").expect("boundary crossed");
+        assert_eq!(error.code, "edit-span-crosses-revision-boundary");
+        // Boundaries exactly at the span edges do not count.
+        assert!(span_crosses_boundary("P0", body, "ab").is_none());
+        assert!(span_crosses_boundary("P0", body, "ef").is_none());
+        assert!(span_crosses_boundary("P0", body, "cd").is_none());
+        // An anchor or format-history token is not a revision: say so.
+        let error = span_crosses_boundary("P0", "x\u{27e6}kind=\"hyperlink\"\u{27e7}y", "xy")
+            .expect("protected marker crossed");
+        assert_eq!(error.code, "edit-span-crosses-protected-marker");
+        // A span that is not contiguous in the flat text is simply not found.
+        assert!(span_crosses_boundary("P0", body, "zz").is_none());
+    }
+
+    /// The batch primitive's argument surface, exercised without a workdir.
+    #[test]
+    fn normalize_patch_hunks_shapes() {
+        let hunks = normalize_patch_hunks(&[json!({
+            "paragraph_id": "P0", "old": "a", "new": "b",
+        })])
+        .expect("replace normalizes");
+        assert_eq!(hunks.len(), 1);
+        assert!(matches!(hunks[0], PatchHunk::Replace { .. }));
+        let hunks = normalize_patch_hunks(&[json!({"insert_after": "P0", "text": "x"})])
+            .expect("insert normalizes");
+        assert!(matches!(hunks[0], PatchHunk::Insert { inherit: None, .. }));
+        let hunks = normalize_patch_hunks(&[json!({"delete": "P4"})]).expect("delete normalizes");
+        assert!(matches!(hunks[0], PatchHunk::Delete { .. }));
+        for bad in [
+            json!({"paragraph_id": "P0", "old": "a", "typo": "b"}),
+            json!({"paragraph_id": "P0", "old": "a"}),
+            json!({"paragraph_id": "P0", "old": "", "new": "b"}),
+            json!({"insert_after": "P0"}),
+            json!({"match_ref": "ref_x", "new": "b"}),
+            json!({"old": "a", "new": "b"}),
+            json!("not an object"),
+        ] {
+            let error =
+                normalize_patch_hunks(std::slice::from_ref(&bad)).expect_err("invalid hunk");
+            assert_eq!(error.code, "invalid-arguments", "{bad}");
+        }
+    }
 }

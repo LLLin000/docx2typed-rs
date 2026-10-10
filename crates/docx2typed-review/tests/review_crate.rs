@@ -752,6 +752,393 @@ fn replace_in_body_enforces_unique_match_and_marker_rules() {
 }
 
 // ---------------------------------------------------------------------------
+// document_patch: the batch edit primitive
+// ---------------------------------------------------------------------------
+
+fn direct() -> draft::EditTracking<'static> {
+    draft::EditTracking {
+        tracked: false,
+        author: None,
+        date: None,
+    }
+}
+
+fn hunk_list(hunks: &Value) -> Vec<Value> {
+    hunks.as_array().expect("hunks array").clone()
+}
+
+/// The current draft revision token (what `document_read` hands back and
+/// `base_revision` checks).
+fn revision(wd: &Path) -> String {
+    draft::workdir_status(wd).expect("status")["edit_body_sha256"]
+        .as_str()
+        .expect("revision token")
+        .to_string()
+}
+
+fn patch(
+    wd: &Path,
+    hunks: &Value,
+    base_revision: Option<&str>,
+) -> Result<Value, docx2typed_review::collab::CollaborationError> {
+    let hunks = hunk_list(hunks);
+    draft::document_patch(wd, Some(&hunks), None, base_revision, false, direct())
+}
+
+#[test]
+fn document_patch_applies_replace_insert_delete_in_one_batch() {
+    let wd = workdir("patch-batch", "plain");
+    draft::ensure_projection(&wd).expect("projection");
+    let hunks = json!([
+        // two non-overlapping replaces in ONE paragraph (git apply style)
+        {"paragraph_id": "P0", "old": "本发明", "new": "我们"},
+        {"paragraph_id": "P0", "old": "20 mg", "new": "40 mg"},
+        {"paragraph_id": "P1", "old": "250 mg", "new": "500 mg"},
+        {"insert_after": "P2", "text": "新增段落。"},
+        {"delete": "P3"},
+    ]);
+    let result = patch(&wd, &hunks, None).expect("batch applies");
+    assert_eq!(
+        draft::get_paragraph(&wd, "P0").expect("get")["plain"],
+        "我们涉及生物医用材料技术领域。剂量为 40 mg。"
+    );
+    assert_eq!(
+        draft::get_paragraph(&wd, "P1").expect("get")["plain"],
+        "实施例1采用 500 mg 剂量。"
+    );
+    // The applied summary mirrors the Python payload: replaces report their
+    // hunk count, inserts their temp id, deletes their paragraph id.
+    let applied = result["applied"].as_array().expect("applied");
+    assert_eq!(
+        applied[0],
+        json!({"kind": "replace", "paragraph_id": "P0", "hunks": 2})
+    );
+    assert_eq!(
+        applied[1],
+        json!({"kind": "replace", "paragraph_id": "P1", "hunks": 1})
+    );
+    assert_eq!(applied[2], json!({"kind": "delete", "paragraph_id": "P3"}));
+    assert_eq!(
+        applied[3],
+        json!({"kind": "insert", "after_id": "P2", "temp_id": "N1"})
+    );
+    assert_eq!(
+        result["affected_paragraph_ids"],
+        json!(["N1", "P0", "P1", "P3"])
+    );
+    assert_eq!(result["document_state"]["draft"], "dirty");
+    assert_ne!(
+        result["document_state"]["revision_before"], result["document_state"]["revision_after"],
+        "the batch moves the revision token"
+    );
+    // The inserted block landed directly after its anchor; P3 reads deleted.
+    let listed = draft::list_paragraphs(&wd).expect("list");
+    let paragraphs = listed["paragraphs"].as_array().expect("paragraphs");
+    let ids: Vec<&str> = paragraphs
+        .iter()
+        .map(|p| p["id"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(ids, vec!["P0", "P1", "P2", "N1", "P4", "P5", "P3"]);
+    let p3 = paragraphs.iter().find(|p| p["id"] == "P3").expect("P3");
+    assert_eq!(p3["deleted"], true);
+    // Every replace hunk recorded its leaf-local island edit in ONE sidecar
+    // write (the batch resolves all of them before writing).
+    let islands: Value =
+        serde_json::from_str(&fs::read_to_string(wd.join("islands.json")).expect("islands"))
+            .expect("islands json");
+    let edits = islands["edits"].as_array().expect("edits");
+    assert_eq!(edits.len(), 3, "one island record per replace hunk");
+    assert_eq!(edits[0]["paragraph_id"], "P0");
+    assert_eq!(edits[0]["old"], "本发明");
+    assert_eq!(edits[0]["new"], "我们");
+    assert_eq!(edits[1]["paragraph_id"], "P0");
+    assert_eq!(edits[1]["old"], "20 mg");
+    assert_eq!(edits[1]["new"], "40 mg");
+    assert_eq!(edits[2]["paragraph_id"], "P1");
+    assert_eq!(edits[2]["old"], "250 mg");
+    // The batch result is commit-ready.
+    let changed = draft::apply_projection(&wd).expect("commit");
+    assert!(changed.contains(&"P0".to_string()));
+    assert!(changed.contains(&"P1".to_string()));
+    assert!(changed.contains(&"P3".to_string()));
+}
+
+#[test]
+fn document_patch_rejects_overlapping_hunks_without_touching_the_draft() {
+    let wd = workdir("patch-overlap", "plain");
+    draft::ensure_projection(&wd).expect("projection");
+    let before = fs::read(wd.join("edit.md")).expect("edit.md");
+    // "本发明涉及" and "涉及生物" share the "涉及" span.
+    let hunks = json!([
+        {"paragraph_id": "P0", "old": "本发明涉及", "new": "A"},
+        {"paragraph_id": "P0", "old": "涉及生物", "new": "B"},
+    ]);
+    let error = patch(&wd, &hunks, None).expect_err("overlap rejected");
+    assert_eq!(error.code, "patch-hunks-invalid");
+    assert!(
+        error.detail.contains("overlap"),
+        "the refusal names the overlap: {}",
+        error.detail
+    );
+    assert_eq!(
+        fs::read(wd.join("edit.md")).expect("edit.md"),
+        before,
+        "a rejected batch leaves the draft byte-identical"
+    );
+}
+
+#[test]
+fn document_patch_one_bad_hunk_leaves_the_draft_byte_identical() {
+    let wd = workdir("patch-atomic", "plain");
+    draft::ensure_projection(&wd).expect("projection");
+    let before = fs::read(wd.join("edit.md")).expect("edit.md");
+    let islands_before = fs::read(wd.join("islands.json")).ok();
+    // Hunk #1 is valid, hunk #2 can never resolve: the batch must apply nothing.
+    let hunks = json!([
+        {"paragraph_id": "P0", "old": "本发明", "new": "我们"},
+        {"paragraph_id": "P1", "old": "不存在的文本", "new": "x"},
+    ]);
+    let error = patch(&wd, &hunks, None).expect_err("bad hunk");
+    assert_eq!(error.code, "text-not-found");
+    assert!(
+        error.detail.starts_with("hunk #2 (P1)"),
+        "the refusal names the failing hunk: {}",
+        error.detail
+    );
+    assert_eq!(
+        fs::read(wd.join("edit.md")).expect("edit.md"),
+        before,
+        "the atomicity guarantee: nothing of the batch landed"
+    );
+    assert_eq!(
+        fs::read(wd.join("islands.json")).ok(),
+        islands_before,
+        "no island edit of the failed batch landed either"
+    );
+    // Several broken hunks surface TOGETHER as one report, still applying
+    // nothing.
+    let hunks = json!([
+        {"paragraph_id": "P0", "old": "本发明", "new": "我们"},
+        {"paragraph_id": "P1", "old": "缺失", "new": "x"},
+        {"paragraph_id": "P0", "old": "剂量", "new": "剂量"},
+    ]);
+    let error = patch(&wd, &hunks, None).expect_err("two bad hunks");
+    assert_eq!(error.code, "patch-hunks-invalid");
+    assert!(error.detail.contains("2 of 3 hunks are invalid"));
+    assert!(error.detail.contains("hunk #2 (P1): text-not-found"));
+    assert!(error.detail.contains("hunk #3 (P0): patch-noop"));
+    assert_eq!(
+        fs::read(wd.join("edit.md")).expect("edit.md"),
+        before,
+        "still byte-identical"
+    );
+}
+
+#[test]
+fn document_patch_hunk_diagnostics_and_arguments() {
+    let wd = workdir("patch-errors", "plain");
+    draft::ensure_projection(&wd).expect("projection");
+    // old == new is a no-op, not an edit.
+    let error = patch(
+        &wd,
+        &json!([{"paragraph_id": "P0", "old": "本发明", "new": "本发明"}]),
+        None,
+    )
+    .expect_err("noop");
+    assert_eq!(error.code, "patch-noop");
+    // P5 carries the same phrase twice.
+    let error = patch(
+        &wd,
+        &json!([{"paragraph_id": "P5", "old": "重复句子内容", "new": "x"}]),
+        None,
+    )
+    .expect_err("ambiguous");
+    assert_eq!(error.code, "text-ambiguous");
+    let error = patch(
+        &wd,
+        &json!([{"paragraph_id": "P0", "old": "不存在", "new": "x"}]),
+        None,
+    )
+    .expect_err("missing");
+    assert_eq!(error.code, "text-not-found");
+    // Container and part paragraphs belong to the container tools.
+    let error = patch(&wd, &json!([{"delete": "T0"}]), None).expect_err("table");
+    assert_eq!(error.code, "table-structure-immutable");
+    let error =
+        patch(&wd, &json!([{"insert_after": "B1", "text": "x"}]), None).expect_err("text box");
+    assert_eq!(error.code, "table-structure-immutable");
+    // Comment text needs the explicit opt-in.
+    let error = patch(&wd, &json!([{"delete": "comments.P0"}]), None).expect_err("comment");
+    assert_eq!(error.code, "comment-text-requires-opt-in");
+    // Shape and argument errors.
+    let hunks = hunk_list(&json!([]));
+    let error = draft::document_patch(&wd, Some(&hunks), None, None, false, direct())
+        .expect_err("empty hunks");
+    assert_eq!(error.code, "invalid-arguments");
+    assert_eq!(error.detail, "hunks must not be empty");
+    let error =
+        draft::document_patch(&wd, None, None, None, false, direct()).expect_err("neither form");
+    assert_eq!(error.code, "invalid-arguments");
+    assert_eq!(error.detail, "provide exactly one of hunks or diff");
+    let hunks = hunk_list(&json!([{"paragraph_id": "P0", "old": "本发明", "new": "我们"}]));
+    let error = draft::document_patch(
+        &wd,
+        Some(&hunks),
+        Some("@@ -1 +1 @@"),
+        None,
+        false,
+        direct(),
+    )
+    .expect_err("both forms");
+    assert_eq!(error.code, "invalid-arguments");
+    // The unified-diff form is not implemented in this build.
+    let error = draft::document_patch(&wd, None, Some("@@ -1 +1 @@"), None, false, direct())
+        .expect_err("diff form");
+    assert_eq!(error.code, "invalid-arguments");
+    assert!(error.detail.contains("not implemented yet"));
+    // Unknown keys are refused rather than silently ignored.
+    let error = patch(
+        &wd,
+        &json!([{"paragraph_id": "P0", "old": "本发明", "neww": "x"}]),
+        None,
+    )
+    .expect_err("unknown key");
+    assert_eq!(error.code, "invalid-arguments");
+    assert!(error.detail.contains("\"neww\""));
+    // A replace hunk without 'new' cannot be a deletion in disguise.
+    let error = patch(&wd, &json!([{"paragraph_id": "P0", "old": "本发明"}]), None)
+        .expect_err("missing new");
+    assert_eq!(error.code, "invalid-arguments");
+    // A hunk that is not an object.
+    let error = patch(&wd, &json!(["P0"]), None).expect_err("not an object");
+    assert_eq!(error.code, "invalid-arguments");
+    // No key at all.
+    let error =
+        patch(&wd, &json!([{"old": "本发明", "new": "我们"}]), None).expect_err("no target");
+    assert_eq!(error.code, "invalid-arguments");
+}
+
+#[test]
+fn document_patch_base_revision_gates_and_heals() {
+    let wd = workdir("patch-base-revision", "plain");
+    draft::ensure_projection(&wd).expect("projection");
+    let token = revision(&wd);
+    let hunks = json!([{"paragraph_id": "P0", "old": "本发明", "new": "我们"}]);
+    let first = patch(&wd, &hunks, Some(&token)).expect("current token applies");
+    assert!(first["warnings"].as_array().expect("warnings").is_empty());
+    // A token matching neither the draft nor the previous committed view is a
+    // view the caller never read.
+    let error = patch(&wd, &hunks, Some(&"0".repeat(64))).expect_err("unknown token");
+    assert_eq!(error.code, "stale-document-view");
+    // The pre-patch token is the previous committed view: hunks that still
+    // resolve are applied against the current draft and healed with a warning.
+    let healed = patch(
+        &wd,
+        &json!([{"paragraph_id": "P1", "old": "250 mg", "new": "300 mg"}]),
+        Some(&token),
+    )
+    .expect("stale view heals while every anchor resolves");
+    assert!(healed["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .unwrap_or("")
+            .starts_with("stale-document-view-healed")));
+    // The same token with a hunk whose text moved fails closed instead.
+    let error = patch(&wd, &hunks, Some(&token)).expect_err("stale anchor");
+    assert_eq!(error.code, "stale-document-view");
+    // An exact retry of a completed patch replays from the store ledger without
+    // reaching the base_revision check — so a lost response can be re-sent.
+    // (The mutation closure runs against the store's overlaid generation, so it
+    // ensures the projection there exactly like the MCP draft tools do.)
+    let wd = workdir("patch-replay", "plain");
+    draft::ensure_projection(&wd).expect("projection");
+    let token = revision(&wd);
+    let hunks = hunk_list(&json!([{"paragraph_id": "P0", "old": "本发明", "new": "我们"}]));
+    let args = json!({"hunks": hunks, "base_revision": token});
+    let operation_id = docx2typed_protocol::new_operation_id();
+    let run = {
+        let hunks = hunks.clone();
+        let token = token.clone();
+        move |target: &Path| {
+            draft::ensure_projection(target)
+                .map_err(|error| MutationError::new(error.code, error.detail))?;
+            draft::document_patch(target, Some(&hunks), None, Some(&token), false, direct())
+                .map_err(|error| MutationError::new(error.code, error.detail))
+        }
+    };
+    let first =
+        store_mutation(&wd, "document_patch", &operation_id, &args, run).expect("first patch");
+    assert_eq!(first["document_state"]["draft"], "dirty");
+    let applied_once = fs::read(wd.join("edit.md")).expect("edit.md");
+    assert!(
+        String::from_utf8_lossy(&applied_once).contains("我们"),
+        "the committed draft carries the batch"
+    );
+    // The retry's closure would fail if it ran: the old text is gone.
+    let replay = store_mutation(
+        &wd,
+        "document_patch",
+        &operation_id,
+        &args,
+        |_target: &Path| {
+            Err(MutationError::new(
+                "should-not-run",
+                "the ledger replay must not reach the mutation closure",
+            ))
+        },
+    )
+    .expect("exact retry replays");
+    assert_eq!(replay["applied"], first["applied"]);
+    assert_eq!(replay["document_state"], first["document_state"]);
+    assert_eq!(
+        fs::read(wd.join("edit.md")).expect("edit.md"),
+        applied_once,
+        "the replay has no second effect"
+    );
+}
+
+#[test]
+fn document_patch_refuses_a_span_crossing_a_revision_boundary() {
+    let wd = workdir("patch-boundary", "plain");
+    draft::ensure_projection(&wd).expect("projection");
+    // A projection carrying a revision-control token: the visible text still
+    // reads "本发明涉及…", but an insert marker splits it after the first
+    // character, so "本发" is not one editable run.
+    let text = fs::read_to_string(wd.join("edit.md")).expect("edit.md");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let index = lines
+        .iter()
+        .position(|line| line.starts_with("<!--@p id=\"P0\""))
+        .expect("P0 block");
+    lines[index + 1] =
+        "本\u{27e6}insert\u{27e7}发明涉及生物医用材料技术领域。剂量为 20 mg。".to_string();
+    fs::write(wd.join("edit.md"), format!("{}\n", lines.join("\n"))).expect("write draft");
+    let error = patch(
+        &wd,
+        &json!([{"paragraph_id": "P0", "old": "本发", "new": "X"}]),
+        None,
+    )
+    .expect_err("span crosses the marker");
+    assert_eq!(error.code, "edit-span-crosses-revision-boundary");
+    assert!(error.detail.contains("revision-control markers"));
+    // A span that stays on one side of the marker is an ordinary replace.
+    let result = patch(
+        &wd,
+        &json!([{"paragraph_id": "P0", "old": "本", "new": "该"}]),
+        None,
+    )
+    .expect("in-span edit");
+    assert_eq!(result["applied"][0]["paragraph_id"], "P0");
+    assert!(draft::get_paragraph(&wd, "P0").expect("get")["text"]
+        .as_str()
+        .unwrap_or("")
+        .contains("\u{27e6}insert\u{27e7}"));
+}
+
+// ---------------------------------------------------------------------------
 // server: store-wrapped mutation contract
 // ---------------------------------------------------------------------------
 
