@@ -30,8 +30,11 @@ Machine-readable: [`matrix.json`](matrix.json), [`python-lock.json`](python-lock
 > 3. The plan's cited SHA `1a4d4885` was a third, stale value (main at plan
 >    writing, now superseded by #100 delivery evidence + #101 gate design).
 >
-> **PR 2 must decide the oracle-bump policy before touching any behaviour that
-> `main` fixed after 2026-08-14.**
+> **The oracle-bump policy is now on the critical path** — see
+> [`oracle-coverage-gap.md`](oracle-coverage-gap.md). Measured: the oracle
+> exposes 36 tools and lacks **exactly the 12 tools Rust still has to
+> implement**, so the oracle-qualification job can never exercise the
+> migration target.
 
 ## 1. Surface counts (verified, not estimated)
 
