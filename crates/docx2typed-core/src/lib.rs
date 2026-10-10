@@ -10,6 +10,7 @@
 //! replay reproduces the Python Reference output exactly.
 
 pub mod document_projection;
+pub mod document_view;
 pub mod edit_state;
 pub mod govern;
 pub mod inspect;
