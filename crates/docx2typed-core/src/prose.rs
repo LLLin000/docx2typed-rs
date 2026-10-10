@@ -85,6 +85,15 @@ pub struct ProseLeaf {
     pub style_sha256: String,
     /// Raw rPr XML of the owning run ("" when the run has no rPr).
     pub rpr: String,
+    /// Byte range of the owning run's `w:rPr` within the part XML. Empty
+    /// (`start == end`) when the run has none — a restyle then inserts one at
+    /// `run_open_end`, which is what the reference does: it always writes the
+    /// derived rPr, even onto a run that carried none.
+    pub rpr_start: usize,
+    pub rpr_end: usize,
+    /// Byte offset just past the owning run's open tag: where a `w:rPr`
+    /// belongs when the run has none (rPr precedes every other run child).
+    pub run_open_end: usize,
 }
 
 /// One opaque block (locked interior) with its byte range.
@@ -873,11 +882,13 @@ fn extract_paragraph(
         part_key: &str,
     ) {
         let mut opaque = false;
+        let mut rpr_range: (usize, usize) = (0, 0);
         for &child in &run.children {
             let child_node = &nodes[child];
             let name = child_node.name.as_str();
             if name == "rPr" {
                 *rpr_bytes = xml[child_node.open_start..child_node.end].to_vec();
+                rpr_range = (child_node.open_start, child_node.end);
             } else if name == "t" || name == "delText" {
                 let text_start = child_node.open_end;
                 let text_end = if child_node.children.is_empty() {
@@ -900,6 +911,9 @@ fn extract_paragraph(
                     open_end: child_node.open_end,
                     style_sha256: style_sha256(rpr_bytes),
                     rpr: String::from_utf8_lossy(rpr_bytes).into_owned(),
+                    rpr_start: rpr_range.0,
+                    rpr_end: rpr_range.1,
+                    run_open_end: run.open_end,
                     text,
                 });
                 // delText is a deletion revision: locked in v1.
@@ -1781,6 +1795,196 @@ fn find_eocd(package: &[u8]) -> Option<usize> {
 // ---------------------------------------------------------------------------
 // Workdir sidecar (islands.json)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Workdir sidecar (rpr_edits.json) -- the format_span lane
+// ---------------------------------------------------------------------------
+
+/// The `format_span` sidecar: character-formatting changes the build applies
+/// by rewriting an existing run's `w:rPr` in place.
+///
+/// This is the third record the build understands, and it is deliberately not
+/// one of the other two: `islands.json` changes text BYTES inside a leaf, and
+/// `structure.json` synthesises or removes whole paragraphs. A format change
+/// is neither -- it rewrites properties that sit BEFORE the text, which is why
+/// `IslandEdit`'s `text_start..text_end` cannot express it.
+pub const RPR_EDITS_SCHEMA: &str = "docx2typed-rpr-edits-1";
+pub const RPR_EDITS_FILE: &str = "rpr_edits.json";
+
+/// One recorded restyle.
+///
+/// Addressing is the same anchor `IslandEdit` uses -- a paragraph plus a
+/// character span -- and NOT a run index. A run index is an index into a
+/// structure the caller never sees, and it goes stale the moment any text
+/// edit moves a run boundary; a text span survives edits elsewhere in the
+/// paragraph. `style_id` is what the build applies; `attributes` is kept so
+/// the record explains itself.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RprEdit {
+    /// Part key: "document", "header1", ...
+    pub part: String,
+    pub paragraph_id: String,
+    /// Character span within the paragraph's visible text.
+    pub text_start: usize,
+    pub text_end: usize,
+    /// The partial override map that was requested, for audit and preview.
+    #[serde(default)]
+    pub attributes: serde_json::Value,
+    /// The derived character style, already present in `styles.json`.
+    pub style_id: String,
+}
+
+/// Read the restyle sidecar of a workdir (missing file = no edits).
+pub fn load_rpr_edits(root: &Path) -> Result<Vec<RprEdit>, CoreError> {
+    let path = root.join(RPR_EDITS_FILE);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(&path).map_err(CoreError::io)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| CoreError::Domain(format!("invalid rpr_edits.json: {error}")))?;
+    if value.get("schema").and_then(|v| v.as_str()) != Some(RPR_EDITS_SCHEMA) {
+        return Err(CoreError::Domain(format!(
+            "incompatible rpr_edits.json schema: {}",
+            value
+                .get("schema")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing")
+        )));
+    }
+    let edits = value
+        .get("edits")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            CoreError::Domain("invalid rpr_edits.json: missing edits array".to_string())
+        })?;
+    let mut out = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let parsed: RprEdit = serde_json::from_value(edit.clone())
+            .map_err(|error| CoreError::Domain(format!("invalid rpr_edits.json edit: {error}")))?;
+        out.push(parsed);
+    }
+    Ok(out)
+}
+
+/// Persist the restyle sidecar. An empty record REMOVES the file, matching the
+/// structure sidecar, so "no formatting changes" has one representation.
+pub fn save_rpr_edits(root: &Path, edits: &[RprEdit]) -> Result<(), CoreError> {
+    let path = root.join(RPR_EDITS_FILE);
+    if edits.is_empty() {
+        if path.is_file() {
+            std::fs::remove_file(&path).map_err(CoreError::io)?;
+        }
+        return Ok(());
+    }
+    let value = serde_json::json!({
+        "schema": RPR_EDITS_SCHEMA,
+        "edits": edits,
+    });
+    let mut json = serde_json::to_string_pretty(&value).expect("rpr edits serialize");
+    json.push('\n');
+    std::fs::write(&path, json).map_err(CoreError::io)
+}
+
+/// Apply recorded restyles to a package, in place.
+///
+/// Mirrors `apply_edits`' shape: read the canonical inventory once, resolve
+/// each edit to the leaves its span covers, collect byte spans, then splice
+/// them right-to-left so earlier offsets stay valid.
+///
+/// A run with no `w:rPr` gets one inserted at the run's open tag -- the
+/// reference always writes the derived properties, even onto a run that
+/// carried none.
+///
+/// Returns the new package and the paragraph ids it could NOT apply. The
+/// caller MUST report those: a restyle whose paragraph a later structure edit
+/// removed is stale, and dropping it silently is the defect class #26 named.
+pub fn apply_rpr_edits(
+    package: &[u8],
+    edits: &[RprEdit],
+    styles: &BTreeMap<String, String>,
+) -> Result<(Vec<u8>, Vec<String>), CoreError> {
+    if edits.is_empty() {
+        return Ok((package.to_vec(), Vec::new()));
+    }
+    let mut by_part: BTreeMap<String, Vec<&RprEdit>> = BTreeMap::new();
+    for edit in edits {
+        by_part.entry(edit.part.clone()).or_default().push(edit);
+    }
+    let mut stale: Vec<String> = Vec::new();
+    let mut current = package.to_vec();
+    for (part, part_edits) in &by_part {
+        let inventory = enumerate_package_bytes(&current)?;
+        let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+        for edit in part_edits {
+            let Some(style_rpr) = styles.get(&edit.style_id) else {
+                return Err(CoreError::Domain(format!(
+                    "format-style-unavailable: rpr_edits.json names {} which styles.json does not hold",
+                    edit.style_id
+                )));
+            };
+            // The paragraph's visible text, exactly the surface the read side
+            // publishes, so a span copied from it resolves here too.
+            let paragraph_leaves: Vec<&ProseLeaf> = inventory
+                .leaves
+                .iter()
+                .filter(|leaf| leaf.part_key == *part && leaf.paragraph_id == edit.paragraph_id)
+                .collect();
+            let paragraph_text: String = paragraph_leaves
+                .iter()
+                .filter(|leaf| leaf.text_start != leaf.text_end)
+                .map(|leaf| leaf.text.clone())
+                .collect();
+            let length = paragraph_text.chars().count();
+            if edit.text_end > length || edit.text_start >= edit.text_end {
+                stale.push(edit.paragraph_id.clone());
+                continue;
+            }
+            let mut cursor = 0usize;
+            let mut targets: Vec<&ProseLeaf> = Vec::new();
+            for leaf in &paragraph_leaves {
+                if leaf.text_start == leaf.text_end {
+                    continue;
+                }
+                let leaf_length = leaf.text.chars().count();
+                let (leaf_start, leaf_end) = (cursor, cursor + leaf_length);
+                cursor = leaf_end;
+                if leaf_start < edit.text_end && leaf_end > edit.text_start {
+                    targets.push(leaf);
+                }
+            }
+            if targets.is_empty() {
+                stale.push(edit.paragraph_id.clone());
+                continue;
+            }
+            for leaf in targets {
+                let (start, end) = if leaf.rpr_start == leaf.rpr_end {
+                    // No rPr on the run: insert one immediately after the
+                    // run's open tag, where an rPr belongs.
+                    (leaf.run_open_end, leaf.run_open_end)
+                } else {
+                    (leaf.rpr_start, leaf.rpr_end)
+                };
+                spans.push((start, end, style_rpr.as_bytes().to_vec()));
+            }
+        }
+        if spans.is_empty() {
+            continue;
+        }
+        let part_bytes = read_part_bytes(&current, &part_path(part))?;
+        spans.sort_by_key(|(start, _, _)| *start);
+        let mut new_part = part_bytes.clone();
+        for (start, end, replacement) in spans.into_iter().rev() {
+            if end > new_part.len() || start > end {
+                stale.push(part.clone());
+                continue;
+            }
+            new_part.splice(start..end, replacement);
+        }
+        current = patch_zip_member(&current, &part_path(part), &new_part)?;
+    }
+    Ok((current, stale))
+}
 
 /// Read the island-edit sidecar of a workdir (missing file = no edits).
 pub fn load_islands(root: &Path) -> Result<Vec<IslandEdit>, CoreError> {
@@ -4007,5 +4211,194 @@ mod tests {
             text, expected,
             "styles.json must match the reference byte for byte"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_span: the rPr restyle lane
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_restyle_replaces_the_runs_properties_in_place() {
+        let package = std::fs::read(fixture("styled.docx")).expect("fixture");
+        let inventory = enumerate_package_bytes(&package).expect("inventory");
+        let leaf = inventory
+            .leaves
+            .iter()
+            .find(|leaf| !leaf.rpr.is_empty() && leaf.editable)
+            .expect("an editable run with properties");
+        let style_id = "s_test_style".to_string();
+        let new_rpr = r#"<w:rPr><w:b/></w:rPr>"#.to_string();
+        let mut styles = BTreeMap::new();
+        styles.insert(style_id.clone(), new_rpr.clone());
+
+        let text_len = leaf.text.chars().count();
+        let edit = RprEdit {
+            part: leaf.part_key.clone(),
+            paragraph_id: leaf.paragraph_id.clone(),
+            text_start: 0,
+            text_end: text_len.max(1),
+            attributes: json!({ "bold": true }),
+            style_id: style_id.clone(),
+        };
+        let (out, stale) =
+            apply_rpr_edits(&package, &[edit], &styles).expect("apply restyle");
+        assert!(stale.is_empty(), "nothing stale: {stale:?}");
+
+        // The target run now carries the new properties...
+        let after = enumerate_package_bytes(&out).expect("inventory after");
+        let restyled = after
+            .leaves
+            .iter()
+            .find(|candidate| {
+                candidate.paragraph_id == leaf.paragraph_id && candidate.leaf_index == leaf.leaf_index
+            })
+            .expect("the run survived");
+        assert_eq!(restyled.rpr, new_rpr, "the run's properties were rewritten");
+        // ...and nothing else in the document changed.
+        assert_eq!(
+            after.paragraphs.len(),
+            inventory.paragraphs.len(),
+            "a restyle adds no paragraphs"
+        );
+    }
+
+    #[test]
+    fn a_run_without_properties_gets_them_inserted() {
+        // The reference always writes the derived rPr, even onto a run that
+        // carried none, so the writer must insert rather than skip.
+        let package = std::fs::read(fixture("complex.docx")).expect("fixture");
+        let inventory = enumerate_package_bytes(&package).expect("inventory");
+        // complex.docx has 75 runs and 21 carrying rPr, so a bare editable run
+        // is guaranteed. Asserted rather than skipped: a test that can
+        // silently no-op is not a test.
+        let bare = inventory
+            .leaves
+            .iter()
+            .find(|leaf| leaf.rpr.is_empty() && leaf.editable && !leaf.text.is_empty())
+            .expect("complex.docx must have a bare editable run");
+        let mut styles = BTreeMap::new();
+        styles.insert("s_x".to_string(), "<w:rPr><w:i/></w:rPr>".to_string());
+        let edit = RprEdit {
+            part: bare.part_key.clone(),
+            paragraph_id: bare.paragraph_id.clone(),
+            text_start: 0,
+            text_end: bare.text.chars().count().max(1),
+            attributes: json!({ "italic": true }),
+            style_id: "s_x".to_string(),
+        };
+        let (out, stale) = apply_rpr_edits(&package, &[edit], &styles).expect("apply");
+        assert!(stale.is_empty());
+        let after = enumerate_package_bytes(&out).expect("inventory after");
+        let restyled = after
+            .leaves
+            .iter()
+            .find(|candidate| {
+                candidate.paragraph_id == bare.paragraph_id
+                    && candidate.leaf_index == bare.leaf_index
+            })
+            .expect("the run survived");
+        assert_eq!(restyled.rpr, "<w:rPr><w:i/></w:rPr>", "an rPr was inserted");
+    }
+
+    #[test]
+    fn a_span_covering_several_runs_restyles_each_of_them() {
+        let package = std::fs::read(fixture("norm.docx")).expect("fixture");
+        let inventory = enumerate_package_bytes(&package).expect("inventory");
+        // A paragraph with more than one editable leaf.
+        let paragraph_id = inventory
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.editable && !leaf.text.is_empty())
+            .fold(BTreeMap::<String, usize>::new(), |mut acc, leaf| {
+                *acc.entry(leaf.paragraph_id.clone()).or_default() += 1;
+                acc
+            })
+            .into_iter()
+            .find(|(_, count)| *count > 1)
+            .map(|(id, _)| id);
+        let Some(paragraph_id) = paragraph_id else {
+            return;
+        };
+        let leaves: Vec<&ProseLeaf> = inventory
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.paragraph_id == paragraph_id && leaf.editable)
+            .collect();
+        let total: usize = leaves.iter().map(|leaf| leaf.text.chars().count()).sum();
+
+        let mut styles = BTreeMap::new();
+        styles.insert("s_multi".to_string(), "<w:rPr><w:u/></w:rPr>".to_string());
+        let edit = RprEdit {
+            part: leaves[0].part_key.clone(),
+            paragraph_id: paragraph_id.clone(),
+            text_start: 0,
+            text_end: total,
+            attributes: json!({ "underline": true }),
+            style_id: "s_multi".to_string(),
+        };
+        let (out, stale) = apply_rpr_edits(&package, &[edit], &styles).expect("apply");
+        assert!(stale.is_empty());
+        let after = enumerate_package_bytes(&out).expect("inventory after");
+        let restyled: Vec<&ProseLeaf> = after
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.paragraph_id == paragraph_id && leaf.editable)
+            .collect();
+        assert!(
+            restyled.iter().all(|leaf| leaf.rpr == "<w:rPr><w:u/></w:rPr>"),
+            "every covered run was restyled, not just the first: {:?}",
+            restyled.iter().map(|leaf| leaf.rpr.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_restyle_whose_paragraph_is_gone_is_reported_stale() {
+        // #26's class: never silent, and never resurrected.
+        let package = std::fs::read(fixture("norm.docx")).expect("fixture");
+        let mut styles = BTreeMap::new();
+        styles.insert("s_y".to_string(), "<w:rPr><w:b/></w:rPr>".to_string());
+        let edit = RprEdit {
+            part: "document".to_string(),
+            paragraph_id: "P_does_not_exist".to_string(),
+            text_start: 0,
+            text_end: 3,
+            attributes: json!({ "bold": true }),
+            style_id: "s_y".to_string(),
+        };
+        let (out, stale) = apply_rpr_edits(&package, &[edit], &styles).expect("apply");
+        assert_eq!(stale, vec!["P_does_not_exist".to_string()]);
+        assert_eq!(out, package, "a stale restyle changes nothing");
+    }
+
+    #[test]
+    fn the_sidecar_round_trips_and_an_empty_one_is_removed() {
+        let dir = std::env::temp_dir().join(format!(
+            "docx2typed-rpr-edits-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        assert!(load_rpr_edits(&dir).expect("missing file is no edits").is_empty());
+
+        let edits = vec![RprEdit {
+            part: "document".to_string(),
+            paragraph_id: "P1".to_string(),
+            text_start: 2,
+            text_end: 5,
+            attributes: json!({ "vertAlign": "superscript" }),
+            style_id: "s_z".to_string(),
+        }];
+        save_rpr_edits(&dir, &edits).expect("save");
+        assert_eq!(load_rpr_edits(&dir).expect("load"), edits);
+
+        save_rpr_edits(&dir, &[]).expect("clear");
+        assert!(
+            !dir.join(RPR_EDITS_FILE).is_file(),
+            "an empty record removes the file, so 'no formatting changes' has one representation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
