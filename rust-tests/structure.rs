@@ -209,9 +209,20 @@ fn a_new_paragraph_really_reaches_the_built_package() {
         ("verify_output", json!({ "output": out_str })),
     ]);
     let inserted = ok(&results[1]);
+    // The temp id is draft-local: the commit reallocates it to the next free
+    // `P<n>` (mirror of Python's `_next_paragraph_id`) and reports THAT.
     assert_eq!(inserted["temp_id"], "N1");
     let committed = ok(&results[2]);
-    assert_eq!(committed["changed_paragraph_ids"], json!(["N1"]));
+    let new_id = committed["changed_paragraph_ids"]
+        .as_array()
+        .and_then(|ids| ids.first())
+        .and_then(Value::as_str)
+        .expect("commit reports the allocated paragraph id")
+        .to_string();
+    assert!(
+        new_id.starts_with('P') && new_id != "N1",
+        "the commit must report a freshly allocated P-id, got {new_id}"
+    );
     ok(&results[3]);
     // verify_output reports success only when every independent check passed.
     ok(&results[4]);
@@ -302,10 +313,28 @@ fn a_new_paragraph_can_be_edited_again_and_a_deleted_one_disappears() {
             }),
         ),
         ("commit_sync", json!({ "operation_id": "op-commit-1" })),
+    ]);
+    for index in [1, 2] {
+        ok(&results[index]);
+    }
+    // The commit reallocates the draft temp id to the next free `P<n>` (mirror
+    // of Python's `_next_paragraph_id`) and reports it; from here the caller
+    // addresses the paragraph by THAT id, because the temp id does not
+    // survive into `typed.md`.
+    let new_id = ok(&results[2])["changed_paragraph_ids"]
+        .as_array()
+        .and_then(|ids| ids.first())
+        .and_then(Value::as_str)
+        .expect("commit reports the allocated paragraph id")
+        .to_string();
+    assert!(new_id.starts_with('P'), "allocated id: {new_id}");
+
+    let results = mcp(&[
+        ("workdir_open", json!({ "workdir": wd })),
         (
             "replace_text",
             json!({
-                "paragraph_id": "N1",
+                "paragraph_id": new_id,
                 "old": "XYZ",
                 "new": "QQQ",
                 "operation_id": "op-replace",
@@ -328,7 +357,7 @@ fn a_new_paragraph_can_be_edited_again_and_a_deleted_one_disappears() {
         ),
         ("verify_output", json!({ "output": second_str })),
     ]);
-    for index in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+    for index in [1, 2, 3, 4, 5, 6, 7, 8] {
         ok(&results[index]);
     }
     // Acceptance 4: the re-edited body builds.

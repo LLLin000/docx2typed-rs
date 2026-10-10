@@ -81,6 +81,21 @@ pub const PHASE_ORDER: [&str; 5] = [
 /// root, mutations overlay them into the generation copy before running.
 pub const INGRESS_FILES: [&str; 2] = ["typed.md", "edit.md"];
 
+/// Root sidecars the engine may create and later remove.
+///
+/// A sidecar that becomes empty is deleted from the generation, but
+/// [`Store::materialize_root`] only *copies* files the generation carries —
+/// so without this list the root would keep a stale copy, and the engine
+/// (which reads sidecars from the root) would keep acting on state the commit
+/// had already dropped. Observed end to end: deleting a synthesised paragraph
+/// emptied `structure.json`, the generation lost it, the root kept it, and the
+/// builder kept re-emitting the deleted paragraph.
+///
+/// Deliberately an explicit list rather than "anything the generation lacks":
+/// the root also holds files the store does not own (`workdir.json` is
+/// root-only by design), and a blanket sweep would delete them.
+pub const OPTIONAL_ROOT_SIDECARS: [&str; 2] = ["islands.json", "structure.json"];
+
 /// Lock outcomes are stable diagnostic codes (public contract).
 pub const WRITER_BUSY: &str = "writer-busy";
 pub const WRITER_TIMEOUT: &str = "writer-timeout";
@@ -1589,6 +1604,20 @@ impl Store {
                 let _ = fs::remove_file(&temp);
             }
             result?;
+        }
+        // A sidecar the generation no longer carries must not survive at the
+        // root: reads take sidecars from the root, so a stale copy would
+        // resurrect state the commit dropped. Idempotent (guarded by
+        // `is_file`), so recovery may re-run this freely.
+        for name in OPTIONAL_ROOT_SIDECARS {
+            if gen_dir.join(name).is_file() {
+                continue;
+            }
+            let target = self.root.join(name);
+            if target.is_file() {
+                fire(Some(&format!("materialize-remove-{name}")), None)?;
+                fs::remove_file(&target)?;
+            }
         }
         fsync_dir(&self.root);
         Ok(())

@@ -245,7 +245,11 @@ fn marker_attr(marker: &str, name: &str) -> Option<String> {
 fn committed_marker(id: &str, marker: &str) -> String {
     match marker_attr(marker, "inherit") {
         Some(inherit) if !inherit.is_empty() => {
-            format!("<!--@p id=\"{id}\" base=\"\" inherit=\"{inherit}\"/>")
+            // A new paragraph states `inherit` ONLY. Python's marker grammar
+            // requires exactly one of `base`/`inherit` (`typed_core` parse:
+            // "paragraph marker requires exactly one of base or inherit"), and
+            // `base` addresses baseline style this paragraph does not have.
+            format!("<!--@p id=\"{id}\" inherit=\"{inherit}\"/>")
         }
         _ => format!("<!--@p id=\"{id}\"-->"),
     }
@@ -825,6 +829,50 @@ pub fn apply_projection_with_options(
     if changed.is_empty() {
         return Ok(changed);
     }
+    // Formal paragraph ids for this commit's new blocks, in draft order —
+    // mirror of Python's `_next_paragraph_id` (`edit_sync.py:1028`): the next
+    // free `P<n>` above every id already in use. `used` is shared across the
+    // commit, so two inserts become P1 and P2 rather than both P1.
+    //
+    // Python reallocates the draft's temp id (`N1`) to this formal id at
+    // commit; the temp id is draft-local bookkeeping and never survives into
+    // `typed.md`.
+    let mut formal_ids: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    {
+        let mut used: std::collections::BTreeSet<String> = blocks
+            .iter()
+            .filter_map(|block| {
+                let (kind, id, _) = marker_of(block)?;
+                (kind != "new").then_some(id)
+            })
+            .collect();
+        for block in &blocks {
+            let Some((kind, temp, _)) = marker_of(block) else {
+                continue;
+            };
+            if kind != "new" {
+                continue;
+            }
+            let next = used
+                .iter()
+                .filter_map(|id| id.strip_prefix('P').and_then(|n| n.parse::<i64>().ok()))
+                .max()
+                .map_or(0, |max| max + 1);
+            let formal = format!("P{next}");
+            used.insert(formal.clone());
+            formal_ids.insert(temp, formal);
+        }
+    }
+    // Everything downstream addresses paragraphs by their committed id.
+    let formal_to_temp: std::collections::BTreeMap<String, String> = formal_ids
+        .iter()
+        .map(|(temp, formal)| (formal.clone(), temp.clone()))
+        .collect();
+    let changed: Vec<String> = changed
+        .into_iter()
+        .map(|id| formal_ids.get(&id).cloned().unwrap_or(id))
+        .collect();
     // Capture the pre-commit paragraph bodies so committed text edits can be
     // recorded as island edits (the build/verify sidecar). Whole-paragraph
     // replacement maps to leaf_index 0; validate_edit rejects it at build
@@ -858,6 +906,17 @@ pub fn apply_projection_with_options(
 ",
         );
     }
+    // A delete marker outlives the draft only for a BASELINE paragraph.
+    // Deleting a paragraph that was synthesised in this lineage simply removes
+    // it, so the marker would be stale bookkeeping addressing an id that exists
+    // nowhere. The reference drops it: after insert -> commit -> delete ->
+    // commit, Python's typed.md carries no `@delete` at all. `before` cannot
+    // answer this question (it is seeded from the previous typed.md, which
+    // already lists synthesised ids), so the template inventory is the source.
+    let baseline_ids: std::collections::BTreeSet<String> = inventory_paragraphs(workdir)?
+        .into_iter()
+        .map(|paragraph| paragraph.id)
+        .collect();
     for block in &blocks {
         let Some((kind, id, marker)) = marker_of(block) else {
             continue;
@@ -868,17 +927,20 @@ pub fn apply_projection_with_options(
                 typed.push_str(&format!("{}\n{body}\n", committed_marker(&id, &marker)));
             }
             "new" => {
-                // The draft temp id IS the paragraph id (no reallocation,
-                // mirror of Python's `original_index = -1`); the inherit
-                // anchor rides along so a later commit can re-synthesise
-                // the paragraph from the same baseline.
+                // A new block is committed under its FORMAL id (Python
+                // reallocates the temp id at commit), with its inherit anchor
+                // riding along so a later commit can re-synthesise the
+                // paragraph from the same baseline.
                 let body = block_body(block);
-                typed.push_str(&format!("{}\n{body}\n", committed_marker(&id, &marker)));
+                let formal = formal_ids.get(&id).map(String::as_str).unwrap_or(&id);
+                typed.push_str(&format!("{}\n{body}\n", committed_marker(formal, &marker)));
             }
-            "delete" => {
+            "delete" if baseline_ids.contains(&id) => {
                 typed.push_str(&format!("<!--@delete id=\"{id}\"-->"));
                 typed.push('\n');
             }
+            // A deleted non-baseline paragraph leaves no trace: it never
+            // existed in the baseline, so there is nothing to record.
             _ => {}
         }
     }
@@ -909,7 +971,8 @@ pub fn apply_projection_with_options(
         }
         if let Some(rest) = trimmed.strip_prefix("<!--@new temp=\"") {
             let id = rest.split('"').next().unwrap_or("");
-            kept.push(committed_marker(id, trimmed));
+            let formal = formal_ids.get(id).map(String::as_str).unwrap_or(id);
+            kept.push(committed_marker(formal, trimmed));
             continue;
         }
         kept.push(line.clone());
@@ -997,15 +1060,20 @@ pub fn apply_projection_with_options(
         }
         let Some(old_body) = before.get(id) else {
             // Not in the baseline: a synthesised paragraph. Its inherit
-            // anchor and insertion point come from the draft order.
+            // anchor and insertion point come from the draft order, which is
+            // keyed by the DRAFT temp id — `id` here is already the formal id.
+            let temp = formal_to_temp
+                .get(id)
+                .map(String::as_str)
+                .unwrap_or(id.as_str());
             structure
                 .new_paragraphs
                 .push(docx2typed_core::prose::NewParagraph {
                     part: "document".to_string(),
                     paragraph_id: id.clone(),
-                    inherit: draft_inherit(&blocks, id).unwrap_or_default(),
+                    inherit: draft_inherit(&blocks, temp).unwrap_or_default(),
                     body: new_body.clone(),
-                    insert_before: next_live_paragraph(&blocks, id),
+                    insert_before: next_live_paragraph(&blocks, temp),
                 });
             structured = true;
             continue;
@@ -1038,6 +1106,44 @@ pub fn apply_projection_with_options(
             .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     }
     Ok(changed)
+}
+
+/// True when `typed.md` records a paragraph the build cannot reproduce from
+/// the template alone.
+///
+/// The build applies two sidecars — `islands.json` (byte surgery inside an
+/// existing paragraph) and `structure.json` (synthesised / removed
+/// paragraphs). With neither present it simply replays the template, which is
+/// safe exactly when every paragraph `typed.md` carries matches the baseline.
+///
+/// This is the question the build guard must ask. Comparing `typed.md`
+/// *bytes* against the extract-time file is too coarse: after an insert and a
+/// subsequent delete of that same paragraph, `typed.md` legitimately differs
+/// from the header-only extract state (committed baseline bodies were
+/// materialised into it) while holding no edit at all — refusing that build
+/// would be a false positive.
+///
+/// A body that differs from the baseline, or an id the baseline does not
+/// carry, is a genuine unrecorded edit.
+pub fn has_unrecorded_typed_edits(workdir: &Path) -> Result<bool, CollaborationError> {
+    let typed = fs::read_to_string(workdir.join("typed.md"))
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    let recorded = parse_typed_paragraphs(&typed);
+    let baseline: std::collections::BTreeMap<String, String> = inventory_paragraphs(workdir)?
+        .into_iter()
+        .map(|paragraph| (paragraph.id, paragraph.visible_text))
+        .collect();
+    for (id, body) in &recorded {
+        match baseline.get(id) {
+            Some(baseline_body) => {
+                if baseline_body != body {
+                    return Ok(true);
+                }
+            }
+            None => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
 /// Parse committed typed.md paragraph records: id -> body, plus the

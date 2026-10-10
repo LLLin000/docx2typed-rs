@@ -658,8 +658,6 @@ fn mcp_draft_lifecycle_with_replay_and_changed_set() {
     let temp_id = inserted["temp_id"].as_str().unwrap_or("").to_string();
     assert!(temp_id.starts_with('N'));
     let commit = &envelope(&results[6])["data"];
-    let mut expected_changed = vec!["P0".to_string(), temp_id.clone(), "P3".to_string()];
-    expected_changed.sort();
     let mut got_changed = commit["changed_paragraph_ids"]
         .as_array()
         .unwrap()
@@ -668,7 +666,25 @@ fn mcp_draft_lifecycle_with_replay_and_changed_set() {
         .map(str::to_string)
         .collect::<Vec<_>>();
     got_changed.sort();
-    assert_eq!(got_changed, expected_changed, "commit changed set");
+    // The draft temp id is draft-local bookkeeping: the commit reallocates it
+    // to the next free `P<n>` (mirror of Python's `_next_paragraph_id`) and
+    // reports THAT. So the set is the two edited baseline paragraphs plus one
+    // freshly allocated id, and the temp id never appears.
+    assert_eq!(got_changed.len(), 3, "commit changed set: {got_changed:?}");
+    assert!(got_changed.contains(&"P0".to_string()), "{got_changed:?}");
+    assert!(got_changed.contains(&"P3".to_string()), "{got_changed:?}");
+    let allocated = got_changed
+        .iter()
+        .find(|id| **id != "P0" && **id != "P3")
+        .expect("one freshly allocated paragraph id");
+    assert!(
+        allocated.starts_with('P') && allocated != "P0" && allocated != "P3",
+        "allocated id must be a fresh P-number, got {allocated}"
+    );
+    assert!(
+        !got_changed.contains(&temp_id),
+        "the draft temp id {temp_id} must not survive into the commit"
+    );
     assert_eq!(commit["current_snapshot"]["id"], "C1");
     assert_eq!(commit["state"], "clean");
     // Replay: same operation_id + same args returns the original envelope.
