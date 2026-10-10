@@ -189,7 +189,9 @@ dependencies = [
  "docx2typed-core",
  "docx2typed-protocol",
  "fs2",
+ "hex",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

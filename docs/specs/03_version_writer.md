@@ -204,6 +204,14 @@ diagnostic, not a normal state.
 - `label` / `pin` as user-facing retention roots — the fields are recorded, but
   no Rust surface sets them yet; `pin` is the only thing that survives retention
   by intent, so its tool surface deserves its own decision.
-- Whether `objectstore`'s chunk-level dedup is worth reproducing exactly, or
-  whether matching `build_tree` / `write_commit` outputs byte-for-byte is the
-  real requirement. Test 7 is what settles it, and it should be written first.
+- ~~Whether `objectstore`'s chunk-level dedup is worth reproducing exactly.~~
+  **Settled by test 7, which was written first, as required.** On a real
+  extracted workdir Rust's whole-blob writer and the reference's chunking
+  writer emit the **same tree object id**
+  (`6745fdc7f656f2700e095edff5bc3a69515300754100f53680bf0ca2b7b1b6cc`), because
+  `split_typed` fails its own round-trip guard on the `typed.md` this pipeline
+  writes, so `_parts` returns `None` and the reference stores **every** asset
+  whole. Chunking is therefore unnecessary for compatibility *and* is not what
+  the reference does for this input. Re-open condition: a `typed.md` that
+  survives `split_typed`'s round-trip would make the reference chunk and the
+  ids diverge — the digest would still agree.
