@@ -969,5 +969,28 @@
   "title": "history_verifyArguments",
   "type": "object",
   "additionalProperties": false
+ },
+ "workspace_fork": {
+  "properties": {
+   "docx": {
+    "title": "Docx",
+    "type": "string"
+   },
+   "operation_id": {
+    "title": "Operation Id",
+    "type": "string"
+   },
+   "outdir": {
+    "title": "Outdir",
+    "type": "string"
+   }
+  },
+  "required": [
+   "docx",
+   "outdir"
+  ],
+  "title": "workspace_forkArguments",
+  "type": "object",
+  "additionalProperties": false
  }
 }
