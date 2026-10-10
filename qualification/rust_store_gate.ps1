@@ -344,7 +344,12 @@ $oldEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 $testRun = & cargo test --manifest-path "$root\Cargo.toml" -p docx2typed-store --test store_recovery 2>&1 | Out-String
 $ErrorActionPreference = $oldEap
-$checks += @{ name = "focused rust store tests pass (18 fault/durability/probe cases)"; pass = ($testRun -match "test result: ok. 18 passed") }
+# Frozen count, deliberately: it catches a test silently disappearing. It also
+# means adding a test is a deliberate edit here -- and because CI runs the
+# schema and tracer62 gates but NOT this one, a drift here is invisible to CI.
+# It reached 21 when #42 added the version-HEAD carry-forward pair and #37's
+# boundary regression; the count was 18 at the last commit CI could see.
+$checks += @{ name = "focused rust store tests pass (21 fault/durability/probe cases)"; pass = ($testRun -match "test result: ok. 21 passed") }
 
 # ---------------------------------------------------------------------------
 # Verdict + evidence JSON
