@@ -12,7 +12,7 @@
     {
       "tool": "format_span",
       "python_site": "mcp_server.py:3783",
-      "rust_owner": "core/prose.rs (primitive landed, #28)",
+      "rust_owner": "core/prose.rs (primitive landed #28; design #39)",
       "status": "partial"
     },
     {
