@@ -1210,11 +1210,13 @@ impl McpSession {
         // Guard BEFORE the engine: a Python-extracted workdir has no
         // `typed_sha256` in format.json, so the engine treats it as pristine
         // and silently replays the template — dropping any committed typed
-        // edits. Committed edits recorded in islands.json ARE buildable
-        // (issue #58 path); only unrecorded divergence fails loudly here.
+        // edits. Committed edits recorded in the edit sidecars (islands.json
+        // leaf surgery, structure.json new/deleted paragraphs) ARE buildable;
+        // only unrecorded divergence fails loudly here.
         let root = Path::new(&workdir);
-        let islands_cover_edits = root.join("islands.json").is_file();
-        let has_committed_edits = islands_cover_edits
+        let sidecars_cover_edits = root.join("islands.json").is_file()
+            || root.join(docx2typed_core::prose::STRUCTURE_FILE).is_file();
+        let has_committed_edits = sidecars_cover_edits
             || (|| -> Option<bool> {
                 let gens = root.join(".docx2typed-store").join("generations");
                 let earliest = std::fs::read_dir(&gens)
@@ -1234,7 +1236,7 @@ impl McpSession {
                 Some(extract_time != current)
             })()
             .unwrap_or(false);
-        if has_committed_edits && !islands_cover_edits {
+        if has_committed_edits && !sidecars_cover_edits {
             return self.failure(
                 "build_docx",
                 "edits-not-implemented",

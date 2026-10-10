@@ -16,8 +16,16 @@
 //! (package prevalidation + per-part XML well-formedness + opaque
 //! containment) runs before any edited build and rejects the whole build
 //! with no output on failure.
+//!
+//! A **structural edit** is the other edited-build path (PR 3): a new
+//! paragraph has no baseline byte range at all (`base=""`), so it is
+//! *synthesised* — the inherit paragraph's opening tag (ephemeral
+//! attributes stripped) plus its `pPr` and run properties, spliced before
+//! the next surviving baseline paragraph — and a deleted paragraph is
+//! simply not rendered. Both live in `structure.json` and are validated by
+//! the same fail-closed gate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 
@@ -1834,6 +1842,516 @@ pub fn validate_islands(template: &Path, edits: &[IslandEdit]) -> Result<(), Cor
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Structural edits (new / deleted paragraphs)
+// ---------------------------------------------------------------------------
+//
+// An island edit replaces bytes inside an EXISTING leaf; a new paragraph has
+// no baseline byte range at all (`base=""`), so it needs a synthesis path
+// instead. Mirror of the Python reference (`typed_docx.py`
+// `_render_paragraph` / `_new_paragraph_opening` / `_paragraph_placements`):
+// the new `w:p` copies the inherit paragraph's opening tag (ephemeral
+// attributes stripped) and its `<w:pPr>` verbatim, renders its own run, and
+// is spliced before the next surviving baseline paragraph (or appended when
+// none follows). A deleted paragraph is simply not rendered.
+
+pub const STRUCTURE_SCHEMA: &str = "docx2typed-structure-1";
+pub const STRUCTURE_FILE: &str = "structure.json";
+
+/// Paragraph opening attributes that are per-extraction ephemeral: the
+/// synthesised paragraph must not inherit another paragraph's revision or
+/// identity markers (`typed_docx.py` `_EPHEMERAL_P_ATTRS`).
+const EPHEMERAL_P_ATTRS: [&str; 7] = [
+    "paraId",
+    "textId",
+    "rsidP",
+    "rsidR",
+    "rsidRDefault",
+    "rsidDel",
+    "rsidRPr",
+];
+
+/// One synthesised paragraph: rendered from the `inherit` baseline
+/// paragraph and spliced before `insert_before` (None = append).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NewParagraph {
+    /// Part key ("document"); container parts are out of scope.
+    pub part: String,
+    /// Typed paragraph id — the draft temp id is kept (`N1`), never
+    /// reallocated to a `P` slot (mirror of `original_index = -1`).
+    pub paragraph_id: String,
+    /// Baseline paragraph whose opening tag, `pPr`, and run properties are
+    /// copied.
+    pub inherit: String,
+    /// Plain-text body (XML-escaped on write).
+    pub body: String,
+    /// Baseline id the new paragraph is spliced before; None = append.
+    #[serde(default)]
+    pub insert_before: Option<String>,
+}
+
+/// One removed baseline paragraph: not rendered, so its `w:p` disappears.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeletedParagraph {
+    pub part: String,
+    pub paragraph_id: String,
+}
+
+/// The structural-edit sidecar of one workdir.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructureEdits {
+    #[serde(default)]
+    pub new_paragraphs: Vec<NewParagraph>,
+    #[serde(default)]
+    pub deleted_paragraphs: Vec<DeletedParagraph>,
+}
+
+impl StructureEdits {
+    pub fn is_empty(&self) -> bool {
+        self.new_paragraphs.is_empty() && self.deleted_paragraphs.is_empty()
+    }
+}
+
+/// Read the structural-edit sidecar of a workdir (missing file = none).
+pub fn load_structure(root: &Path) -> Result<StructureEdits, CoreError> {
+    let path = root.join(STRUCTURE_FILE);
+    if !path.is_file() {
+        return Ok(StructureEdits::default());
+    }
+    let bytes = std::fs::read(&path).map_err(CoreError::io)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| CoreError::Domain(format!("invalid structure.json: {error}")))?;
+    if value.get("schema").and_then(|v| v.as_str()) != Some(STRUCTURE_SCHEMA) {
+        return Err(CoreError::Domain(format!(
+            "incompatible structure.json schema: {}",
+            value
+                .get("schema")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing")
+        )));
+    }
+    serde_json::from_value(value)
+        .map_err(|error| CoreError::Domain(format!("invalid structure.json: {error}")))
+}
+
+/// Persist the structural-edit sidecar (indent-2 JSON + trailing newline,
+/// matching the other workdir sidecars). A sidecar that records nothing is
+/// removed instead of written: "missing file" and "no structural edits"
+/// must not be two different states.
+pub fn save_structure(root: &Path, edits: &StructureEdits) -> Result<(), CoreError> {
+    let path = root.join(STRUCTURE_FILE);
+    if edits.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CoreError::io(error)),
+        };
+    }
+    let mut value = serde_json::to_value(edits).expect("structure serialize");
+    value["schema"] = serde_json::Value::String(STRUCTURE_SCHEMA.to_string());
+    let mut json = serde_json::to_string_pretty(&value).expect("structure serialize");
+    json.push('\n');
+    std::fs::write(path, json).map_err(CoreError::io)
+}
+
+/// The protected-structure reason for one template paragraph, or None when
+/// it is plain prose. Absent ids are also None (callers own existence
+/// checks). Mirror of `typed_docx.py` `section_bearing or
+/// _contains_structural(nodes)`.
+pub fn paragraph_protection(
+    workdir: &Path,
+    paragraph_id: &str,
+) -> Result<Option<String>, CoreError> {
+    let package = std::fs::read(workdir.join("_template.docx")).map_err(CoreError::io)?;
+    let part = read_part_bytes(&package, &part_path("document"))?;
+    let located = scan_document(&part)?;
+    let Some((start, end)) = located
+        .iter()
+        .find(|(id, _, _)| id == paragraph_id)
+        .map(|(_, start, end)| (*start, *end))
+    else {
+        return Ok(None);
+    };
+    let inventory = enumerate_package_bytes(&package)?;
+    Ok(structure_reason(
+        &part,
+        &inventory,
+        paragraph_id,
+        start,
+        end,
+    ))
+}
+
+/// Why a paragraph's own structure is immutable, or None when it is plain
+/// prose. Section properties, tracked-revision containers, anchors, nested
+/// tables, and opaque interiors (fields/math/drawings/proofErr) all refuse.
+fn structure_reason(
+    part: &[u8],
+    inventory: &ProseInventory,
+    paragraph_id: &str,
+    start: usize,
+    end: usize,
+) -> Option<String> {
+    for tag in scan_tags(&part[start..end]) {
+        match tag.name.as_str() {
+            "sectPr" => return Some("section properties".to_string()),
+            "ins" | "del" | "moveFrom" | "moveTo" => return Some("tracked revisions".to_string()),
+            "bookmarkStart" | "bookmarkEnd" | "commentRangeStart" | "commentRangeEnd" => {
+                return Some("anchors".to_string())
+            }
+            "tbl" => return Some("nested tables".to_string()),
+            _ => {}
+        }
+    }
+    if inventory
+        .opaques
+        .iter()
+        .any(|opaque| opaque.paragraph_id == paragraph_id)
+    {
+        return Some("structural content".to_string());
+    }
+    None
+}
+
+fn container_paragraph_error(paragraph_id: &str) -> CoreError {
+    CoreError::Domain(format!(
+        "table-structure-immutable: paragraphs cannot be added to or removed from tables, \
+         text boxes, or header/footer/note parts ({paragraph_id}); container structure \
+         operations are out of scope"
+    ))
+}
+
+/// Validate every recorded structural edit against the workdir template:
+/// the inherit/deleted paragraph must be an existing body paragraph with no
+/// protected structure. Any failure rejects the whole build with no output.
+pub fn validate_structure(template: &Path, edits: &StructureEdits) -> Result<(), CoreError> {
+    if edits.is_empty() {
+        return Ok(());
+    }
+    validate_package(template)?;
+    let package = std::fs::read(template).map_err(CoreError::io)?;
+    let part = read_part_bytes(&package, &part_path("document"))?;
+    let located = scan_document(&part)?;
+    let inventory = enumerate_package_bytes(&package)?;
+    let range_of = |id: &str| {
+        located
+            .iter()
+            .find(|(paragraph_id, _, _)| paragraph_id == id)
+            .map(|(_, start, end)| (*start, *end))
+    };
+    for paragraph in &edits.new_paragraphs {
+        if paragraph.part != "document" {
+            return Err(container_paragraph_error(&paragraph.paragraph_id));
+        }
+        let Some((start, end)) = range_of(&paragraph.inherit) else {
+            return Err(CoreError::Domain(format!(
+                "invalid-structure: new paragraph requires an existing inherit paragraph: \
+                 {} (inherits {})",
+                paragraph.paragraph_id, paragraph.inherit
+            )));
+        };
+        if !paragraph.inherit.starts_with('P') {
+            return Err(container_paragraph_error(&paragraph.inherit));
+        }
+        if let Some(reason) = structure_reason(&part, &inventory, &paragraph.inherit, start, end) {
+            return Err(CoreError::Domain(format!(
+                "invalid-structure: new paragraph cannot inherit protected structure: {} \
+                 (inherits {}: {reason})",
+                paragraph.paragraph_id, paragraph.inherit
+            )));
+        }
+        if let Some(anchor) = &paragraph.insert_before {
+            if range_of(anchor).is_none() {
+                return Err(CoreError::Domain(format!(
+                    "invalid-structure: unknown insert_before paragraph: {anchor}"
+                )));
+            }
+        }
+    }
+    for paragraph in &edits.deleted_paragraphs {
+        if paragraph.part != "document" {
+            return Err(container_paragraph_error(&paragraph.paragraph_id));
+        }
+        let Some((start, end)) = range_of(&paragraph.paragraph_id) else {
+            return Err(CoreError::Domain(format!(
+                "invalid-structure: deleted paragraph not found: {}",
+                paragraph.paragraph_id
+            )));
+        };
+        if !paragraph.paragraph_id.starts_with('P') {
+            return Err(container_paragraph_error(&paragraph.paragraph_id));
+        }
+        if let Some(reason) =
+            structure_reason(&part, &inventory, &paragraph.paragraph_id, start, end)
+        {
+            return Err(CoreError::Domain(format!(
+                "invalid-structure: paragraph with protected structure cannot be deleted: {} \
+                 ({reason})",
+                paragraph.paragraph_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The byte offset a new paragraph with no following baseline paragraph is
+/// appended at: the body-level `w:sectPr` start, else just before
+/// `</w:body>` (mirror of Python's `template_count` slot, which lands after
+/// every body-level unit and before the section properties).
+fn body_append_offset(xml: &[u8]) -> Result<usize, CoreError> {
+    fn find(nodes: &[ElementNode], index: usize, name: &str) -> Option<usize> {
+        if nodes[index].name == name {
+            return Some(index);
+        }
+        nodes[index]
+            .children
+            .iter()
+            .find_map(|&child| find(nodes, child, name))
+    }
+    let tags = scan_tags(xml);
+    let nodes = build_tree(&tags)?;
+    let body = (0..nodes.len())
+        .find_map(|root| find(&nodes, root, "body"))
+        .ok_or_else(|| CoreError::Domain("document XML has no body element".to_string()))?;
+    for &child in &nodes[body].children {
+        if nodes[child].name == "sectPr" {
+            return Ok(nodes[child].open_start);
+        }
+    }
+    Ok(nodes[body].close_start)
+}
+
+/// Render one synthesised `w:p`: the inherit paragraph's opening tag with
+/// ephemeral attributes stripped, its `pPr` verbatim, and one run carrying
+/// the inherit paragraph's run properties (`typed_docx.py`
+/// `_render_paragraph` + `_new_paragraph_opening`).
+fn render_new_paragraph(
+    part: &[u8],
+    inventory: &ProseInventory,
+    located: &[(String, usize, usize)],
+    paragraph: &NewParagraph,
+) -> Result<Vec<u8>, CoreError> {
+    let (start, end) = located
+        .iter()
+        .find(|(id, _, _)| id == &paragraph.inherit)
+        .map(|(_, start, end)| (*start, *end))
+        .ok_or_else(|| {
+            CoreError::Domain(format!(
+                "invalid-structure: new paragraph requires an existing inherit paragraph: \
+                 {} (inherits {})",
+                paragraph.paragraph_id, paragraph.inherit
+            ))
+        })?;
+    let inherit = &part[start..end];
+    let tags = scan_tags(inherit);
+    let nodes = build_tree(&tags)?;
+    let root = nodes
+        .first()
+        .ok_or_else(|| CoreError::Domain("malformed paragraph XML".to_string()))?;
+    let mut opening = inherit[..root.open_end].to_vec();
+    if root.self_closing {
+        // `<w:p .../>` cannot be reopened: drop the `/` to keep the tag open.
+        opening.pop();
+    }
+    let ppr = root
+        .children
+        .iter()
+        .find(|&&child| nodes[child].name == "pPr")
+        .map(|&child| &inherit[nodes[child].open_start..nodes[child].end])
+        .unwrap_or_default();
+    let rpr = inventory
+        .leaves
+        .iter()
+        .find(|leaf| leaf.paragraph_id == paragraph.inherit && leaf.leaf_index == 0)
+        .map(|leaf| leaf.rpr.as_str())
+        .unwrap_or("");
+    let mut out = strip_ephemeral_p_attrs(&opening);
+    out.extend_from_slice(ppr);
+    if !paragraph.body.is_empty() {
+        out.extend_from_slice(b"<w:r>");
+        out.extend_from_slice(rpr.as_bytes());
+        let space = if needs_xml_space(&paragraph.body) {
+            " xml:space=\"preserve\""
+        } else {
+            ""
+        };
+        out.extend_from_slice(format!("<w:t{space}>").as_bytes());
+        out.extend_from_slice(xml_escape(&paragraph.body).as_bytes());
+        out.extend_from_slice(b"</w:t></w:r>");
+    }
+    out.extend_from_slice(b"</w:p>");
+    Ok(out)
+}
+
+fn attr_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+}
+
+/// Match one `\s+name\s*=\s*"value"` attribute at `start`, returning its end
+/// offset and qname (mirror of `_P_ATTR_RE`; unquoted values do not match).
+fn match_p_attr(bytes: &[u8], start: usize) -> Option<(usize, String)> {
+    let mut index = start;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index == start {
+        return None;
+    }
+    let name_start = index;
+    if !matches!(bytes.get(index), Some(byte) if byte.is_ascii_alphabetic() || *byte == b'_') {
+        return None;
+    }
+    index += 1;
+    while index < bytes.len() && attr_name_byte(bytes[index]) {
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b':') {
+        index += 1;
+        if !matches!(bytes.get(index), Some(byte) if byte.is_ascii_alphabetic() || *byte == b'_') {
+            return None;
+        }
+        index += 1;
+        while index < bytes.len() && attr_name_byte(bytes[index]) {
+            index += 1;
+        }
+    }
+    let name = String::from_utf8_lossy(&bytes[name_start..index]).into_owned();
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'=') {
+        return None;
+    }
+    index += 1;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    let quote = *bytes.get(index)?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    index += 1;
+    while index < bytes.len() && bytes[index] != quote {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&quote) {
+        return None;
+    }
+    index += 1;
+    Some((index, name))
+}
+
+/// Copy one paragraph opening tag, dropping the ephemeral attributes
+/// (mirror of `_new_paragraph_opening`).
+fn strip_ephemeral_p_attrs(opening: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(opening.len());
+    let mut index = 0usize;
+    while index < opening.len() {
+        if opening[index].is_ascii_whitespace() {
+            if let Some((end, name)) = match_p_attr(opening, index) {
+                let local = name.rsplit(':').next().unwrap_or(&name);
+                if EPHEMERAL_P_ATTRS.contains(&local) {
+                    index = end;
+                    continue;
+                }
+                out.extend_from_slice(&opening[index..end]);
+                index = end;
+                continue;
+            }
+        }
+        out.push(opening[index]);
+        index += 1;
+    }
+    out
+}
+
+/// Splice the structural edits into one document part: deleted paragraphs
+/// are dropped, synthesised paragraphs land before the next surviving
+/// baseline paragraph (or at the append offset).
+fn splice_structure(
+    part: &[u8],
+    inventory: &ProseInventory,
+    edits: &StructureEdits,
+) -> Result<Vec<u8>, CoreError> {
+    let located = scan_document(part)?;
+    let index_of: BTreeMap<&str, usize> = located
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _, _))| (id.as_str(), index))
+        .collect();
+    let deleted: BTreeSet<&str> = edits
+        .deleted_paragraphs
+        .iter()
+        .map(|paragraph| paragraph.paragraph_id.as_str())
+        .collect();
+    let append_at = body_append_offset(part)?;
+    let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    for paragraph in &edits.deleted_paragraphs {
+        let index = index_of[paragraph.paragraph_id.as_str()];
+        let (_, start, end) = &located[index];
+        spans.push((*start, *end, Vec::new()));
+    }
+    for paragraph in &edits.new_paragraphs {
+        let at = match &paragraph.insert_before {
+            None => append_at,
+            Some(anchor) => {
+                // The anchor may itself have been deleted since the insert
+                // was committed: fall forward to the next surviving one.
+                let mut target = None;
+                let mut index = index_of.get(anchor.as_str()).copied();
+                while let Some(current) = index {
+                    let (id, start, _) = &located[current];
+                    if !deleted.contains(id.as_str()) {
+                        target = Some(*start);
+                        break;
+                    }
+                    index = Some(current + 1);
+                }
+                target.unwrap_or(append_at)
+            }
+        };
+        spans.push((
+            at,
+            at,
+            render_new_paragraph(part, inventory, &located, paragraph)?,
+        ));
+    }
+    spans.sort_by_key(|(start, end, _)| (*start, *end));
+    let mut out = Vec::with_capacity(part.len());
+    let mut cursor = 0usize;
+    for (start, end, replacement) in spans {
+        if start < cursor || end < start {
+            return Err(CoreError::Domain(
+                "invalid-structure: overlapping paragraph splices".to_string(),
+            ));
+        }
+        out.extend_from_slice(&part[cursor..start]);
+        out.extend_from_slice(&replacement);
+        cursor = end;
+    }
+    out.extend_from_slice(&part[cursor..]);
+    Ok(out)
+}
+
+/// The full edited build: island leaf surgery first, then the structural
+/// synthesis over the result. Both sides validate against the template
+/// before any byte moves.
+pub fn apply_build(
+    template: &Path,
+    islands: &[IslandEdit],
+    structure: &StructureEdits,
+) -> Result<Vec<u8>, CoreError> {
+    let package = apply_edits(template, islands)?;
+    if structure.is_empty() {
+        return Ok(package);
+    }
+    validate_structure(template, structure)?;
+    let part = read_part_bytes(&package, &part_path("document"))?;
+    let inventory = enumerate_package_bytes(&package)?;
+    let new_part = splice_structure(&part, &inventory, structure)?;
+    patch_zip_member(&package, &part_path("document"), &new_part)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1851,6 +2369,119 @@ mod tests {
             .iter()
             .map(|paragraph| paragraph.paragraph_id.clone())
             .collect()
+    }
+
+    #[test]
+    fn new_paragraphs_strip_ephemeral_opening_attributes() {
+        // `typed_docx.py` `_EPHEMERAL_P_ATTRS`: identity and revision marks
+        // never travel into a synthesised paragraph.
+        let ephemeral = b"<w:p w:rsidR=\"00A\" w:rsidRDefault=\"00B\" w14:paraId=\"1A2B\" \
+                          w:rsidP=\"00C\">";
+        assert_eq!(
+            String::from_utf8(strip_ephemeral_p_attrs(ephemeral)).unwrap(),
+            "<w:p>"
+        );
+        let kept = b"<w:p w:rsidR=\"00A\" w:style=\"Heading1\" w:rsidDel=\"00B\">";
+        assert_eq!(
+            String::from_utf8(strip_ephemeral_p_attrs(kept)).unwrap(),
+            "<w:p w:style=\"Heading1\">"
+        );
+    }
+
+    #[test]
+    fn an_empty_structure_sidecar_is_removed() {
+        let dir = std::env::temp_dir().join(format!("docx2typed-structure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let edits = StructureEdits {
+            new_paragraphs: vec![NewParagraph {
+                part: "document".to_string(),
+                paragraph_id: "N1".to_string(),
+                inherit: "P0".to_string(),
+                body: "正文".to_string(),
+                insert_before: None,
+            }],
+            deleted_paragraphs: Vec::new(),
+        };
+        save_structure(&dir, &edits).expect("save");
+        assert_eq!(load_structure(&dir).expect("load"), edits);
+        save_structure(&dir, &StructureEdits::default()).expect("clear");
+        assert!(!dir.join(STRUCTURE_FILE).is_file(), "empty sidecar removed");
+        assert_eq!(
+            load_structure(&dir).expect("load"),
+            StructureEdits::default()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn structure_edits_synthesise_and_drop_paragraphs() {
+        let template = fixture("plain.docx");
+        let edits = StructureEdits {
+            new_paragraphs: vec![NewParagraph {
+                part: "document".to_string(),
+                paragraph_id: "N1".to_string(),
+                inherit: "P0".to_string(),
+                body: "新段落 <文本>".to_string(),
+                insert_before: Some("P1".to_string()),
+            }],
+            deleted_paragraphs: vec![DeletedParagraph {
+                part: "document".to_string(),
+                paragraph_id: "P3".to_string(),
+            }],
+        };
+        validate_structure(&template, &edits).expect("valid structure edits");
+        let bytes = apply_build(&template, &[], &edits).expect("apply structure");
+        let package = std::io::Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(package).expect("zip");
+        let mut document = String::new();
+        archive
+            .by_name("word/document.xml")
+            .expect("document part")
+            .read_to_string(&mut document)
+            .expect("utf8");
+        // The new paragraph is spliced before P1 and XML-escaped.
+        assert!(document.contains(
+            "<w:p><w:r><w:t>新段落 &lt;文本&gt;</w:t></w:r></w:p>\
+             <w:p><w:r><w:t>实施例1采用 250 mg 剂量。</w:t></w:r></w:p>"
+        ));
+        // The deleted paragraph is not rendered.
+        assert!(!document.contains("结束段落。"));
+        assert!(document.contains("重复句子内容 重复句子内容。"));
+    }
+
+    #[test]
+    fn protected_structure_refuses_structural_edits() {
+        let package = std::fs::read(fixture("complex.docx")).expect("fixture");
+        let part = read_part_bytes(&package, &part_path("document")).expect("document part");
+        let inventory = enumerate_package_bytes(&package).expect("inventory");
+        let located = scan_document(&part).expect("scan");
+        let reason = |id: &str| {
+            let (start, end) = located
+                .iter()
+                .find(|(paragraph_id, _, _)| paragraph_id == id)
+                .map(|(_, start, end)| (*start, *end))
+                .expect("located paragraph");
+            structure_reason(&part, &inventory, id, start, end)
+        };
+        // P17 carries the section properties; P12 carries a field.
+        assert!(reason("P17").is_some_and(|why| why.contains("section properties")));
+        assert!(reason("P12").is_some_and(|why| why.contains("structural content")));
+        assert_eq!(reason("P0"), None);
+        let edits = StructureEdits {
+            new_paragraphs: Vec::new(),
+            deleted_paragraphs: vec![DeletedParagraph {
+                part: "document".to_string(),
+                paragraph_id: "P17".to_string(),
+            }],
+        };
+        let error = validate_structure(&fixture("complex.docx"), &edits).expect_err("must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("protected structure cannot be deleted"),
+            "{error}"
+        );
     }
 
     #[test]

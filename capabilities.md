@@ -52,6 +52,22 @@ workdir_open → list_paragraphs/get_paragraph
 → replace_text or batch_edit → diff_preview → commit_sync
 ```
 
+## Paragraph structure atoms
+
+```text
+insert_paragraph after_id=ID text=TEXT [inherit=ID]
+delete_paragraph paragraph_id=ID
+```
+
+`insert_paragraph` synthesises a new `<w:p>` from the `inherit` paragraph
+(its opening tag with ephemeral attributes stripped, its `pPr`, and its run
+properties), spliced before the next surviving baseline paragraph;
+`delete_paragraph` removes one. Both commit through `commit_sync` into
+`structure.json` and build into a real DOCX. The `inherit` and the deleted
+paragraph must be plain body prose: section-bearing paragraphs, tracked
+revisions, anchors, tables, and opaque interiors refuse rather than silently
+drop content.
+
 ## Revision atoms
 
 ```text

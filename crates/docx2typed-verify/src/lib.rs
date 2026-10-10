@@ -97,11 +97,12 @@ impl IndependentVerifier {
             }
         };
 
-        // The recorded island edits (the only mutation the output may
-        // implement). Read independently from the workdir sidecar.
+        // The recorded edits (the only mutation the output may implement).
+        // Read independently from the workdir sidecars.
         let islands = load_islands(&request.workdir).unwrap_or_default();
+        let structure = load_structure(&request.workdir).unwrap_or_default();
 
-        if islands.is_empty() {
+        if islands.is_empty() && structure.is_empty() {
             self.verify_noop(
                 &template,
                 &output_parts,
@@ -115,6 +116,7 @@ impl IndependentVerifier {
                 &request.output,
                 &output_parts,
                 &islands,
+                &structure,
                 &mut checks,
                 &template_sha256,
                 &output_sha256,
@@ -167,9 +169,10 @@ impl IndependentVerifier {
         }
     }
 
-    /// Issue #58 edited-build verification: independent re-walk of the
-    /// template bytes, recomputing the expected edited parts and comparing
-    /// them byte-for-byte with the output, plus the opaque replay check.
+    /// Issue #58 / PR 3 edited-build verification: independent re-walk of
+    /// the template bytes, recomputing the expected edited parts (leaf
+    /// surgery + structural synthesis) and comparing them byte-for-byte
+    /// with the output, plus the opaque replay check.
     #[allow(clippy::too_many_arguments)]
     fn verify_edited(
         &self,
@@ -177,6 +180,7 @@ impl IndependentVerifier {
         output: &Path,
         output_parts: &BTreeMap<String, String>,
         islands: &[IslandEdit],
+        structure: &StructureEdits,
         checks: &mut Vec<VerificationCheck>,
         template_sha256: &str,
         output_sha256: &str,
@@ -188,6 +192,9 @@ impl IndependentVerifier {
             std::collections::BTreeSet::new();
         for edit in islands {
             edited_part_paths.insert(part_path(&edit.part));
+        }
+        if !structure.is_empty() {
+            edited_part_paths.insert(part_path("document"));
         }
         let mut changed: Vec<String> = Vec::new();
         for (name, hash) in &template_parts {
@@ -234,14 +241,32 @@ impl IndependentVerifier {
             let output_part =
                 read_member_bytes(&std::fs::read(output).unwrap_or_default(), part_path)
                     .unwrap_or_default();
-            if edits.iter().any(|edit| edit.tracked) {
+            let structural = part_key == "document" && !structure.is_empty();
+            if edits.iter().any(|edit| edit.tracked) && !structural {
                 if let Err(message) = verify_tracked_part(&output_part, &edits) {
                     edited_exact = false;
                     edited_detail = format!("part {part_path}: {message}");
                 }
+            } else if edits.iter().any(|edit| edit.tracked) {
+                // PR 3 scope: tracked leaf revisions and paragraph-level
+                // structural edits are not combined; fail closed.
+                edited_exact = false;
+                edited_detail = format!(
+                    "part {part_path}: tracked edits cannot be combined with structural edits"
+                );
             } else {
                 match recompute_edited_part(&template_part, &edits) {
-                    Ok(expected) => {
+                    Ok(mut expected) => {
+                        if structural {
+                            match recompute_structure_part(&expected, structure) {
+                                Ok(spliced) => expected = spliced,
+                                Err(message) => {
+                                    edited_exact = false;
+                                    edited_detail = format!("part {part_path}: {message}");
+                                    continue;
+                                }
+                            }
+                        }
                         if expected != output_part {
                             edited_exact = false;
                             edited_detail = format!(
@@ -286,7 +311,17 @@ impl IndependentVerifier {
             let output_part =
                 read_member_bytes(&std::fs::read(output).unwrap_or_default(), part_path)
                     .unwrap_or_default();
-            match check_opaque_replay(&template_part, &output_part, &edits) {
+            // With structural edits the base for the shift walk is the
+            // island-applied part: the structural spans live in that space.
+            let replay = if part_key == "document" && !structure.is_empty() {
+                recompute_edited_part(&template_part, &edits).and_then(|applied| {
+                    let spans = structure_spans(&applied, structure)?;
+                    replay_opaque_blocks(&applied, &output_part, "document", &spans)
+                })
+            } else {
+                check_opaque_replay(&template_part, &output_part, &edits)
+            };
+            match replay {
                 Ok(()) => {}
                 Err(message) => {
                     opaque_locked = false;
@@ -464,6 +499,327 @@ fn part_path(part_key: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Independent structural re-walk (PR 3): new / deleted paragraphs
+// ---------------------------------------------------------------------------
+
+/// The structural-edit sidecar, parsed independently (never via Core).
+#[derive(Clone, Debug, Default)]
+struct StructureEdits {
+    new_paragraphs: Vec<NewParagraph>,
+    deleted: Vec<String>,
+}
+
+impl StructureEdits {
+    fn is_empty(&self) -> bool {
+        self.new_paragraphs.is_empty() && self.deleted.is_empty()
+    }
+}
+
+/// One recorded synthesised paragraph.
+#[derive(Clone, Debug)]
+struct NewParagraph {
+    inherit: String,
+    body: String,
+    insert_before: Option<String>,
+}
+
+const STRUCTURE_SCHEMA: &str = "docx2typed-structure-1";
+
+fn load_structure(workdir: &Path) -> Option<StructureEdits> {
+    let path = workdir.join("structure.json");
+    if !path.is_file() {
+        return Some(StructureEdits::default());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if value.get("schema").and_then(|v| v.as_str()) != Some(STRUCTURE_SCHEMA) {
+        return None;
+    }
+    let mut structure = StructureEdits::default();
+    for entry in value.get("new_paragraphs")?.as_array()? {
+        if entry.get("part").and_then(|v| v.as_str()) != Some("document") {
+            return None;
+        }
+        structure.new_paragraphs.push(NewParagraph {
+            inherit: entry.get("inherit")?.as_str()?.to_string(),
+            body: entry.get("body")?.as_str()?.to_string(),
+            insert_before: entry
+                .get("insert_before")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        });
+    }
+    for entry in value.get("deleted_paragraphs")?.as_array()? {
+        if entry.get("part").and_then(|v| v.as_str()) != Some("document") {
+            return None;
+        }
+        structure
+            .deleted
+            .push(entry.get("paragraph_id")?.as_str()?.to_string());
+    }
+    Some(structure)
+}
+
+/// The byte offset a new paragraph with no following baseline paragraph is
+/// appended at: the body-level `w:sectPr` start, else before `</w:body>`.
+fn body_append_offset(part: &[u8]) -> Result<usize, String> {
+    fn find(nodes: &[LightNode], index: usize, name: &str) -> Option<usize> {
+        if nodes[index].name == name {
+            return Some(index);
+        }
+        nodes[index]
+            .children
+            .iter()
+            .find_map(|&child| find(nodes, child, name))
+    }
+    let nodes = build_light_tree(&scan_tags(part))?;
+    let body = (0..nodes.len())
+        .find_map(|root| find(&nodes, root, "body"))
+        .ok_or("no body element")?;
+    for &child in &nodes[body].children {
+        if nodes[child].name == "sectPr" {
+            return Ok(nodes[child].open_start);
+        }
+    }
+    Ok(nodes[body].close_start)
+}
+
+/// The run properties of the inherit paragraph's first text run (the run
+/// the synthesised paragraph's own run copies).
+fn first_run_rpr(paragraph: &[u8], nodes: &[LightNode], root: usize) -> Option<String> {
+    fn walk(paragraph: &[u8], nodes: &[LightNode], index: usize) -> Option<String> {
+        let node = &nodes[index];
+        if node.name == "r" {
+            let has_text = node
+                .children
+                .iter()
+                .any(|&child| matches!(nodes[child].name.as_str(), "t" | "delText"));
+            if !has_text {
+                return None;
+            }
+            let rpr = node
+                .children
+                .iter()
+                .find(|&&child| nodes[child].name == "rPr")
+                .map(|&child| &paragraph[nodes[child].open_start..nodes[child].end])
+                .unwrap_or_default();
+            return Some(String::from_utf8_lossy(rpr).into_owned());
+        }
+        node.children
+            .iter()
+            .find_map(|&child| walk(paragraph, nodes, child))
+    }
+    walk(paragraph, nodes, root)
+}
+
+/// Render one synthesised `w:p` from the inherit paragraph (independent port
+/// of the writer: opening tag with ephemeral attributes stripped, `pPr`
+/// verbatim, one run carrying the inherited run properties).
+fn render_new_paragraph(
+    part: &[u8],
+    located: &[(String, usize, usize)],
+    paragraph: &NewParagraph,
+) -> Result<Vec<u8>, String> {
+    let (start, end) = located
+        .iter()
+        .find(|(id, _, _)| id == &paragraph.inherit)
+        .map(|(_, start, end)| (*start, *end))
+        .ok_or_else(|| format!("inherit paragraph not found: {}", paragraph.inherit))?;
+    let inherit = &part[start..end];
+    let nodes = build_light_tree(&scan_tags(inherit))?;
+    let root = nodes
+        .iter()
+        .position(|node| node.parent.is_none())
+        .ok_or("no paragraph root")?;
+    let mut opening = inherit[..nodes[root].open_end].to_vec();
+    if nodes[root].end == nodes[root].open_end {
+        // `<w:p .../>` cannot be reopened: drop the `/`.
+        opening.pop();
+    }
+    let ppr = nodes[root]
+        .children
+        .iter()
+        .find(|&&child| nodes[child].name == "pPr")
+        .map(|&child| &inherit[nodes[child].open_start..nodes[child].end])
+        .unwrap_or_default();
+    let rpr = first_run_rpr(inherit, &nodes, root).unwrap_or_default();
+    let mut out = strip_ephemeral_p_attrs(&opening);
+    out.extend_from_slice(ppr);
+    if !paragraph.body.is_empty() {
+        out.extend_from_slice(b"<w:r>");
+        out.extend_from_slice(rpr.as_bytes());
+        let space = if needs_xml_space(&paragraph.body) {
+            " xml:space=\"preserve\""
+        } else {
+            ""
+        };
+        out.extend_from_slice(format!("<w:t{space}>").as_bytes());
+        out.extend_from_slice(xml_escape(&paragraph.body).as_bytes());
+        out.extend_from_slice(b"</w:t></w:r>");
+    }
+    out.extend_from_slice(b"</w:p>");
+    Ok(out)
+}
+
+fn attr_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+}
+
+/// Match one `\s+name\s*=\s*"value"` attribute at `start` (unquoted values
+/// do not match).
+fn match_p_attr(bytes: &[u8], start: usize) -> Option<(usize, String)> {
+    let mut index = start;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index == start {
+        return None;
+    }
+    let name_start = index;
+    if !matches!(bytes.get(index), Some(byte) if byte.is_ascii_alphabetic() || *byte == b'_') {
+        return None;
+    }
+    index += 1;
+    while index < bytes.len() && attr_name_byte(bytes[index]) {
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b':') {
+        index += 1;
+        if !matches!(bytes.get(index), Some(byte) if byte.is_ascii_alphabetic() || *byte == b'_') {
+            return None;
+        }
+        index += 1;
+        while index < bytes.len() && attr_name_byte(bytes[index]) {
+            index += 1;
+        }
+    }
+    let name = String::from_utf8_lossy(&bytes[name_start..index]).into_owned();
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'=') {
+        return None;
+    }
+    index += 1;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    let quote = *bytes.get(index)?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    index += 1;
+    while index < bytes.len() && bytes[index] != quote {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&quote) {
+        return None;
+    }
+    index += 1;
+    Some((index, name))
+}
+
+/// Ephemeral paragraph opening attributes (never inherited).
+const EPHEMERAL_P_ATTRS: [&str; 7] = [
+    "paraId",
+    "textId",
+    "rsidP",
+    "rsidR",
+    "rsidRDefault",
+    "rsidDel",
+    "rsidRPr",
+];
+
+/// Copy one paragraph opening tag, dropping the ephemeral attributes.
+fn strip_ephemeral_p_attrs(opening: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(opening.len());
+    let mut index = 0usize;
+    while index < opening.len() {
+        if opening[index].is_ascii_whitespace() {
+            if let Some((end, name)) = match_p_attr(opening, index) {
+                let local = name.rsplit(':').next().unwrap_or(&name);
+                if EPHEMERAL_P_ATTRS.contains(&local) {
+                    index = end;
+                    continue;
+                }
+                out.extend_from_slice(&opening[index..end]);
+                index = end;
+                continue;
+            }
+        }
+        out.push(opening[index]);
+        index += 1;
+    }
+    out
+}
+
+/// The byte spans one structural edit set produces in `part`: deletions
+/// (start, end, empty) and synthesised insertions (at, at, rendered).
+fn structure_spans(
+    part: &[u8],
+    structure: &StructureEdits,
+) -> Result<Vec<(usize, usize, Vec<u8>)>, String> {
+    let located = locate_paragraphs(part, "document")?;
+    let index_of: BTreeMap<&str, usize> = located
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _, _))| (id.as_str(), index))
+        .collect();
+    let deleted: std::collections::BTreeSet<&str> =
+        structure.deleted.iter().map(String::as_str).collect();
+    let append_at = body_append_offset(part)?;
+    let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    for id in &structure.deleted {
+        let index = *index_of
+            .get(id.as_str())
+            .ok_or_else(|| format!("deleted paragraph not found: {id}"))?;
+        let (_, start, end) = &located[index];
+        spans.push((*start, *end, Vec::new()));
+    }
+    for paragraph in &structure.new_paragraphs {
+        let at = match &paragraph.insert_before {
+            None => append_at,
+            Some(anchor) => {
+                let mut target = None;
+                let mut index = index_of.get(anchor.as_str()).copied();
+                while let Some(current) = index {
+                    let (id, start, _) = &located[current];
+                    if !deleted.contains(id.as_str()) {
+                        target = Some(*start);
+                        break;
+                    }
+                    index = Some(current + 1);
+                }
+                target.ok_or_else(|| format!("unknown insert_before paragraph: {anchor}"))?
+            }
+        };
+        spans.push((at, at, render_new_paragraph(part, &located, paragraph)?));
+    }
+    spans.sort_by_key(|(start, end, _)| (*start, *end));
+    Ok(spans)
+}
+
+/// Apply a sorted, non-overlapping span list to one part.
+fn apply_spans(part: &[u8], spans: &[(usize, usize, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(part.len());
+    let mut cursor = 0usize;
+    for (start, end, replacement) in spans {
+        if *start < cursor || end < start {
+            return Err("overlapping paragraph splices".to_string());
+        }
+        out.extend_from_slice(&part[cursor..*start]);
+        out.extend_from_slice(replacement);
+        cursor = *end;
+    }
+    out.extend_from_slice(&part[cursor..]);
+    Ok(out)
+}
+
+/// Independently recompute the structurally edited document part.
+fn recompute_structure_part(part: &[u8], structure: &StructureEdits) -> Result<Vec<u8>, String> {
+    apply_spans(part, &structure_spans(part, structure)?)
+}
+
 fn verify_tracked_part(output_part: &[u8], edits: &[&IslandEdit]) -> Result<(), String> {
     let xml = String::from_utf8_lossy(output_part);
     for edit in edits.iter().filter(|edit| edit.tracked) {
@@ -546,7 +902,6 @@ fn check_opaque_replay(
         .first()
         .map(|edit| edit.part.as_str())
         .unwrap_or("document");
-    let opaques = opaque_blocks(template_part, part_key)?;
     // Shifts contributed by edits at or before a byte position.
     let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
     for edit in edits {
@@ -560,6 +915,19 @@ fn check_opaque_replay(
         spans.push((start, end, xml_escape(&edit.new).into_bytes()));
     }
     spans.sort_by_key(|(start, _, _)| *start);
+    replay_opaque_blocks(template_part, output_part, part_key, &spans)
+}
+
+/// The shared opaque-replay walk: each opaque block of `base` must appear
+/// verbatim in the output at its shifted position, and no recorded span may
+/// cross one partially.
+fn replay_opaque_blocks(
+    base: &[u8],
+    output_part: &[u8],
+    part_key: &str,
+    spans: &[(usize, usize, Vec<u8>)],
+) -> Result<(), String> {
+    let opaques = opaque_blocks(base, part_key)?;
     for block in &opaques {
         let contains_edit = spans
             .iter()
@@ -590,7 +958,7 @@ fn check_opaque_replay(
         if out_start < 0 || out_end > output_part.len() as i64 {
             return Err(format!("opaque block {} out of range in output", block.tag));
         }
-        let expected = &template_part[block.start..block.end];
+        let expected = &base[block.start..block.end];
         let actual = &output_part[out_start as usize..out_end as usize];
         if expected != actual {
             return Err(format!(

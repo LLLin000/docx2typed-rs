@@ -73,5 +73,9 @@ name = "review60"
 path = "rust-tests/review60.rs"
 
 [[test]]
+name = "structure"
+path = "rust-tests/structure.rs"
+
+[[test]]
 name = "tracer62"
 path = "rust-tests/tracer62.rs"

@@ -228,6 +228,65 @@ fn marker_of(block: &str) -> Option<(String, String, String)> {
     None
 }
 
+/// One attribute value out of a marker line (`id`, `temp`, `inherit`).
+fn marker_attr(marker: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    marker
+        .split(&needle)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .map(str::to_string)
+}
+
+/// The committed typed.md marker for one draft block: a plain template
+/// paragraph records `<!--@p id="X"-->`; a synthesised paragraph keeps
+/// `base=""` and its `inherit` anchor, so a later commit re-synthesises it
+/// from the same baseline instead of dropping it (PR 3).
+fn committed_marker(id: &str, marker: &str) -> String {
+    match marker_attr(marker, "inherit") {
+        Some(inherit) if !inherit.is_empty() => {
+            format!("<!--@p id=\"{id}\" base=\"\" inherit=\"{inherit}\"/>")
+        }
+        _ => format!("<!--@p id=\"{id}\"-->"),
+    }
+}
+
+/// The inherit anchor recorded for a draft paragraph (the `@new` block's
+/// `inherit` attribute, or a synthesised `@p` block's).
+fn draft_inherit(blocks: &[String], id: &str) -> Option<String> {
+    blocks.iter().find_map(|block| {
+        let (_, block_id, marker) = marker_of(block)?;
+        (block_id == id)
+            .then(|| marker_attr(&marker, "inherit"))
+            .flatten()
+    })
+}
+
+/// The insertion anchor of a synthesised paragraph: the next following
+/// surviving baseline paragraph in draft order, else None (append) —
+/// mirror of Python's `_paragraph_placements`.
+fn next_live_paragraph(blocks: &[String], id: &str) -> Option<String> {
+    let mut deleted: Vec<String> = Vec::new();
+    for block in blocks {
+        if let Some((kind, block_id, _)) = marker_of(block) {
+            if kind == "delete" {
+                deleted.push(block_id);
+            }
+        }
+    }
+    let start = blocks
+        .iter()
+        .position(|block| marker_of(block).is_some_and(|(_, block_id, _)| block_id == id))?;
+    for block in &blocks[start + 1..] {
+        if let Some((kind, block_id, _)) = marker_of(block) {
+            if kind == "p" && !deleted.contains(&block_id) {
+                return Some(block_id);
+            }
+        }
+    }
+    None
+}
+
 /// The changed paragraph ids of one draft: the draft body vs the effective
 /// baseline (committed typed.md record where present, else the template
 /// inventory body). New blocks are always changed; delete markers are
@@ -554,6 +613,17 @@ fn record_island_operation(
         new,
         leaf_index,
     } = edit;
+    // A synthesised paragraph has no baseline leaf to replace: it is
+    // rendered from the inherit paragraph at build time, so its body is
+    // rewritten in the structure sidecar at commit instead (PR 3).
+    if docx2typed_core::prose::load_structure(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?
+        .new_paragraphs
+        .iter()
+        .any(|paragraph| paragraph.paragraph_id == paragraph_id)
+    {
+        return Ok(());
+    }
     let package = fs::read(workdir.join("_template.docx"))
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     let inventory = docx2typed_core::prose::enumerate_package_bytes(&package)
@@ -619,6 +689,21 @@ pub fn insert_paragraph(
         )
     })?;
     let resolved_inherit = inherit.unwrap_or(after_id).to_string();
+    // Fail closed before the draft is touched: a synthesised paragraph
+    // copies its inherit paragraph's opening and pPr, so that paragraph
+    // must be plain prose (no section properties, revisions, anchors, or
+    // opaque interiors).
+    if let Some(reason) =
+        docx2typed_core::prose::paragraph_protection(workdir, &resolved_inherit)
+            .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?
+    {
+        return Err(CollaborationError::new(
+            "invalid-structure",
+            format!(
+                "new paragraph cannot inherit protected structure: {resolved_inherit} ({reason})"
+            ),
+        ));
+    }
     let mut max_temp = 0usize;
     for block in &blocks {
         if let Some((kind, id, _)) = marker_of(block) {
@@ -662,6 +747,19 @@ pub fn delete_paragraph(workdir: &Path, paragraph_id: &str) -> Result<Value, Col
             format!("paragraph {paragraph_id} not found in the draft"),
         )
     })?;
+    // Fail closed before the draft is touched: a deleted paragraph is
+    // simply not rendered, which would silently drop any protected
+    // structure it carries (section properties, revisions, anchors).
+    if let Some(reason) = docx2typed_core::prose::paragraph_protection(workdir, paragraph_id)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?
+    {
+        return Err(CollaborationError::new(
+            "invalid-structure",
+            format!(
+                "paragraph with protected structure cannot be deleted: {paragraph_id} ({reason})"
+            ),
+        ));
+    }
     blocks.remove(index);
     blocks.push(format!("<!--@delete id=\"{paragraph_id}\"-->"));
     write_draft(workdir, &header, &blocks)?;
@@ -767,26 +865,15 @@ pub fn apply_projection_with_options(
         match kind.as_str() {
             "p" => {
                 let body = block_body(block);
-                let marker_line = if marker.contains("base=\"\"") {
-                    format!("<!--@p id=\"{id}\"-->")
-                } else {
-                    marker.clone()
-                };
-                typed.push_str(&format!(
-                    "{marker_line}
-{body}
-"
-                ));
+                typed.push_str(&format!("{}\n{body}\n", committed_marker(&id, &marker)));
             }
             "new" => {
-                // Formal paragraph allocation is a declared tracer
-                // deferral; new paragraphs commit under their temp id.
+                // The draft temp id IS the paragraph id (no reallocation,
+                // mirror of Python's `original_index = -1`); the inherit
+                // anchor rides along so a later commit can re-synthesise
+                // the paragraph from the same baseline.
                 let body = block_body(block);
-                typed.push_str(&format!(
-                    "<!--@p id=\"{id}\" base=\"\"-->
-{body}
-"
-                ));
+                typed.push_str(&format!("{}\n{body}\n", committed_marker(&id, &marker)));
             }
             "delete" => {
                 typed.push_str(&format!("<!--@delete id=\"{id}\"-->"));
@@ -822,7 +909,7 @@ pub fn apply_projection_with_options(
         }
         if let Some(rest) = trimmed.strip_prefix("<!--@new temp=\"") {
             let id = rest.split('"').next().unwrap_or("");
-            kept.push(format!("<!--@p id=\"{id}\"-->"));
+            kept.push(committed_marker(id, trimmed));
             continue;
         }
         kept.push(line.clone());
@@ -857,20 +944,73 @@ pub fn apply_projection_with_options(
     // so the recorded edits survive byte-identical replay.
     let mut islands = docx2typed_core::prose::load_islands(workdir)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let mut structure = docx2typed_core::prose::load_structure(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let mut recorded = 0usize;
+    let mut structured = false;
+    let committed = parse_typed_paragraphs(
+        &fs::read_to_string(workdir.join("typed.md"))
+            .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?,
+    );
     for id in &changed {
-        let Some(new_body) =
-            parse_typed_paragraphs(&fs::read_to_string(workdir.join("typed.md")).map_err(
-                |error| CollaborationError::new("workdir-unreadable", error.to_string()),
-            )?)
-            .remove(id)
-        else {
+        let Some(new_body) = committed.get(id) else {
+            // No committed @p record: the draft removed this paragraph.
+            // Deletion has no baseline byte range to rewrite either, so it
+            // is recorded as a structural edit (not rendered => gone).
+            if structure
+                .new_paragraphs
+                .iter()
+                .any(|paragraph| &paragraph.paragraph_id == id)
+            {
+                // A paragraph that was itself synthesised is dropped from
+                // the sidecar instead of becoming a deletion.
+                structure
+                    .new_paragraphs
+                    .retain(|paragraph| &paragraph.paragraph_id != id);
+                structured = true;
+            } else if !structure
+                .deleted_paragraphs
+                .iter()
+                .any(|paragraph| &paragraph.paragraph_id == id)
+            {
+                structure
+                    .deleted_paragraphs
+                    .push(docx2typed_core::prose::DeletedParagraph {
+                        part: "document".to_string(),
+                        paragraph_id: id.clone(),
+                    });
+                structured = true;
+            }
             continue;
         };
+        if let Some(paragraph) = structure
+            .new_paragraphs
+            .iter_mut()
+            .find(|paragraph| &paragraph.paragraph_id == id)
+        {
+            // Re-editing a synthesised paragraph rewrites its body in place.
+            if &paragraph.body != new_body {
+                paragraph.body = new_body.clone();
+                structured = true;
+            }
+            continue;
+        }
         let Some(old_body) = before.get(id) else {
+            // Not in the baseline: a synthesised paragraph. Its inherit
+            // anchor and insertion point come from the draft order.
+            structure
+                .new_paragraphs
+                .push(docx2typed_core::prose::NewParagraph {
+                    part: "document".to_string(),
+                    paragraph_id: id.clone(),
+                    inherit: draft_inherit(&blocks, id).unwrap_or_default(),
+                    body: new_body.clone(),
+                    insert_before: next_live_paragraph(&blocks, id),
+                });
+            structured = true;
             continue;
         };
-        if *old_body == new_body {
+        if old_body == new_body {
             continue;
         }
         if islands.iter().any(|edit| edit.paragraph_id == *id) {
@@ -882,7 +1022,7 @@ pub fn apply_projection_with_options(
             paragraph_id: id.clone(),
             leaf_index: 0,
             old: old_body.clone(),
-            new: new_body,
+            new: new_body.clone(),
             tracked,
             author: author.unwrap_or("").to_string(),
             date: date.unwrap_or("").to_string(),
@@ -891,6 +1031,10 @@ pub fn apply_projection_with_options(
     }
     if recorded > 0 {
         docx2typed_core::prose::save_islands(workdir, &islands)
+            .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    }
+    if structured {
+        docx2typed_core::prose::save_structure(workdir, &structure)
             .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     }
     Ok(changed)
