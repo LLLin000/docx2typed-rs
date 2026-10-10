@@ -13,15 +13,24 @@ external behaviour, safety boundaries, verifiability, and Agent usability.
 | `repro.sh` | minimal reproduction of the Phase-1 blockers |
 
 ## Frozen reference
+Two references exist and must not be conflated:
 
 ```
-reference  LLLin000/docx2typed    @ 1adcc9403cc830e899efe74c5ec41b11973b8c7c
-target     LLLin000/docx2typed-rs @ 324cd055096e841fd5c97757def982b91ed93e15
+feature reference  LLLin000/docx2typed @ 1adcc94  (current main -- behaviour to reach)
+runtime oracle     LLLin000/docx2typed @ c6a17a16 (tag v0.1.0-python-final -- what CI runs)
+target             LLLin000/docx2typed-rs @ 324cd05
 ```
 
-The plan cited `1a4d4885` for the reference; `main` has since taken two merges
-(#100 delivery evidence, #101 gate design). The lock uses `1adcc94` so the
-evidence contract is included. Update only deliberately, with a new lock.
+The oracle is pinned in `.github/workflows/rust-ci.yml`
+(`PINNED_PYTHON_REFERENCE_SHA`, fail-closed) and is **118 commits behind main**;
+it predates the `w:rPr` order fix (#98). So a *correct* Rust fix can still fail
+the oracle gate — that is a spec conflict to resolve by bumping the oracle, not
+by reintroducing the bug. See `matrix.md` §0.
+
+The plan cited a third, stale SHA (`1a4d4885`); `main` has since taken #100
+(delivery evidence) and #101 (gate design), so the lock uses `1adcc94`.
+Update only deliberately, with a new lock and a CI oracle revision if the
+behaviour change reaches the oracle.
 
 ## Regenerate
 

@@ -1,14 +1,37 @@
 # Rust ↔ Python parity matrix (Phase 1, PR 1)
 
-Reference (frozen): `LLLin000/docx2typed` @ `1adcc9403cc830e899efe74c5ec41b11973b8c7c`
+**Feature reference** (behaviour to reach): `LLLin000/docx2typed` @ `1adcc9403cc830e899efe74c5ec41b11973b8c7c`
+**Runtime oracle** (what Rust CI compares against): tag `v0.1.0-python-final` @ `c6a17a16963d36e8860f8952a56465e94b3bb53a`
 Target: `LLLin000/docx2typed-rs` @ `324cd055096e841fd5c97757def982b91ed93e15`
 
 Machine-readable: [`matrix.json`](matrix.json), [`python-lock.json`](python-lock.json).
 
-> Baseline note. The plan cited the reference at `1a4d4885`. `main` has since
-> absorbed two merges — **#100** (`docx2typed-delivery-1` delivery evidence) and
-> **#101** (gate design) — so the frozen reference here is `1adcc94`. Using the
-> older SHA would silently omit the delivery-evidence contract from the lock.
+> ### ⚠ Two different "Python references" exist — do not conflate them
+>
+> This was the most consequential finding of PR 1, and the plan treated the two
+> as one.
+>
+> | Concept | Commit | Age | Role |
+> |---|---|---|---|
+> | **Feature reference** | `1adcc94` = current `main` | today | the behaviour Rust must reach |
+> | **Runtime oracle** | `c6a17a16` = tag `v0.1.0-python-final` | 2026-08-14 | what Rust CI actually runs against |
+>
+> Rust CI pins the oracle **fail-closed** (`.github/workflows/rust-ci.yml`,
+> `PINNED_PYTHON_REFERENCE_SHA`). The two are **118 commits apart**, and the
+> oracle **predates the `w:rPr` order fix (#98)** — its `vertical_style_variant`
+> still does the buggy `root.append`.
+>
+> Consequences:
+> 1. "Rust matches Python" is ambiguous — it must be stated *which*.
+> 2. A defect fixed on `main` is **not** fixed in the oracle, so a Rust fix that
+>    is *correct* can still fail the oracle gate. That is a **real conflict**,
+>    not a Rust bug: the oracle must be bumped deliberately (a spec change), not
+>    worked around by reintroducing the bug.
+> 3. The plan's cited SHA `1a4d4885` was a third, stale value (main at plan
+>    writing, now superseded by #100 delivery evidence + #101 gate design).
+>
+> **PR 2 must decide the oracle-bump policy before touching any behaviour that
+> `main` fixed after 2026-08-14.**
 
 ## 1. Surface counts (verified, not estimated)
 

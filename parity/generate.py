@@ -111,6 +111,20 @@ def main() -> int:
         "reference": {
             "repo": "LLLin000/docx2typed",
             "commit": "1adcc9403cc830e899efe74c5ec41b11973b8c7c",
+            "role": "feature baseline: the behaviour Rust must reach (current main)",
+        },
+        "oracle": {
+            "repo": "LLLin000/docx2typed",
+            "tag": "v0.1.0-python-final",
+            "commit": "c6a17a16963d36e8860f8952a56465e94b3bb53a",
+            "role": "CI-pinned oracle: what Rust CI compares against at runtime",
+            "pinned_in": ".github/workflows/rust-ci.yml PINNED_PYTHON_REFERENCE_SHA",
+            "note": (
+                "DISTINCT from the feature reference: 118 commits behind main and "
+                "predates the rPr fix (#98). A defect fixed on main is NOT fixed in "
+                "the oracle; Rust must implement the correct behaviour and the "
+                "oracle must be bumped deliberately."
+            ),
         },
         "target": {
             "repo": "LLLin000/docx2typed-rs",
