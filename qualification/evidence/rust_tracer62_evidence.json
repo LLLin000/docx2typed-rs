@@ -1,473 +1,449 @@
 {
-    "release_ready":  false,
-    "branch":  "rust-tracer-62",
-    "issue":  "62",
-    "verdict":  "qualified-candidate-not-release-ready (Office save/reopen blocking cells not-run-no-host on this runner: no Word/Office COM host; documented, fail-closed)",
-    "checks_total":  42,
-    "checks":  [
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: inspect rc=0 success ready"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: migrate rc=0 success + manifest + evidence sidecar"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: manifest producer is docx2typed-rust"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: manifest source lineage identity recorded"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: legacy source byte-identical after migrate"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: prose edit text success (leaf P0.0)"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: store generation committed after edit"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: review lane revisions list success"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: comment list success"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: no comments to delete (patent fixture)"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: build success"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: independent verify success, all verifier checks pass"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: byte preservation - only word/document.xml changed, nothing added/removed"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: untouched parts byte-identical (16 of 17)"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[patent-shaped]: legacy source byte-identical after full chain (rollback asset intact)"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: inspect rc=0 success ready"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: migrate rc=0 success + manifest + evidence sidecar"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: manifest producer is docx2typed-rust"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: manifest source lineage identity recorded"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: legacy source byte-identical after migrate"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: prose edit text success (leaf P0.0)"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: store generation committed after edit"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: review lane revisions list success"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: comment list success"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: comment delete (review decision) success"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: build success"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: independent verify success, all verifier checks pass"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: byte preservation - only word/document.xml, word/comments.xml changed, nothing added/removed"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: untouched parts byte-identical (16 of 18)"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "docs[paper-shaped]: legacy source byte-identical after full chain (rollback asset intact)"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "cutover: install_binary.ps1 install rc=0"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "cutover: receipt schema + binary path absolute + hash matches"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "cutover: MCP config resolves ONLY the installed Rust binary absolute path"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "cutover: no python/uvx resolver in MCP config"
-                   },
-                   {
-                       "detail":  "actual=mcp.config.json,receipt.json,bin/docx2typed.exe; expected=bin/docx2typed.exe,receipt.json,mcp.config.json",
-                       "pass":  true,
-                       "name":  "cutover: production tree contains only binary + receipt + mcp config, no Python launcher"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "cutover: installed binary reports docx2typed-rust"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "cutover: production surfaces (SKILL/Installation/README) have no active Python fallback resolver"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "cutover: repo-root Python installers (install.ps1/install.sh) absent from tree"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "cutover: update keeps receipt hash + backup binary"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "cutover: rollback restores previous binary (receipt hash maintained)"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "cutover: receipt-safe uninstall leaves no files"
-                   },
-                   {
-                       "detail":  "",
-                       "pass":  true,
-                       "name":  "office: blocking save/reopen cells honestly not-run-no-host and fail closed"
-                   }
-               ],
-    "host":  "LAPTOP-A5DB6766",
-    "cutover":  {
-                    "installer":  "scripts/install_binary.ps1",
-                    "update_rollback_uninstall_ok":  true,
-                    "resolver":  "rust-absolute-path-only",
-                    "receipt_binary_sha256":  "fd29ab2324ddd1c0b949e1a40ece979ba1a678af0dc59d0c320567ff96ae6734",
-                    "mcp_config_path":  "C:\\Users\\Lin\\AppData\\Local\\Temp\\rust-tracer62-70b8f0db682644c5a4cbf4887250a04c\\prefix\\mcp.config.json",
-                    "python_launcher_in_tree":  false,
-                    "repo_root_python_installers_absent":  true,
-                    "mcp_command":  "C:\\Users\\Lin\\AppData\\Local\\Temp\\rust-tracer62-70b8f0db682644c5a4cbf4887250a04c\\prefix\\bin\\docx2typed.exe",
-                    "receipt_schema":  "docx2typed-install-receipt-1",
-                    "receipt_binary_path":  "C:\\Users\\Lin\\AppData\\Local\\Temp\\rust-tracer62-70b8f0db682644c5a4cbf4887250a04c\\prefix\\bin\\docx2typed.exe",
-                    "install_prefix":  "C:\\Users\\Lin\\AppData\\Local\\Temp\\rust-tracer62-70b8f0db682644c5a4cbf4887250a04c\\prefix",
-                    "production_surface_scan":  [
-                                                    {
-                                                        "python_fallback_hits":  [
-
-                                                                                 ],
-                                                        "file":  "SKILL.md"
-                                                    },
-                                                    {
-                                                        "python_fallback_hits":  [
-
-                                                                                 ],
-                                                        "file":  "Installation.md"
-                                                    },
-                                                    {
-                                                        "python_fallback_hits":  [
-
-                                                                                 ],
-                                                        "file":  "README.md"
-                                                    },
-                                                    {
-                                                        "python_fallback_hits":  [
-
-                                                                                 ],
-                                                        "file":  "README.zh-CN.md"
-                                                    }
-                                                ],
-                    "mcp_args":  [
-                                     "mcp"
-                                 ],
-                    "receipt_path":  "C:\\Users\\Lin\\AppData\\Local\\Temp\\rust-tracer62-70b8f0db682644c5a4cbf4887250a04c\\prefix\\receipt.json"
-                },
-    "checks_pass":  42,
-    "legacy":  {
-                   "fixtures":  [
-                                    {
-                                        "unchanged":  true,
-                                        "name":  "patent-shaped"
-                                    },
-                                    {
-                                        "unchanged":  true,
-                                        "name":  "paper-shaped"
-                                    }
-                                ],
-                   "note":  "Each legacy Python schema-1 workdir fixture is byte/hash-identical after the full Rust chain; the unchanged legacy source is the rollback asset, the migrate manifest records lineage, and the install lifecycle keeps a backup for rollback."
-               },
-    "deferrals":  {
-                      "telemetry":  "deferred until real cutover evidence exists (PRD #45 decision 38)",
-                      "long_term_oracle_policy":  "deferred; Python reference remains an offline oracle / diagnostic rollback asset only (PRD #45 decision 38)",
-                      "committee":  "deferred until real cutover evidence exists (PRD #45 decision 38)",
-                      "rollout_counts":  "deferred until real cutover evidence exists (PRD #45 decision 38)"
-                  },
-    "generated":  "2026-08-17T11:00:27.5899346Z",
-    "gate":  "qualification/rust_tracer62_gate.ps1",
-    "binary":  {
-                   "path":  "C:\\Users\\Lin\\dev\\docx2typed-rs\\target\\release\\docx2typed.exe",
-                   "sha256":  "fd29ab2324ddd1c0b949e1a40ece979ba1a678af0dc59d0c320567ff96ae6734",
-                   "version":  "0.1.0rc1"
-               },
-    "docs_matrix":  [
-                        {
-                            "fixture":  "patent-shaped",
-                            "legacy_unchanged_after_chain":  true,
-                            "output_docx_bytes":  829129,
-                            "untouched_parts":  16,
-                            "parts_total":  17,
-                            "legacy_source_tree_sha256":  "76b270c1a35eaba1da1265d6c175614621aae7e0d4f8ace18529c16d8f7f0f01",
-                            "changed_parts":  [
-                                                  "word/document.xml"
-                                              ],
-                            "parts_removed":  0,
-                            "operations":  [
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "inspect",
-                                                   "readiness":  "ready",
-                                                   "codes":  [
-
-                                                             ]
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "migrate",
-                                                   "operation_id":  "8aeed002abf33e4e43505bf4804445700a5ceeeb44f4531ba120bf9b2f84b5bb",
-                                                   "codes":  [
-
-                                                             ]
-                                               },
-                                               {
-                                                   "op":  "edit",
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "leaf":  "P0.0",
-                                                   "operation_id":  "63b27e2507434b534f81a3fe7e23aa679f26ab375ec13a468549ee6ef6203c28",
-                                                   "codes":  [
-
-                                                             ]
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "revisions-list",
-                                                   "count":  0
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "comment-list",
-                                                   "count":  0
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "build",
-                                                   "operation_id":  "f544ac2b984260ad4710ef052bf38fcc599603e3788508f07e347c528e02655a",
-                                                   "codes":  [
-
-                                                             ]
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "verify",
-                                                   "verifier_checks_total":  5,
-                                                   "verifier_checks_pass":  true
-                                               }
-                                           ],
-                            "parts_added":  0,
-                            "generation":  "a42ec38e01604333b9194986917ad151",
-                            "source_docx":  "corpus/release/patent-shaped.docx",
-                            "output_docx_sha256":  "d8fa031d05e890a110cc347c2da2e2b1db7ff9697e6764470fb936238362f5a7",
-                            "comment_count":  0,
-                            "legacy_workdir":  "qualification/rust_tracer62/fixtures/legacy/patent-shaped-workdir",
-                            "source_docx_sha256":  "44f29d55376a2936609a493105e718e30ae69e44d6d025756ab6a9a40cb06170"
-                        },
-                        {
-                            "fixture":  "paper-shaped",
-                            "legacy_unchanged_after_chain":  true,
-                            "output_docx_bytes":  830716,
-                            "untouched_parts":  16,
-                            "parts_total":  18,
-                            "legacy_source_tree_sha256":  "727993c9c1f444923468eb441a540a7556cddb379b34656cf3df49e76e0454e4",
-                            "changed_parts":  [
-                                                  "word/comments.xml",
-                                                  "word/document.xml"
-                                              ],
-                            "parts_removed":  0,
-                            "operations":  [
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "inspect",
-                                                   "readiness":  "ready",
-                                                   "codes":  [
-
-                                                             ]
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "migrate",
-                                                   "operation_id":  "e3668f1e86b5809dc1da1a04e640a057cebf7f6ed5a5d491be7591065f8c5e13",
-                                                   "codes":  [
-
-                                                             ]
-                                               },
-                                               {
-                                                   "op":  "edit",
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "leaf":  "P0.0",
-                                                   "operation_id":  "713fef844f489afa6d39a2eee326f9030930ef42861a934eed839a1b36a2b20f",
-                                                   "codes":  [
-
-                                                             ]
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "revisions-list",
-                                                   "count":  0
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "comment-list",
-                                                   "count":  3
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "comment-delete",
-                                                   "operation_id":  "d8cded4b73350ee5d13f64014d72f1e1914d915cf2ba2a7ad19235fd79cf0aec",
-                                                   "decision":  {
-                                                                    "action":  "comment-delete",
-                                                                    "comment_id":  "1"
-                                                                }
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "build",
-                                                   "operation_id":  "844c2326c3ccc38405255172e11f2958035b705fe72811d5f554f101e6a4bbcd",
-                                                   "codes":  [
-
-                                                             ]
-                                               },
-                                               {
-                                                   "outcome":  "success",
-                                                   "rc":  0,
-                                                   "op":  "verify",
-                                                   "verifier_checks_total":  5,
-                                                   "verifier_checks_pass":  true
-                                               }
-                                           ],
-                            "parts_added":  0,
-                            "generation":  "9f83f444199044b8b7843b0e518c2c0c",
-                            "source_docx":  "corpus/release/paper-shaped.docx",
-                            "output_docx_sha256":  "6c54fdc7df7533fa634293a31eb926102b7a53bf5fea223da2037fb43bdf32fe",
-                            "comment_count":  3,
-                            "legacy_workdir":  "qualification/rust_tracer62/fixtures/legacy/paper-shaped-workdir",
-                            "source_docx_sha256":  "a871e3cfb5c3227b6231886fe8b2431a1bb033f69c97aa3eafaf2842e52a3241"
-                        }
-                    ],
-    "schema":  "docx2typed-rust-qualification-62-1",
-    "office_matrix":  {
-                          "cells_total":  66,
-                          "blocking_summary":  {
-                                                   "blocking_cells_total":  66,
-                                                   "gate":  "fail",
-                                                   "blocking_cells_not_pass":  66,
-                                                   "reason":  "Office save/reopen cells not-run-no-host: no Word/Office COM host on this runner; the product remains a qualified candidate, not release-ready.",
-                                                   "blocking_cells_pass":  0
-                                               },
-                          "cells_not_run":  66,
-                          "evidence":  "qualification/evidence/rust_tracer62_evidence.json",
-                          "reason":  "Word/Office COM is not run on this host (no Word/Office host available; Office interop is out of scope for the Rust tracer). The blocking Office save/reopen acceptance cells are recorded honestly as not-run and fail closed, consistent with Python #52/#61.",
-                          "status":  "not-run-no-host",
-                          "cells_fail":  0
-                      }
+  "generated": "2026-10-10T20:57:26.9821164Z",
+  "checks_total": 42,
+  "verdict": "qualified-candidate-not-release-ready (Office save/reopen blocking cells not-run-no-host on this runner: no Word/Office COM host; documented, fail-closed)",
+  "issue": "62",
+  "release_ready": false,
+  "checks": [
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: inspect rc=0 success ready"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: migrate rc=0 success + manifest + evidence sidecar"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: manifest producer is docx2typed-rust"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: manifest source lineage identity recorded"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: legacy source byte-identical after migrate"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: prose edit text success (leaf P0.0)"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: store generation committed after edit"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: review lane revisions list success"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: comment list success"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: no comments to delete (patent fixture)"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: build success"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: independent verify success, all verifier checks pass"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: byte preservation - only word/document.xml changed, nothing added/removed"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: untouched parts byte-identical (16 of 17)"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[patent-shaped]: legacy source byte-identical after full chain (rollback asset intact)"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: inspect rc=0 success ready"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: migrate rc=0 success + manifest + evidence sidecar"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: manifest producer is docx2typed-rust"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: manifest source lineage identity recorded"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: legacy source byte-identical after migrate"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: prose edit text success (leaf P0.0)"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: store generation committed after edit"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: review lane revisions list success"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: comment list success"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: comment delete (review decision) success"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: build success"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: independent verify success, all verifier checks pass"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: byte preservation - only word/document.xml, word/comments.xml changed, nothing added/removed"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: untouched parts byte-identical (16 of 18)"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "docs[paper-shaped]: legacy source byte-identical after full chain (rollback asset intact)"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "cutover: install_binary.ps1 install rc=0"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "cutover: receipt schema + binary path absolute + hash matches"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "cutover: MCP config resolves ONLY the installed Rust binary absolute path"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "cutover: no python/uvx resolver in MCP config"
+    },
+    {
+      "detail": "actual=mcp.config.json,receipt.json,bin/docx2typed.exe; expected=bin/docx2typed.exe,receipt.json,mcp.config.json",
+      "pass": true,
+      "name": "cutover: production tree contains only binary + receipt + mcp config, no Python launcher"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "cutover: installed binary reports docx2typed-rust"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "cutover: production surfaces (SKILL/Installation/README) have no active Python fallback resolver"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "cutover: repo-root Python installers (install.ps1/install.sh) absent from tree"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "cutover: update keeps receipt hash + backup binary"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "cutover: rollback restores previous binary (receipt hash maintained)"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "cutover: receipt-safe uninstall leaves no files"
+    },
+    {
+      "detail": "",
+      "pass": true,
+      "name": "office: blocking save/reopen cells honestly not-run-no-host and fail closed"
+    }
+  ],
+  "office_matrix": {
+    "status": "not-run-no-host",
+    "cells_not_run": 66,
+    "blocking_summary": {
+      "gate": "fail",
+      "blocking_cells_pass": 0,
+      "reason": "Office save/reopen cells not-run-no-host: no Word/Office COM host on this runner; the product remains a qualified candidate, not release-ready.",
+      "blocking_cells_not_pass": 66,
+      "blocking_cells_total": 66
+    },
+    "evidence": "qualification/evidence/rust_tracer62_evidence.json",
+    "reason": "Word/Office COM is not run on this host (no Word/Office host available; Office interop is out of scope for the Rust tracer). The blocking Office save/reopen acceptance cells are recorded honestly as not-run and fail closed, consistent with Python #52/#61.",
+    "cells_fail": 0,
+    "cells_total": 66
+  },
+  "branch": "rust-tracer-62",
+  "checks_pass": 42,
+  "binary": {
+    "sha256": "0b1e1c20399a1d7d0d6edeffcf0b42c0b35847b976914a0d7e620b625a0684d3",
+    "version": "0.1.0rc1",
+    "path": "C:\\Users\\Lin\\dev\\rs-wt-ws\\target\\release\\docx2typed.exe"
+  },
+  "host": "LAPTOP-A5DB6766",
+  "legacy": {
+    "note": "Each legacy Python schema-1 workdir fixture is byte/hash-identical after the full Rust chain; the unchanged legacy source is the rollback asset, the migrate manifest records lineage, and the install lifecycle keeps a backup for rollback.",
+    "fixtures": [
+      {
+        "name": "patent-shaped",
+        "unchanged": true
+      },
+      {
+        "name": "paper-shaped",
+        "unchanged": true
+      }
+    ]
+  },
+  "deferrals": {
+    "rollout_counts": "deferred until real cutover evidence exists (PRD #45 decision 38)",
+    "committee": "deferred until real cutover evidence exists (PRD #45 decision 38)",
+    "long_term_oracle_policy": "deferred; Python reference remains an offline oracle / diagnostic rollback asset only (PRD #45 decision 38)",
+    "telemetry": "deferred until real cutover evidence exists (PRD #45 decision 38)"
+  },
+  "schema": "docx2typed-rust-qualification-62-1",
+  "cutover": {
+    "receipt_schema": "docx2typed-install-receipt-1",
+    "install_prefix": "C:\\Users\\Lin\\AppData\\Local\\Temp\\rust-tracer62-ee2c16a4bd5441e78ce1e0ab8ca7ba5c\\prefix",
+    "update_rollback_uninstall_ok": true,
+    "mcp_command": "C:\\Users\\Lin\\AppData\\Local\\Temp\\rust-tracer62-ee2c16a4bd5441e78ce1e0ab8ca7ba5c\\prefix\\bin\\docx2typed.exe",
+    "mcp_args": [
+      "mcp"
+    ],
+    "production_surface_scan": [
+      {
+        "python_fallback_hits": [],
+        "file": "SKILL.md"
+      },
+      {
+        "python_fallback_hits": [],
+        "file": "Installation.md"
+      },
+      {
+        "python_fallback_hits": [],
+        "file": "README.md"
+      },
+      {
+        "python_fallback_hits": [],
+        "file": "README.zh-CN.md"
+      }
+    ],
+    "python_launcher_in_tree": false,
+    "mcp_config_path": "C:\\Users\\Lin\\AppData\\Local\\Temp\\rust-tracer62-ee2c16a4bd5441e78ce1e0ab8ca7ba5c\\prefix\\mcp.config.json",
+    "installer": "scripts/install_binary.ps1",
+    "resolver": "rust-absolute-path-only",
+    "receipt_path": "C:\\Users\\Lin\\AppData\\Local\\Temp\\rust-tracer62-ee2c16a4bd5441e78ce1e0ab8ca7ba5c\\prefix\\receipt.json",
+    "repo_root_python_installers_absent": true,
+    "receipt_binary_sha256": "0b1e1c20399a1d7d0d6edeffcf0b42c0b35847b976914a0d7e620b625a0684d3",
+    "receipt_binary_path": "C:\\Users\\Lin\\AppData\\Local\\Temp\\rust-tracer62-ee2c16a4bd5441e78ce1e0ab8ca7ba5c\\prefix\\bin\\docx2typed.exe"
+  },
+  "docs_matrix": [
+    {
+      "generation": "d34b366a1b124399921d02da4f4ee06f",
+      "comment_count": 0,
+      "parts_added": 0,
+      "fixture": "patent-shaped",
+      "operations": [
+        {
+          "op": "inspect",
+          "codes": [],
+          "rc": 0,
+          "readiness": "ready",
+          "outcome": "success"
+        },
+        {
+          "op": "migrate",
+          "operation_id": "8aeed002abf33e4e43505bf4804445700a5ceeeb44f4531ba120bf9b2f84b5bb",
+          "rc": 0,
+          "codes": [],
+          "outcome": "success"
+        },
+        {
+          "operation_id": "63b27e2507434b534f81a3fe7e23aa679f26ab375ec13a468549ee6ef6203c28",
+          "rc": 0,
+          "outcome": "success",
+          "codes": [],
+          "leaf": "P0.0",
+          "op": "edit"
+        },
+        {
+          "op": "revisions-list",
+          "count": 0,
+          "rc": 0,
+          "outcome": "success"
+        },
+        {
+          "op": "comment-list",
+          "count": 0,
+          "rc": 0,
+          "outcome": "success"
+        },
+        {
+          "op": "build",
+          "operation_id": "f544ac2b984260ad4710ef052bf38fcc599603e3788508f07e347c528e02655a",
+          "rc": 0,
+          "codes": [],
+          "outcome": "success"
+        },
+        {
+          "op": "verify",
+          "rc": 0,
+          "verifier_checks_pass": true,
+          "verifier_checks_total": 5,
+          "outcome": "success"
+        }
+      ],
+      "parts_total": 17,
+      "changed_parts": [
+        "word/document.xml"
+      ],
+      "output_docx_sha256": "d8fa031d05e890a110cc347c2da2e2b1db7ff9697e6764470fb936238362f5a7",
+      "source_docx_sha256": "44f29d55376a2936609a493105e718e30ae69e44d6d025756ab6a9a40cb06170",
+      "parts_removed": 0,
+      "output_docx_bytes": 829129,
+      "legacy_unchanged_after_chain": true,
+      "source_docx": "corpus/release/patent-shaped.docx",
+      "legacy_source_tree_sha256": "76b270c1a35eaba1da1265d6c175614621aae7e0d4f8ace18529c16d8f7f0f01",
+      "untouched_parts": 16,
+      "legacy_workdir": "qualification/rust_tracer62/fixtures/legacy/patent-shaped-workdir"
+    },
+    {
+      "generation": "165f3bb4dd5449a698eeb85611328da6",
+      "comment_count": 3,
+      "parts_added": 0,
+      "fixture": "paper-shaped",
+      "operations": [
+        {
+          "op": "inspect",
+          "codes": [],
+          "rc": 0,
+          "readiness": "ready",
+          "outcome": "success"
+        },
+        {
+          "op": "migrate",
+          "operation_id": "e3668f1e86b5809dc1da1a04e640a057cebf7f6ed5a5d491be7591065f8c5e13",
+          "rc": 0,
+          "codes": [],
+          "outcome": "success"
+        },
+        {
+          "operation_id": "713fef844f489afa6d39a2eee326f9030930ef42861a934eed839a1b36a2b20f",
+          "rc": 0,
+          "outcome": "success",
+          "codes": [],
+          "leaf": "P0.0",
+          "op": "edit"
+        },
+        {
+          "op": "revisions-list",
+          "count": 0,
+          "rc": 0,
+          "outcome": "success"
+        },
+        {
+          "op": "comment-list",
+          "count": 3,
+          "rc": 0,
+          "outcome": "success"
+        },
+        {
+          "op": "comment-delete",
+          "decision": {
+            "action": "comment-delete",
+            "comment_id": "1"
+          },
+          "rc": 0,
+          "operation_id": "d8cded4b73350ee5d13f64014d72f1e1914d915cf2ba2a7ad19235fd79cf0aec",
+          "outcome": "success"
+        },
+        {
+          "op": "build",
+          "operation_id": "844c2326c3ccc38405255172e11f2958035b705fe72811d5f554f101e6a4bbcd",
+          "rc": 0,
+          "codes": [],
+          "outcome": "success"
+        },
+        {
+          "op": "verify",
+          "rc": 0,
+          "verifier_checks_pass": true,
+          "verifier_checks_total": 5,
+          "outcome": "success"
+        }
+      ],
+      "parts_total": 18,
+      "changed_parts": [
+        "word/comments.xml",
+        "word/document.xml"
+      ],
+      "output_docx_sha256": "6c54fdc7df7533fa634293a31eb926102b7a53bf5fea223da2037fb43bdf32fe",
+      "source_docx_sha256": "a871e3cfb5c3227b6231886fe8b2431a1bb033f69c97aa3eafaf2842e52a3241",
+      "parts_removed": 0,
+      "output_docx_bytes": 830716,
+      "legacy_unchanged_after_chain": true,
+      "source_docx": "corpus/release/paper-shaped.docx",
+      "legacy_source_tree_sha256": "727993c9c1f444923468eb441a540a7556cddb379b34656cf3df49e76e0454e4",
+      "untouched_parts": 16,
+      "legacy_workdir": "qualification/rust_tracer62/fixtures/legacy/paper-shaped-workdir"
+    }
+  ],
+  "gate": "qualification/rust_tracer62_gate.ps1"
 }

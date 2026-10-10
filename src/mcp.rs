@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 43] = [
+pub const TOOL_NAMES: [&str; 44] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -83,6 +83,7 @@ pub const TOOL_NAMES: [&str; 43] = [
     "history_diff",
     "history_blame",
     "history_verify",
+    "workspace_fork",
 ];
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
