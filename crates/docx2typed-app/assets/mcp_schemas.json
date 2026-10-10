@@ -832,5 +832,44 @@
   },
   "type": "object",
   "additionalProperties": false
+ },
+ "document_search": {
+  "properties": {
+   "case_sensitive": {
+    "default": false,
+    "title": "Case Sensitive",
+    "type": "boolean"
+   },
+   "context_chars": {
+    "default": 3000,
+    "title": "Context Chars",
+    "type": "integer"
+   },
+   "limit": {
+    "default": 20,
+    "title": "Limit",
+    "type": "integer"
+   },
+   "offset": {
+    "default": 0,
+    "title": "Offset",
+    "type": "integer"
+   },
+   "query": {
+    "title": "Query",
+    "type": "string"
+   },
+   "scope": {
+    "default": "all",
+    "title": "Scope",
+    "type": "string"
+   }
+  },
+  "required": [
+   "query"
+  ],
+  "title": "document_searchArguments",
+  "type": "object",
+  "additionalProperties": false
  }
 }

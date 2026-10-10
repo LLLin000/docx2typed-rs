@@ -65,7 +65,7 @@ function Add-Check([string]$Name, [bool]$Pass, [string]$Detail = "") {
 }
 
 $frozenNames = @($frozen.PSObject.Properties.Name | Sort-Object)
-Add-Check "tool count" ($tools.Count -eq 37 -and $frozenNames.Count -eq 37) "live=$($tools.Count) frozen=$($frozenNames.Count)"
+Add-Check "tool count" ($tools.Count -eq 38 -and $frozenNames.Count -eq 38) "live=$($tools.Count) frozen=$($frozenNames.Count)"
 $liveNames = @($tools | ForEach-Object { $_.name } | Sort-Object)
 Add-Check "tool names" (($liveNames -join "\n") -eq ($frozenNames -join "\n")) "live=$($liveNames -join ',')"
 

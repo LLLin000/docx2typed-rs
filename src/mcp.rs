@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 37] = [
+pub const TOOL_NAMES: [&str; 38] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -77,6 +77,7 @@ pub const TOOL_NAMES: [&str; 37] = [
     "build_docx",
     "verify_output",
     "history_list",
+    "document_search",
 ];
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
@@ -1390,6 +1391,69 @@ impl McpSession {
             }
         }
     }
+
+    /// Full-text search over the token-free edit projection. Each match is
+    /// the enclosing paragraph block plus its `match_ref`, so the caller can
+    /// hand that ref straight to `document_patch`/`format_span` — search is
+    /// where the addressing layer comes from.
+    fn document_search(&self, args: &Value, build_commit: &str) -> Value {
+        let Some(workdir) = self.workdir.as_deref() else {
+            return self.failure(
+                "document_search",
+                "workdir-not-open",
+                "no workdir open; call workdir_open first",
+                build_commit,
+            );
+        };
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+        // Search reads the edit projection, and a Rust-extracted workdir is
+        // header-only until a draft tool runs. Python's `extract` materialises
+        // the projection, so its read tools work immediately on a fresh
+        // workdir; ensuring it here (idempotent) gives the same behaviour
+        // instead of failing with `edit-state-missing`.
+        if let Err(error) = draft::ensure_projection(Path::new(workdir)) {
+            return self.failure("document_search", &error.code, &error.detail, build_commit);
+        }
+        let number = |name: &str, default: usize| {
+            args.get(name)
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(default)
+        };
+        match docx2typed_core::document_search::document_search(
+            Path::new(workdir),
+            query,
+            number("context_chars", 3000),
+            args.get("case_sensitive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            number("limit", 20),
+            number("offset", 0),
+            args.get("scope").and_then(Value::as_str).unwrap_or("all"),
+        ) {
+            Ok(data) => match serde_json::to_value(data) {
+                Ok(value) => self.success("document_search", value, build_commit),
+                Err(error) => self.failure(
+                    "document_search",
+                    "workdir-invalid",
+                    &error.to_string(),
+                    build_commit,
+                ),
+            },
+            Err(error) => {
+                // A domain failure carries `code: detail`; anything else is
+                // not a registered code (mirror of Python's convention).
+                let message = error.to_string();
+                let (code, detail) = match message.split_once(':') {
+                    Some((code, detail)) if !code.contains(' ') => {
+                        (code.to_string(), detail.trim().to_string())
+                    }
+                    _ => ("workdir-invalid".to_string(), message),
+                };
+                self.failure("document_search", &code, &detail, build_commit)
+            }
+        }
+    }
 }
 
 /// `draft_dirty`: the same freshness rule as `diff_preview`/`workdir_status`
@@ -1795,6 +1859,12 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
         }
         "history_list" => {
             let mut json = serde_json::to_string(&session.history_list(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "document_search" => {
+            let mut json = serde_json::to_string(&session.document_search(&args, build_commit))
                 .expect("serializes");
             json.insert_str(0, "OK ");
             json
