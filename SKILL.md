@@ -115,6 +115,7 @@ an offline oracle and diagnostic rollback asset.
 | `_template.docx` | immutable source package | no |
 | `edit.md` / `edit.state.json` | draft projection and freshness binding, when present | through edit seam |
 | `islands.json` | committed text edits the build applies and verify re-checks | no (written by `commit_sync`) |
+| `structure.json` | committed new/deleted paragraphs (synthesis + removal) the build applies and verify re-checks | no (written by `commit_sync`) |
 
 Never mix sidecars from different documents. Never overwrite the original DOCX.
 Use a new output path and, for decisions/table operations, a new workdir-out.

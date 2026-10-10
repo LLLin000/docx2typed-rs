@@ -106,18 +106,48 @@ Python 的 `insert_paragraph`（`mcp_server.py:4330`）与 `delete_paragraph`（
 
 ## 6. 设计点已冻结（来自 Python 源码解析，非推测）
 
-四个必须在动手前定死的点，已从 `scripts/typed_docx.py` 解析出答案：
+四个必须在动手前定死的点，已从 Python 源码解析出答案。
 
-### 8.1 新段落的 ID：**不重新分配，保留 `N` 编号**
+### 6.1 新段落的 ID：**提交时重新分配为下一个空闲 `P<n>`**
 
-Python 不做 `N1 → P<n>` 的改名。新段落由 **`original_index = -1`** 标记
-（`typed_docx.py:2858`），ID 本身保持 `N1`。
-Rust 现状（`<!--@p id="N1" base=""-->`）与此**一致**。
+> ⚠️ 本节初版断言「不重新分配，保留 `N` 编号」，并据此认为
+> 「commit_sync allocates the formal paragraph ID」这句提示是误导。
+> **该结论是错的**：这是我从 `original_index = -1`（`typed_docx.py:2858`，
+> 那是**渲染位置**标记）错误外推到了 **id** 上。实测 Python 后确认它**确实重新分配**。
 
-> 结论：Rust 的错误提示「commit_sync allocates the formal paragraph ID」措辞误导——
-> 并没有「正式 ID」这一分配动作。**无需改动 ID 策略。**
+权威实现（`scripts/edit_sync.py:1028`）：
 
-### 8.2 新段落的格式来源：**从 inherit 段落复制 `p_open` + `ppr`**
+```python
+def _next_paragraph_id(used: set[str]) -> str:
+    numbers = [int(value[1:]) for value in used if value.startswith("P") and value[1:].isdigit()]
+    return f"P{max(numbers, default=-1) + 1}"
+```
+
+- 取值 = 所有在用 id 中最大的 `P<n>` 加一；`used` 在**同一次提交内共享**，
+  所以插入两段会得到 `P1`、`P2`，而不是两个 `P1`。
+- 草稿的临时 id（`N1`）是**草稿局部记账**，**不会**进入 `typed.md`。
+- 实测对照（同一份文档，同一操作序列）：
+
+| | `commit_sync.changed_paragraph_ids` | `typed.md` 标记 |
+|---|---|---|
+| Python 参考 | `["P1"]` | `<!--@p id="P1" inherit="P0"-->` |
+| Rust（修复前） | `["N1"]` | `<!--@p id="N1" base="" inherit="P0"/>` |
+| Rust（修复后） | `["P1"]` | `<!--@p id="P1" inherit="P0"-->` |
+
+**标记语法**：Python 的解析器要求 `base` / `inherit` **恰好出现一个**
+（`typed_core`：「paragraph marker requires exactly one of base or inherit」）。
+Rust 修复前同时写了 `base=""` 与 `inherit="P0"`——按 Python 语法是**非法**的。
+
+**删除的记账**：删除一个**非基线**段落（即本谱系里新建的那个）**不留痕迹**。
+Python 的 `typed.md` 在 insert→commit→delete→commit 之后**没有** `@delete` 标记，
+`structure.json` 也不存在；只有基线段落被删才写 `@delete`。
+实测两端一致：产物都回到 `['第一段落 ABC']`。
+
+> 教训：`original_index` 是**渲染位置**的标记，与**id 分配**是两件事。
+> 把一处的观察外推到相邻概念，就得到了一条错误的「冻结决定」，
+> 并让实现照着错的目标写了一版。
+
+### 6.2 新段落的格式来源：**从 inherit 段落复制 `p_open` + `ppr`**
 
 `_render_paragraph`（`typed_docx.py:1547`）：
 
@@ -142,7 +172,7 @@ return (p_open + ppr + body + "</w:p>").encode("utf-8")
 | 继承段不得 `section_bearing` 或含结构节点 | `new paragraph cannot inherit protected structure` |
 | 新段落不得新增结构 token（修订容器、锚点） | `new paragraph cannot add structural tokens` |
 
-### 8.3 删除的表示：**不渲染即删除；受保护结构拒绝**
+### 6.3 删除的表示：**不渲染即删除；受保护结构拒绝**
 
 删除的 id 从 `live_paragraphs` 中移除（不进入渲染序列），产物中自然没有该 `<w:p>`。
 拒绝条件（`typed_docx.py:2864-2870`）：
@@ -154,7 +184,7 @@ if baseline.section_bearing or _contains_structural(baseline.nodes):
 
 （`comments.*` 的删除是 deliberate decision，单独放行。）
 
-### 8.4 新段落的**位置**：`insert_before` 下一个存活基线段
+### 6.4 新段落的**位置**：`insert_before` 下一个存活基线段
 
 `_paragraph_placements`（`typed_docx.py:1567`）：
 
@@ -164,7 +194,7 @@ if baseline.section_bearing or _contains_structural(baseline.nodes):
 
 即新段落**插在下一条存活基线段之前**，不是按草稿顺序盲插。
 
-### 8.5 两条路径的关系
+### 6.5 两条路径的关系
 
 Python 只有**一条**路径：`_render_paragraph` 对每个段落渲染；
 未触碰的段落走字节回放，触碰/新增的走合成。

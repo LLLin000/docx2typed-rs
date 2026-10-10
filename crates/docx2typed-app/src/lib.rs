@@ -788,16 +788,21 @@ impl Engine {
             // with verified backup; recovery rolls forward/back).
             return self.build_store_backed(context, &workdir, &plan, &output, &manifest_before);
         }
-        let published = if plan.edits.is_empty() {
+        let published = if plan.edits.is_empty() && plan.structure.is_empty() {
             match self.store.publish_build(&plan.template, &output) {
                 Ok(path) => path,
                 Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
             }
         } else {
-            // Issue #58: island-edit build — apply the recorded text
-            // surgery to the template bytes (revalidated here; plan_build
-            // already gated the whole build) and publish the result.
-            let bytes = match docx2typed_core::prose::apply_edits(&plan.template, &plan.edits) {
+            // Issue #58 / PR 3: edited build — apply the recorded leaf
+            // surgery and structural synthesis to the template bytes
+            // (revalidated here; plan_build already gated the whole build)
+            // and publish the result.
+            let bytes = match docx2typed_core::prose::apply_build(
+                &plan.template,
+                &plan.edits,
+                &plan.structure,
+            ) {
                 Ok(bytes) => bytes,
                 Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
             };
@@ -1967,17 +1972,18 @@ impl Engine {
         let evidence_path = PathBuf::from(format!("{}.evidence.json", output.to_string_lossy()));
         let template = plan.template.clone();
         let edits = plan.edits.clone();
+        let structure = plan.structure.clone();
         let out = output.to_path_buf();
         let manifest_before = manifest_before.to_string();
         let run = Box::new(move |_target: &Path, tx: &mut Transaction| {
             let staged = tx.staging("out.docx");
-            if edits.is_empty() {
+            if edits.is_empty() && structure.is_empty() {
                 fs::copy(&template, &staged).map_err(StoreError::Io)?;
             } else {
-                // Issue #58: island-edit build through the store: apply the
-                // recorded surgery to the template bytes (revalidated) and
-                // stage the result.
-                let bytes = docx2typed_core::prose::apply_edits(&template, &edits)
+                // Issue #58 / PR 3: edited build through the store: apply
+                // the recorded leaf surgery and structural synthesis to the
+                // template bytes (revalidated) and stage the result.
+                let bytes = docx2typed_core::prose::apply_build(&template, &edits, &structure)
                     .map_err(|error| StoreError::store("workdir-invalid", error.to_string()))?;
                 fs::write(&staged, bytes).map_err(StoreError::Io)?;
             }

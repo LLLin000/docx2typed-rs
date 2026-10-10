@@ -667,11 +667,25 @@ fn draft_replace_insert_delete_diff_commit_revert() {
         .find(|p| p["id"] == "P3")
         .expect("P3 listed as deleted");
     assert_eq!(p3["deleted"], true);
-    // commit: changed set = {P0, N1, P3}; header rebinds; state clean.
+    // commit: changed set = {P0, P3, <freshly allocated id>}. The draft works
+    // in temp ids, but the commit reallocates the temp id to the next free
+    // `P<n>` (mirror of Python's `_next_paragraph_id`) and reports THAT.
     let changed = draft::apply_projection(&wd).expect("commit");
     assert!(changed.contains(&"P0".to_string()));
-    assert!(changed.contains(&temp_id));
     assert!(changed.contains(&"P3".to_string()));
+    let allocated = changed
+        .iter()
+        .find(|id| **id != "P0" && **id != "P3")
+        .expect("one freshly allocated paragraph id")
+        .clone();
+    assert!(
+        allocated.starts_with('P'),
+        "the commit must report an allocated P-id, got {allocated}"
+    );
+    assert!(
+        !changed.contains(&temp_id),
+        "the draft temp id {temp_id} must not survive into the commit"
+    );
     let status = draft::workdir_status(&wd).expect("status");
     assert_eq!(status["state"], "clean");
     let text = fs::read_to_string(wd.join("edit.md")).expect("edit.md");

@@ -97,10 +97,10 @@ the plan plus what was verified here:
 
 | Area | Finding | Evidence |
 |---|---|---|
-| `insert_paragraph` | Rust writes a **temporary id** (`N{n}`) into the draft; commits via `commit_sync`; the plan reports the DOCX-build closure is incomplete | `review/draft.rs:574` returns `{"temp_id": …, "next": "commit_sync allocates the formal paragraph ID"}` |
-| `delete_paragraph` | Present in both; Rust must be checked for real removal + protected-structure refusal | `review/draft.rs` |
-| build path | `plan_build` is reported to treat `islands.json` local text edits as the main supported path | `core/lib.rs:344 plan_build`, `core/prose.rs:30 ISLANDS_FILE` |
-| `verify_output` | Rust `verify` crate is documented as no-op without `islands.json` | `verify/lib.rs:10` |
+| `insert_paragraph` | Rust writes a **temporary id** (`N{n}`) into the draft; commits via `commit_sync`; the DOCX-build closure is complete (synthesised `<w:p>`, PR 3) | `review/draft.rs` `insert_paragraph`, `core/prose.rs` `apply_structure` |
+| `delete_paragraph` | Present in both; Rust removes the paragraph for real and refuses protected structure (section properties, revisions, anchors, tables) | `review/draft.rs` `delete_paragraph`, `core/prose.rs` `structure_reason` |
+| build path | `plan_build` applies `islands.json` leaf surgery plus `structure.json` new/deleted paragraphs | `core/lib.rs` `plan_build`, `core/prose.rs` `apply_build` |
+| `verify_output` | Rust `verify` crate independently recomputes both edited paths; no-op only when neither sidecar exists | `verify/lib.rs` `verify_edited` |
 
 ## 5. Reference defects — must NOT be copied
 

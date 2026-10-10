@@ -57,6 +57,9 @@ pub struct BuildPlan {
     /// publication (empty = pristine replay). The edits were validated
     /// against the template during planning.
     pub edits: Vec<crate::prose::IslandEdit>,
+    /// PR 3: structural edits (new / deleted paragraphs) applied after the
+    /// island edits. Validated against the template during planning.
+    pub structure: crate::prose::StructureEdits,
 }
 
 /// Workdir metadata produced by validation, shared by build/verify/open.
@@ -349,7 +352,8 @@ pub fn plan_build(workdir: &Path) -> Result<BuildPlan, CoreError> {
     // the sidecar records edits, the pristine gate does not apply — the build
     // applies those edits to the template bytes instead of replaying them.
     let islands = crate::prose::load_islands(&meta.root)?;
-    if !meta.pristine && islands.is_empty() {
+    let structure = crate::prose::load_structure(&meta.root)?;
+    if !meta.pristine && islands.is_empty() && structure.is_empty() {
         return Err(CoreError::Domain(
             "workdir-invalid: typed edits are not implemented in the protocol-major-1 Rust slice (issue #55; edits land in #56+)".to_string(),
         ));
@@ -390,10 +394,17 @@ pub fn plan_build(workdir: &Path) -> Result<BuildPlan, CoreError> {
         // with no output.
         crate::prose::validate_islands(&meta.template, &islands)?;
     }
+    if !structure.is_empty() {
+        // PR 3: the same fail-closed gate for structural edits — the
+        // inherit/deleted paragraph must exist, be plain prose, and carry
+        // no protected structure; failure rejects the whole build.
+        crate::prose::validate_structure(&meta.template, &structure)?;
+    }
     Ok(BuildPlan {
         template: meta.template,
         replay: true,
         edits: islands,
+        structure,
     })
 }
 

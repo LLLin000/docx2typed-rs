@@ -1210,37 +1210,31 @@ impl McpSession {
         // Guard BEFORE the engine: a Python-extracted workdir has no
         // `typed_sha256` in format.json, so the engine treats it as pristine
         // and silently replays the template — dropping any committed typed
-        // edits. Committed edits recorded in islands.json ARE buildable
-        // (issue #58 path); only unrecorded divergence fails loudly here.
+        // edits. Committed edits recorded in the edit sidecars (islands.json
+        // leaf surgery, structure.json new/deleted paragraphs) ARE buildable;
+        // only UNRECORDED divergence fails loudly here.
+        //
+        // "Unrecorded" is asked of the content, not of `typed.md`'s bytes: a
+        // workdir whose committed paragraphs all still match the baseline has
+        // nothing for the replay to drop, even when materialising those bodies
+        // made `typed.md` differ from the header-only extract state. (Insert a
+        // paragraph, then delete it again: no sidecar survives and no edit is
+        // left, so that build must succeed.)
         let root = Path::new(&workdir);
-        let islands_cover_edits = root.join("islands.json").is_file();
-        let has_committed_edits = islands_cover_edits
-            || (|| -> Option<bool> {
-                let gens = root.join(".docx2typed-store").join("generations");
-                let earliest = std::fs::read_dir(&gens)
-                    .ok()?
-                    .filter_map(|entry| entry.ok())
-                    .map(|entry| entry.path())
-                    .filter(|path| path.join("typed.md").is_file())
-                    .min_by_key(|path| {
-                        path.join("typed.md")
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                    })?;
-                let extract_time =
-                    docx2typed_protocol::file_sha256(&earliest.join("typed.md")).ok()?;
-                let current = docx2typed_protocol::file_sha256(&root.join("typed.md")).ok()?;
-                Some(extract_time != current)
-            })()
-            .unwrap_or(false);
-        if has_committed_edits && !islands_cover_edits {
+        let sidecars_cover_edits = root.join("islands.json").is_file()
+            || root.join(docx2typed_core::prose::STRUCTURE_FILE).is_file();
+        let unrecorded_edits = if sidecars_cover_edits {
+            false
+        } else {
+            docx2typed_review::draft::has_unrecorded_typed_edits(root).unwrap_or(true)
+        };
+        if unrecorded_edits {
             return self.failure(
                 "build_docx",
                 "edits-not-implemented",
-                "this workdir has committed typed edits that are not recorded as island \
-                 edits; replaying the template would drop them — re-commit the draft or \
-                 build with the Python reference engine",
+                "this workdir has committed typed edits that are not recorded in the edit \
+                 sidecars (islands.json / structure.json); replaying the template would drop \
+                 them — re-commit the draft or build with the Python reference engine",
                 build_commit,
             );
         }
