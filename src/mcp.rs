@@ -17,6 +17,7 @@
 //! Hand-rolled blocking loop over serde_json — no tokio needed for a stdio
 //! tracer (issue #36: tokio only enters adapters when transports need it).
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -1866,12 +1867,110 @@ fn domain_code_from_message(message: &str) -> &'static str {
 
 /// Dispatch one tool call against the session; returns the CallToolResult
 /// payload (the same value the line protocol wraps in `OK <json>`).
+/// The declared parameters of one tool, from the frozen schema.
+fn declared_parameters(tool: &str) -> Option<BTreeSet<String>> {
+    let schemas: Value = serde_json::from_str(docx2typed_app::embedded::MCP_SCHEMAS_JSON).ok()?;
+    let properties = schemas.get(tool)?.get("properties")?.as_object()?;
+    Some(properties.keys().cloned().collect())
+}
+
+/// The declared parameter a caller most likely meant.
+///
+/// Only fires on a real near-miss: a prefix, a suffix, or within two edits.
+/// A suggestion for a name that is nothing like anything declared is noise,
+/// and noise is how a diagnostic stops being read.
+fn nearest_parameter(unknown: &str, declared: &BTreeSet<String>) -> Option<String> {
+    let lower = unknown.to_ascii_lowercase();
+    let mut scored: Vec<(usize, &String)> = declared
+        .iter()
+        .filter_map(|candidate| {
+            let candidate_lower = candidate.to_ascii_lowercase();
+            if candidate_lower.starts_with(&lower) || lower.starts_with(&candidate_lower) {
+                return Some((0, candidate));
+            }
+            let distance = edit_distance(&lower, &candidate_lower);
+            (distance <= 2).then_some((distance, candidate))
+        })
+        .collect();
+    scored.sort();
+    scored.first().map(|(_, name)| (*name).clone())
+}
+
+/// Levenshtein distance, two rows. Small inputs (parameter names), so the
+/// simple form is the right one.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, lc) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, rc) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(lc != rc);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+/// Reject arguments the tool does not declare.
+///
+/// Every schema says `additionalProperties: false`; nothing enforced it, so an
+/// unrecognised key was dropped and the call reported SUCCESS with a default
+/// applied. `build_docx(out="X.docx")` wrote a differently-named file and
+/// `insert_paragraph(after=...)` reported a missing *paragraph* for a
+/// misspelled *argument* -- a diagnostic pointing away from the mistake.
+///
+/// Only unknown keys are rejected here. A missing required argument keeps its
+/// existing handler error, because those codes are pinned by tests and by the
+/// reference, and changing them is a different decision from this one.
+fn reject_unknown_arguments(tool: &str, args: &Value) -> Result<(), (String, String)> {
+    let Some(declared) = declared_parameters(tool) else {
+        return Ok(());
+    };
+    let Some(object) = args.as_object() else {
+        return Ok(());
+    };
+    let mut unknown: Vec<&String> = object
+        .keys()
+        .filter(|key| !declared.contains(*key))
+        .collect();
+    unknown.sort();
+    let Some(first) = unknown.first() else {
+        return Ok(());
+    };
+    let mut message = match nearest_parameter(first, &declared) {
+        Some(suggestion) => format!("unknown argument `{first}`; did you mean `{suggestion}`?"),
+        None => format!("unknown argument `{first}`"),
+    };
+    message.push_str(&format!(
+        " ({} declares: {})",
+        tool,
+        declared.iter().cloned().collect::<Vec<_>>().join(", ")
+    ));
+    if unknown.len() > 1 {
+        message.push_str(&format!(
+            "; also unknown: {}",
+            unknown[1..]
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Err(("invalid-arguments".to_string(), message))
+}
+
 fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commit: &str) -> Value {
     let args = if args.is_null() {
         Value::Object(Default::default())
     } else {
         args.clone()
     };
+    if let Err((code, message)) = reject_unknown_arguments(tool, &args) {
+        return session.failure(tool, &code, &message, build_commit);
+    }
     let reply = match tool {
         "tools/list" => {
             let mut json = serde_json::to_string(&session.success(

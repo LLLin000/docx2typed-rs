@@ -1410,3 +1410,72 @@ fn review_server_settlement_and_wake_retry() {
 
     server.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Unknown arguments are rejected, not dropped.
+// ---------------------------------------------------------------------------
+
+/// Every published schema says `additionalProperties: false`; nothing enforced
+/// it, so an unrecognised key was silently ignored and the call reported
+/// success with the default applied (#41). The worked examples are the ones
+/// that misled a real caller: `build_docx(out=...)` wrote a differently-named
+/// file, and `insert_paragraph(after=...)` reported a missing *paragraph* for
+/// a misspelled *argument*.
+#[test]
+fn unknown_arguments_are_rejected_and_near_misses_name_the_intent() {
+    let cases: [(&str, Value, &str); 4] = [
+        (
+            "build_docx",
+            json!({"out": "X.docx", "operation_id": "1"}),
+            "output",
+        ),
+        (
+            "build_docx",
+            json!({"outptu": "X.docx", "operation_id": "1"}),
+            "output",
+        ),
+        (
+            "insert_paragraph",
+            json!({"after": "P0", "text": "x", "operation_id": "1"}),
+            "after_id",
+        ),
+        ("history_list", json!({"limt": 5}), "limit"),
+    ];
+    for (tool, args, expected) in cases {
+        let (results, _) = mcp(&[(tool, args)]);
+        let envelope = envelope(&results[0]);
+        assert_eq!(
+            envelope["outcome"], "failure",
+            "{tool} must reject an unknown argument, not apply a default"
+        );
+        let diagnostics = envelope["diagnostics"].as_array().expect("diagnostics");
+        assert_eq!(
+            diagnostics[0]["code"], "invalid-arguments",
+            "{tool}: wrong code"
+        );
+        let message = diagnostics[0]["message"].as_str().expect("message");
+        assert!(
+            message.contains(expected),
+            "{tool}: the diagnostic must name the parameter the caller meant ({expected}); got {message}"
+        );
+    }
+}
+
+/// The guard must not reject a call that only uses declared parameters — the
+/// failure mode of a validation added late is that it breaks the happy path.
+#[test]
+fn declared_arguments_still_dispatch() {
+    let (results, _) = mcp(&[
+        ("tools/list", json!({})),
+        ("engine_info", json!({})),
+        ("workdir_status", json!({})),
+        ("history_verify", json!({})),
+    ]);
+    for (index, result) in results.iter().enumerate() {
+        let envelope = envelope(result);
+        assert_ne!(
+            envelope["diagnostics"][0]["code"], "invalid-arguments",
+            "declared-only call #{index} must not be rejected: {envelope}"
+        );
+    }
+}
