@@ -19,10 +19,14 @@ use docx2typed_protocol::{bytes_sha256, file_sha256, resolve_path, semantic_sha2
 /// injection, external two-phase publication). Mirror of `scripts/store.py`.
 pub mod store;
 
-/// Issue #63: the read-only version timeline (`history_list`) — HEAD, the
-/// commit graph in the object pool, and the legacy generation-manifest
-/// fallback (mirror of `scripts/store.py` `head_version`/`history_list`).
+/// Issue #63: the read-only version timeline (`history_list`) and the
+/// per-paragraph history reads (`history_diff`, `history_blame`,
+/// `history_verify`) — HEAD, the commit graph in the object pool, and the
+/// legacy generation-manifest fallback (mirror of `scripts/store.py`
+/// `head_version`/`history_list`/`history_diff`/`history_blame`/`history_verify`).
 pub mod versions;
+
+pub use versions::{history_blame, history_diff, history_list, history_verify};
 
 pub use store::{
     has_store, pending_recovery, read_root, state, MutateRun, PinnedGeneration, RecoverySummary,
