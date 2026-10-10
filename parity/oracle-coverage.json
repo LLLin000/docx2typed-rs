@@ -1,0 +1,19 @@
+{
+  "reference": 49,
+  "oracle": 36,
+  "uncovered": [
+    "document_patch",
+    "document_read",
+    "document_replace",
+    "document_search",
+    "format_span",
+    "history_blame",
+    "history_diff",
+    "history_gc",
+    "history_list",
+    "history_restore",
+    "history_verify",
+    "workspace_adopt",
+    "workspace_fork"
+  ]
+}
