@@ -1,6 +1,6 @@
 //! MCP stdio adapter (issue #60): the full frozen tool surface of the
 //! Python reference (`scripts/mcp_server.py`) over the one synchronous
-//! Engine — 36 tools with frozen names and input JSON Schemas (published by
+//! Engine — 37 tools with frozen names and input JSON Schemas (published by
 //! `tools/list`), every result a `docx2typed-result-1` envelope carried as
 //! `structuredContent`, one-workdir connection state, and a clean stdio
 //! channel (only `OK <json>` / `ERR <msg>` lines on stdout; all logs go to
@@ -38,8 +38,8 @@ use serde_json::{json, Value};
 // Frozen tool surface
 // ---------------------------------------------------------------------------
 
-/// The 36 frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 36] = [
+/// The frozen tool names (mirror of the Python `@mcp.tool` surface).
+pub const TOOL_NAMES: [&str; 37] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -76,6 +76,7 @@ pub const TOOL_NAMES: [&str; 36] = [
     "revert",
     "build_docx",
     "verify_output",
+    "history_list",
 ];
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
@@ -1362,6 +1363,52 @@ impl McpSession {
             build_commit,
         )
     }
+
+    /// `history_list`: the version timeline from HEAD backwards, newest
+    /// first. Read-only. Python's wrapper reports the draft freshness beside
+    /// the store's `version_dirty`, so both ride in the same payload.
+    fn history_list(&self, args: &Value, build_commit: &str) -> Value {
+        let Some(workdir) = self.workdir.as_deref() else {
+            return self.failure(
+                "history_list",
+                "workdir-not-open",
+                "no workdir open; call workdir_open first",
+                build_commit,
+            );
+        };
+        let argument = |name: &str, default: i64| match args.get(name) {
+            Some(Value::Number(number)) => number.as_i64().unwrap_or(default),
+            _ => default,
+        };
+        let path = Path::new(workdir);
+        match docx2typed_store::versions::history_list(
+            path,
+            argument("limit", 20),
+            argument("offset", 0),
+        ) {
+            Ok(mut data) => {
+                data["draft_dirty"] = json!(draft_dirty(path));
+                self.success("history_list", data, build_commit)
+            }
+            Err(error) => {
+                let code = error.code().unwrap_or("store-invalid").to_string();
+                self.failure("history_list", &code, &error.message(), build_commit)
+            }
+        }
+    }
+}
+
+/// `draft_dirty`: the same freshness rule as `diff_preview`/`workdir_status`
+/// — a workdir without a draft projection reports clean (Rust-extracted
+/// workdirs have no `edit.md` until a draft tool initializes one).
+fn draft_dirty(workdir: &Path) -> bool {
+    if !workdir.join("edit.state.json").is_file() {
+        return false;
+    }
+    matches!(
+        docx2typed_core::edit_state::classify_edit_state(workdir).map(|state| state.state),
+        Ok(state) if state == "dirty" || state == "conflict"
+    )
 }
 
 /// `batch_edit` over the tracer draft model: the paragraph has one style
@@ -1748,6 +1795,12 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
         }
         "verify_output" => {
             let mut json = serde_json::to_string(&session.verify_output(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "history_list" => {
+            let mut json = serde_json::to_string(&session.history_list(&args, build_commit))
                 .expect("serializes");
             json.insert_str(0, "OK ");
             json
