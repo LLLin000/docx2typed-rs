@@ -2,7 +2,7 @@
 //! driven through the installed-style `docx2typed` binary exactly as the
 //! qualification gate does.
 //!
-//! MCP(stdout) surface: the frozen 36-tool inventory with published input
+//! MCP(stdout) surface: the frozen tool inventory with published input
 //! schemas, one-workdir connection state, draft projection lifecycle
 //! (replace/insert/delete/diff/commit with changed-set detection and
 //! byte-exact store replay / operation-id reuse), and a clean stdio
@@ -66,8 +66,8 @@ fn extract(fixture_path: &Path, outdir: &Path) {
     assert_eq!(envelope["outcome"], "success", "{envelope}");
 }
 
-/// The frozen 36-tool MCP surface (mirror of `scripts/mcp_server.py`).
-const TOOL_NAMES: [&str; 36] = [
+/// The frozen MCP tool surface (mirror of `scripts/mcp_server.py`).
+const TOOL_NAMES: [&str; 37] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -104,6 +104,7 @@ const TOOL_NAMES: [&str; 36] = [
     "revert",
     "build_docx",
     "verify_output",
+    "history_list",
 ];
 
 /// Drive one MCP(stdout) session: each stdin line is
@@ -378,7 +379,7 @@ fn security_headers() -> [&'static str; 5] {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mcp_tool_surface_is_frozen_36_with_exact_published_schemas() {
+fn mcp_tool_surface_is_frozen_with_exact_published_schemas() {
     let workdir = scratch("surface");
     extract(&fixture("plain"), &workdir);
     let (results, raw) = mcp(&[("tools/list", json!({}))]);
@@ -536,6 +537,37 @@ fn mcp_tools_accept_schema_derived_minimal_arguments() {
             );
         }
     }
+}
+
+#[test]
+fn mcp_history_list_reports_the_version_timeline() {
+    let workdir = scratch("history");
+    extract(&fixture("plain"), &workdir);
+    let wd = workdir.to_string_lossy().into_owned();
+    let (results, raw) = mcp(&[
+        ("history_list", json!({})),
+        ("workdir_open", json!({ "workdir": wd })),
+        ("history_list", json!({ "limit": 5, "offset": 0 })),
+    ]);
+    assert_eq!(raw.len(), 3, "one reply per request: {raw:?}");
+
+    // Nothing is open yet: the read-only tool refuses with the frozen code.
+    let closed = envelope(&results[0]);
+    assert_eq!(closed["outcome"], "failure", "{closed}");
+    assert_eq!(closed["diagnostics"][0]["code"], "workdir-not-open");
+
+    // An extracted workdir has never been saved, so the timeline is empty.
+    let data = &envelope(&results[2])["data"];
+    assert_eq!(data["schema"], "docx2typed-history-1");
+    assert_eq!(data["total"], 0);
+    assert_eq!(data["retained"], 0);
+    assert_eq!(data["trimmed"], 0);
+    assert_eq!(data["offset"], 0);
+    assert_eq!(data["current"], Value::Null);
+    assert_eq!(data["current_tree"], Value::Null);
+    assert_eq!(data["versions"].as_array().map(Vec::len), Some(0));
+    assert_eq!(data["version_dirty"], true, "never saved counts as dirty");
+    assert_eq!(data["draft_dirty"], false);
 }
 
 #[test]

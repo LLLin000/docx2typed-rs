@@ -816,5 +816,21 @@
   "properties": {},
   "type": "object",
   "additionalProperties": false
+ },
+ "history_list": {
+  "properties": {
+   "limit": {
+    "default": 20,
+    "title": "Limit",
+    "type": "integer"
+   },
+   "offset": {
+    "default": 0,
+    "title": "Offset",
+    "type": "integer"
+   }
+  },
+  "type": "object",
+  "additionalProperties": false
  }
 }
