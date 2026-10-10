@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 43] = [
+pub const TOOL_NAMES: [&str; 44] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -83,6 +83,7 @@ pub const TOOL_NAMES: [&str; 43] = [
     "history_diff",
     "history_blame",
     "history_verify",
+    "workspace_fork",
 ];
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
@@ -1579,6 +1580,95 @@ impl McpSession {
         }
     }
 
+    /// Start a NEW family from a DOCX — the "copy an old patent and write a
+    /// different one" route. Runs the same extraction lane as `extract`, then
+    /// mints a fresh family for the copy, recording `origin_family` /
+    /// `origin_version` for audit only.
+    fn workspace_fork(&self, args: &Value, build_commit: &str) -> Value {
+        let docx = args.get("docx").and_then(Value::as_str).unwrap_or("");
+        let outdir = args.get("outdir").and_then(Value::as_str).unwrap_or("");
+        let source = Path::new(docx);
+        if !source.is_file() {
+            return self.failure(
+                "workspace_fork",
+                "input-not-found",
+                &format!("source file not found: {}", source.display()),
+                build_commit,
+            );
+        }
+        let target = Path::new(outdir);
+        if target.join("typed.md").exists() {
+            return self.failure(
+                "workspace_fork",
+                "workdir-exists",
+                &format!("{} already holds a typed workdir", target.display()),
+                build_commit,
+            );
+        }
+        let outcome = match docx2typed_app::Engine::new().execute(
+            docx2typed_app::Operation::Extract,
+            docx2typed_app::OperationContext::new(docx2typed_protocol::new_operation_id()),
+            docx2typed_app::OperationArgs::Extract(docx2typed_app::ExtractArgs {
+                input: source.to_path_buf(),
+                outdir: target.to_path_buf(),
+            }),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return self.failure(
+                    "workspace_fork",
+                    "workdir-invalid",
+                    &error.message,
+                    build_commit,
+                )
+            }
+        };
+        if outcome.outcome != docx2typed_app::Outcome::Success {
+            let first = outcome
+                .diagnostics
+                .first()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .unwrap_or_else(|| "extraction produced no diagnostics".to_string());
+            return self.failure("workspace_fork", "workdir-invalid", &first, build_commit);
+        }
+        // A fork mints its OWN family: the copy is a different document that
+        // merely shares bytes with its origin. `origin_*` records the lineage
+        // for audit and never resolves anything.
+        //
+        // A resolver would fill `origin` from the source's family when one is
+        // already known; Rust has none yet, so the audit fields stay empty
+        // rather than guessing an identity from similar content.
+        let origin = docx2typed_core::workspace_identity::Origin {
+            family_id: None,
+            version: None,
+        };
+        let (identity, _created) =
+            match docx2typed_core::workspace_identity::ensure_identity(target, Some(origin)) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    return self.failure(
+                        "workspace_fork",
+                        "workdir-invalid",
+                        &error.to_string(),
+                        build_commit,
+                    )
+                }
+            };
+        self.success(
+            "workspace_fork",
+            json!({
+                "status": "forked",
+                "family_id": identity.family_id,
+                "workspace_id": identity.workspace_id,
+                "workspace": target.to_string_lossy(),
+                "origin_family": identity.origin_family,
+                "origin_version": identity.origin_version,
+                "next": "call workdir_open on that workspace",
+            }),
+            build_commit,
+        )
+    }
+
     /// Apply a batch of edits to the draft in one atomic call.
     fn document_patch(&self, args: &Value, build_commit: &str) -> Value {
         let hunks = args.get("hunks").cloned();
@@ -2057,6 +2147,12 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
         "history_verify" => {
             let mut json =
                 serde_json::to_string(&session.history_verify(build_commit)).expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "workspace_fork" => {
+            let mut json = serde_json::to_string(&session.workspace_fork(&args, build_commit))
+                .expect("serializes");
             json.insert_str(0, "OK ");
             json
         }

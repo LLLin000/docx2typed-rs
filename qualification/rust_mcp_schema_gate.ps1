@@ -21,6 +21,19 @@ if (-not (Test-Path $bin)) {
     throw "binary not found: $bin"
 }
 
+# A binary older than the sources answers with an OLD tool surface. When tools
+# were ADDED that fails loudly, but when they were REMOVED it passes silently --
+# which is the one direction a schema gate must never fail in.
+$newestSource = Get-ChildItem -Path (Join-Path $root "src"), (Join-Path $root "crates") `
+    -Recurse -File -Include *.rs -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$binaryStamp = (Get-Item $bin).LastWriteTime
+if ($newestSource -and $binaryStamp -lt $newestSource.LastWriteTime) {
+    throw ("binary is older than $($newestSource.Name) " +
+        "($($binaryStamp.ToString('HH:mm:ss')) < $($newestSource.LastWriteTime.ToString('HH:mm:ss'))); " +
+        "rebuild before running the gate, or it answers with a stale tool surface")
+}
+
 $schemaPath = Join-Path $root ".mcp_schemas.json"
 $frozen = Get-Content -Raw -Encoding UTF8 $schemaPath | ConvertFrom-Json
 
@@ -65,7 +78,7 @@ function Add-Check([string]$Name, [bool]$Pass, [string]$Detail = "") {
 }
 
 $frozenNames = @($frozen.PSObject.Properties.Name | Sort-Object)
-Add-Check "tool count" ($tools.Count -eq 43 -and $frozenNames.Count -eq 43) "live=$($tools.Count) frozen=$($frozenNames.Count)"
+Add-Check "tool count" ($tools.Count -eq 44 -and $frozenNames.Count -eq 44) "live=$($tools.Count) frozen=$($frozenNames.Count)"
 $liveNames = @($tools | ForEach-Object { $_.name } | Sort-Object)
 Add-Check "tool names" (($liveNames -join "\n") -eq ($frozenNames -join "\n")) "live=$($liveNames -join ',')"
 
