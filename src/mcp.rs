@@ -455,13 +455,17 @@ impl McpSession {
                 .map_err(|error| MutationError::new(error.code, error.detail))?;
             draft::replace_text_with_options(
                 target,
-                &paragraph_id,
-                &old,
-                &new,
-                tracked,
-                author.as_deref(),
-                None,
-                leaf_index,
+                draft::TextEdit {
+                    paragraph_id: &paragraph_id,
+                    old: &old,
+                    new: &new,
+                    leaf_index,
+                },
+                draft::EditTracking {
+                    tracked,
+                    author: author.as_deref(),
+                    date: None,
+                },
             )
             .map_err(|error| MutationError::new(error.code, error.detail))
         })
@@ -1874,15 +1878,14 @@ pub fn run(build_commit: &str) -> i32 {
             .unwrap_or("")
             .to_string();
         let args = request.get("args").cloned().unwrap_or(Value::Null);
-        let reply =
-            if TOOL_NAMES.iter().any(|known| *known == tool.as_str()) || tool == "tools/list" {
-                let result = dispatch_tool(&mut session, &tool, &args, build_commit);
-                let mut json = serde_json::to_string(&result).expect("serializes");
-                json.insert_str(0, "OK ");
-                json
-            } else {
-                format!("ERR unknown tool: {tool}")
-            };
+        let reply = if TOOL_NAMES.contains(&tool.as_str()) || tool == "tools/list" {
+            let result = dispatch_tool(&mut session, &tool, &args, build_commit);
+            let mut json = serde_json::to_string(&result).expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        } else {
+            format!("ERR unknown tool: {tool}")
+        };
         if writeln!(stdout, "{reply}").is_err() {
             break;
         }

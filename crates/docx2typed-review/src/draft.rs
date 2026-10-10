@@ -420,21 +420,49 @@ pub fn replace_text(
     old: &str,
     new: &str,
 ) -> Result<Value, CollaborationError> {
-    replace_text_with_options(workdir, paragraph_id, old, new, false, None, None, None)
+    replace_text_with_options(
+        workdir,
+        TextEdit {
+            paragraph_id,
+            old,
+            new,
+            leaf_index: None,
+        },
+        EditTracking {
+            tracked: false,
+            author: None,
+            date: None,
+        },
+    )
+}
+
+/// The text replacement one draft operation performs, plus the addressing
+/// needed to select the right occurrence within the paragraph.
+#[derive(Clone, Copy)]
+pub struct TextEdit<'a> {
+    pub paragraph_id: &'a str,
+    pub old: &'a str,
+    pub new: &'a str,
+    pub leaf_index: Option<usize>,
+}
+
+/// How an operation is recorded: a plain body edit, or a tracked revision
+/// that carries an author and date.
+#[derive(Clone, Copy)]
+pub struct EditTracking<'a> {
+    pub tracked: bool,
+    pub author: Option<&'a str>,
+    pub date: Option<&'a str>,
 }
 
 pub fn replace_text_with_options(
     workdir: &Path,
-    paragraph_id: &str,
-    old: &str,
-    new: &str,
-    tracked: bool,
-    author: Option<&str>,
-    date: Option<&str>,
-    leaf_index: Option<usize>,
+    edit: TextEdit<'_>,
+    tracking: EditTracking<'_>,
 ) -> Result<Value, CollaborationError> {
     crate::collab::ensure_agent_ready(workdir)?;
     let (header, mut blocks) = read_blocks(workdir)?;
+    let paragraph_id = edit.paragraph_id;
     let index = find_block(&blocks, "p", paragraph_id).ok_or_else(|| {
         CollaborationError::new(
             "paragraph-not-found",
@@ -443,27 +471,18 @@ pub fn replace_text_with_options(
     })?;
     let marker = blocks[index].split('\n').next().unwrap_or("").to_string();
     let body = block_body(&blocks[index]);
-    let new_body = if let Some(leaf_index) = leaf_index {
-        let occurrence = leaf_occurrence(workdir, paragraph_id, leaf_index, old)?;
-        replace_nth_in_body(&body, old, new, occurrence, paragraph_id)?
+    let new_body = if let Some(leaf_index) = edit.leaf_index {
+        let occurrence = leaf_occurrence(workdir, paragraph_id, leaf_index, edit.old)?;
+        replace_nth_in_body(&body, edit.old, edit.new, occurrence, paragraph_id)?
     } else {
-        replace_in_body(&body, old, new, paragraph_id)?
+        replace_in_body(&body, edit.old, edit.new, paragraph_id)?
     };
     blocks[index] = if new_body.is_empty() {
         marker
     } else {
         format!("{marker}\n{new_body}")
     };
-    record_island_operation(
-        workdir,
-        paragraph_id,
-        old,
-        new,
-        tracked,
-        author,
-        date,
-        leaf_index,
-    )?;
+    record_island_operation(workdir, edit, tracking)?;
     write_draft(workdir, &header, &blocks)?;
     Ok(serde_json::json!({
         "paragraph_id": paragraph_id,
@@ -526,14 +545,15 @@ fn replace_nth_in_body(
 }
 fn record_island_operation(
     workdir: &Path,
-    paragraph_id: &str,
-    old: &str,
-    new: &str,
-    tracked: bool,
-    author: Option<&str>,
-    date: Option<&str>,
-    leaf_index: Option<usize>,
+    edit: TextEdit<'_>,
+    tracking: EditTracking<'_>,
 ) -> Result<(), CollaborationError> {
+    let TextEdit {
+        paragraph_id,
+        old,
+        new,
+        leaf_index,
+    } = edit;
     let package = fs::read(workdir.join("_template.docx"))
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     let inventory = docx2typed_core::prose::enumerate_package_bytes(&package)
@@ -562,9 +582,9 @@ fn record_island_operation(
         leaf_index: leaf.leaf_index,
         old: old.to_string(),
         new: new.to_string(),
-        tracked,
-        author: author.unwrap_or("").to_string(),
-        date: date.unwrap_or("").to_string(),
+        tracked: tracking.tracked,
+        author: tracking.author.unwrap_or("").to_string(),
+        date: tracking.date.unwrap_or("").to_string(),
     });
     docx2typed_core::prose::save_islands(workdir, &islands)
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))

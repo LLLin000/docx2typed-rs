@@ -2211,7 +2211,7 @@ impl Store {
         if fs::create_dir_all(&self.quarantine_dir).is_err() {
             result.needs_recovery.push(json!({
                 "operation_id": operation_id,
-                "reason": format!("quarantine move failed"),
+                "reason": "quarantine move failed",
             }));
             return;
         }
