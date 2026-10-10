@@ -1,6 +1,6 @@
 //! MCP stdio adapter (issue #60): the full frozen tool surface of the
 //! Python reference (`scripts/mcp_server.py`) over the one synchronous
-//! Engine — 36 tools with frozen names and input JSON Schemas (published by
+//! Engine — 37 tools with frozen names and input JSON Schemas (published by
 //! `tools/list`), every result a `docx2typed-result-1` envelope carried as
 //! `structuredContent`, one-workdir connection state, and a clean stdio
 //! channel (only `OK <json>` / `ERR <msg>` lines on stdout; all logs go to

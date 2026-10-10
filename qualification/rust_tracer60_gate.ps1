@@ -1,5 +1,5 @@
 # rust_tracer60_gate.ps1 - issue #60 differential/adversarial gate: the
-# secured review collaboration lane (MCP 36-tool surface + stdio purity +
+# secured review collaboration lane (MCP 37-tool surface + stdio purity +
 # one-workdir + draft lifecycle with store replay, HTTP security contract,
 # capability lifecycle, throttle, CAS one-winner, restart revocation) run
 # against the real installed-style `docx2typed` binary.
