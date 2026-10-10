@@ -37,14 +37,14 @@ Machine-readable: [`matrix.json`](matrix.json), [`python-lock.json`](python-lock
 
 | Surface | Python | Rust | Gap |
 |---|---|---|---|
-| MCP tools | **49** | **36** | 13 missing, 0 extra |
+| MCP tools | **49** | **37** | 12 missing, 0 extra |
 | CLI commands | **8** | **8** | **at parity** |
 
 The CLI is already at parity: both declare exactly
 `build, decide, edit, extract, inspect, migrate, validate, verify`
 (Python `scripts/protocol.py`, Rust `crates/docx2typed-protocol/src/descriptor.rs`).
 
-## 2. The 13 missing MCP tools
+## 2. The 12 missing MCP tools
 
 Name equality is not functional equality; each row lists the Python definition
 site and the Rust crate that must own the capability. Status values:
@@ -58,29 +58,36 @@ site and the Rust crate that must own the capability. Status values:
 | 3 | `document_replace` | `mcp_server.py:4947` | — | `missing` |
 | 4 | `document_patch` | `mcp_server.py:5232` | region/leaf machinery in `review/draft.rs` | `partial` |
 | 5 | `format_span` | `mcp_server.py:3783` | run-properties in `core/prose.rs` | `partial` |
-| 6 | `history_list` | `mcp_server.py:5934` | `review/history.rs:163 list()` | `partial` |
+| 6 | ~~`history_list`~~ | `mcp_server.py:5934` | **landed** (#20) | `equivalent` |
 | 7 | `history_diff` | `mcp_server.py:5865` | — | `missing` |
 | 8 | `history_blame` | `mcp_server.py:5886` | — | `missing` |
 | 9 | `history_verify` | `mcp_server.py:5905` | — | `missing` |
 | 10 | `history_restore` | `mcp_server.py:5951` | `store/store.rs` (generations) | `missing` |
 | 11 | `history_gc` | `mcp_server.py:5917` | `store/store.rs` | `missing` |
-| 12 | `workspace_adopt` | `mcp_server.py:2935` | **none** (see §3) | `missing` |
-| 13 | `workspace_fork` | `mcp_server.py:2984` | **none** (see §3) | `missing` |
+| 12 | `workspace_adopt` | `mcp_server.py:2935` | identity substrate landed (#19); tool not yet exposed | `partial` |
+| 13 | `workspace_fork` | `mcp_server.py:2984` | identity substrate landed (#19); tool not yet exposed | `partial` |
 
-## 3. Structural finding: workspace identity is absent from Rust
-
-`grep -rn "family_id\|workspace_id\|workspace.json" crates/` returns **nothing**.
+## 3. Workspace identity: substrate landed (#19)
 
 Python's identity lane (ADR 0046) mints a permanent `f_…` family id and a
-`ws_…` workspace id in `workspace.json`, and `workspace_adopt`/`workspace_fork`
-are built on it. Rust has **no equivalent**, so tools 12–13 are not "unexposed
-infrastructure" — the substrate itself is missing. This is larger than a tool
-addition and should be scoped as its own slice.
+`ws_…` workspace id in `workspace.json`; `workspace_adopt`/`workspace_fork`
+are built on it. Rust originally had **no equivalent at all**.
 
-Rust does have `review/history.rs` (`list`/`read`/`append`) — the *version*
-lane exists, but only as history records, not as family/observation identity.
+**Now landed:** `crates/docx2typed-core/src/workspace_identity.rs` mirrors
+`scripts/workspace_identity.py` (`read_identity`, `write_identity`,
+`ensure_identity`, `new_family_id`, `new_workspace_id`, the
+`docx2typed-workspace-1` schema), verified cross-engine: Rust writes the file,
+Python's `read_identity` accepts it, Python's `ensure_identity` returns
+`created=false` and the bytes stay unchanged.
 
-## 4. Known non-equivalences among the 36 shared tools
+So tools 12–13 are no longer "substrate missing" — they are **unexposed
+infrastructure**: the remaining work is the MCP surface (`workspace_adopt`
+with its adoption-token flow, `workspace_fork` with origin recording).
+
+Rust also has `review/history.rs` (`list`/`read`/`append`) and
+`store/versions.rs` (the read-only chain reader behind `history_list`).
+
+## 4. Known non-equivalences among the 37 shared tools
 
 These must be checked per-tool, not assumed equal. Priority suspects named in
 the plan plus what was verified here:
@@ -104,24 +111,33 @@ Per the plan, Python's behaviour is the *behavioural* reference, not always the
    "Python 已知风险"). Listed as `known-reference-defect`; out of Phase 1 scope
    beyond compatibility.
 
-## 6. Red CI / first blockers (PR 2 targets)
+## 6. Former CI blockers — all resolved (#18)
 
-| Blocker | Location | Status |
+| Blocker | Location | Resolution |
 |---|---|---|
-| Clippy `too_many_arguments` (8/7) | `core/prose.rs:1330` `tracked_run_replacement` | **reproduced** (`cargo clippy -p docx2typed-core -- -D warnings`) |
-| Python-oracle differential failures | `rust-tests/migrate.rs`, `differential.rs` | reported (Linux 4 / Windows 5); needs structured JSON-path diff, not assertion deletion |
-| `cargo check -p docx2typed-core` | — | **passes** (11 s) |
+| Clippy `too_many_arguments` (8/7) | `core/prose.rs` `tracked_run_replacement`; `review/draft.rs` `replace_text_with_options` + `record_island_operation` | parameter structs (`TextEdit`/`EditTracking`), not lint suppression |
+| Python-oracle differential failures (5) | `rust-tests/migrate.rs` | Rust emitted a 15th inspect asset row (`islands.json`) the reference has no concept of; entry removed |
+| `clippy::manual_contains` | `src/mcp.rs` | `TOOL_NAMES.contains(&s)` |
+| `clippy::useless_format` | `store/store.rs` | literal, not `format!` |
+| Local/CI clippy disagreement | toolchain | local was 1.97.1, CI `stable` is 1.99.0 → `rustup update stable` |
+| `cargo check -p docx2typed-core` | — | passes |
 
-## 7. Ordered PR plan (dependency-sorted)
+All seven CI jobs are green as of #20/#21.
 
-| PR | Scope | Depends on |
-|---|---|---|
-| **1** | this lock + matrix + repro scripts | — |
-| **2** | CI health: clippy fix, migrate/differential normalisation (no semantic change) | 1 |
-| **3** | structural closure: insert/delete paragraph → real DOCX build → verify | 2 |
-| **4** | high-frequency Agent tools: `document_read/search/patch/replace`, `format_span` | 3 |
-| **5** | versions & workspace: `history_*`, `workspace_adopt/fork` (+ identity substrate) | 3 |
-| **6** | verification evidence + release qualification + real-DOCX acceptance | 4, 5 |
+## 7. Ordered PR plan (dependency-sorted, with live status)
+
+| PR | Scope | Depends on | Status |
+|---|---|---|---|
+| **1** | this lock + matrix + repro scripts | — | **done** (#17) |
+| **2** | CI health: clippy, fmt, toolchain parity, inspect asset parity | 1 | **done** (#18) |
+| **3** | structural closure: insert/delete paragraph → real DOCX build → verify | 2 | in progress |
+| **4** | high-frequency Agent tools: `document_read/search/patch/replace`, `format_span` | 3 | in progress (`document_read` core) |
+| **5** | versions & workspace: `history_*`, `workspace_adopt/fork` | 3 | partial: `history_list` **done** (#20), identity substrate **done** (#19); `workspace_adopt/fork` + remaining `history_*` open |
+| **6** | verification evidence + release qualification + real-DOCX acceptance | 4, 5 | pending |
 
 Each PR carries: Python reference location, behaviour spec, positive / refusal /
 misuse cases, output-diff explanation, test command, CI result.
+
+**Toolchain note (learned in PR 2):** verify with the same compiler CI uses.
+A local/CI `clippy` mismatch (1.97 vs 1.99) made green local runs fail CI
+repeatedly. `rustup update stable` first, then run all three checks.
