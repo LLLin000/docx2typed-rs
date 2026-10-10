@@ -31,6 +31,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use docx2typed_protocol::{bytes_sha256, canonical_json};
+
 use crate::xml_walker::{build_tree, scan_tags, ElementNode};
 use crate::CoreError;
 
@@ -2448,6 +2450,7 @@ impl RunRestyle {
 /// One `<w:rPr>` fragment taken apart for byte-level surgery.
 struct RprFragment {
     bytes: Vec<u8>,
+    nodes: Vec<ElementNode>,
     root: ElementNode,
     children: Vec<ElementNode>,
 }
@@ -2517,6 +2520,262 @@ fn tag_attribute_pairs(tag: &[u8]) -> Vec<(String, String)> {
     pairs
 }
 
+// ---------------------------------------------------------------------------
+// Python-compatible rPr canonicalisation (style identity)
+// ---------------------------------------------------------------------------
+
+/// A canonical value, mirroring the shape Python's `_canonical_element`
+/// returns: a tuple of (name, attributes, text, children), where attributes is
+/// a tuple of pairs. Tuples serialize as JSON arrays.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Canon {
+    Text(String),
+    Seq(Vec<Canon>),
+}
+
+/// Python's `repr()` for the canonical tuple, which is the SORT KEY for rPr
+/// children. Reproduced because the sort decides the canonical string, and the
+/// canonical string decides every style id.
+///
+/// Python's string rules: single quotes unless the text holds a `'` and no
+/// `"`, in which case double quotes; `\` and the active quote are escaped.
+fn canon_python_repr(value: &Canon) -> String {
+    match value {
+        Canon::Text(text) => {
+            let quote = if text.contains('\'') && !text.contains('"') {
+                '"'
+            } else {
+                '\''
+            };
+            let mut out = String::with_capacity(text.len() + 2);
+            out.push(quote);
+            for character in text.chars() {
+                match character {
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if c == quote => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push(quote);
+            out
+        }
+        Canon::Seq(items) => {
+            let mut out = String::from("(");
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&canon_python_repr(item));
+            }
+            // Python marks a one-element tuple with a trailing comma.
+            if items.len() == 1 {
+                out.push(',');
+            }
+            out.push(')');
+            out
+        }
+    }
+}
+
+fn canon_to_json(value: &Canon) -> serde_json::Value {
+    match value {
+        Canon::Text(text) => serde_json::Value::String(text.clone()),
+        Canon::Seq(items) => serde_json::Value::Array(items.iter().map(canon_to_json).collect()),
+    }
+}
+
+/// `_BOOLEAN_RPR`: elements whose `w:val` is a boolean, so an explicit true is
+/// noise and an explicit false removes the property entirely.
+const BOOLEAN_RPR: [&str; 9] = [
+    "b",
+    "i",
+    "strike",
+    "outline",
+    "shadow",
+    "smallCaps",
+    "caps",
+    "vanish",
+    "webHidden",
+];
+const FALSE_VALUES: [&str; 4] = ["false", "0", "off", "none"];
+const TRUE_VALUES: [&str; 3] = ["true", "1", "on"];
+
+/// The literal tag name of one element (`w:rFonts` from `<w:rFonts ...>`).
+fn element_qname(bytes: &[u8], node: &ElementNode) -> String {
+    let tag = &bytes[node.open_start..node.open_end];
+    let mut end = 1;
+    while end < tag.len() && !tag[end].is_ascii_whitespace() && tag[end] != b'>' && tag[end] != b'/'
+    {
+        end += 1;
+    }
+    String::from_utf8_lossy(&tag[1..end]).into_owned()
+}
+
+fn local_of(qname: &str) -> &str {
+    qname.rsplit(':').next().unwrap_or(qname)
+}
+
+/// Python's `_canonical_element`. `None` means the element is dropped (a
+/// boolean property explicitly false).
+fn canonical_element(
+    bytes: &[u8],
+    nodes: &[ElementNode],
+    node: &ElementNode,
+    rpr: bool,
+) -> Option<Canon> {
+    let name = element_qname(bytes, node);
+    let local = local_of(&name).to_string();
+    let mut attributes: Vec<(String, String)> = Vec::new();
+    for (key, value) in canonical_attribute_pairs(&bytes[node.open_start..node.end]) {
+        let key_local = local_of(&key).to_string();
+        if key_local.starts_with("rsid") {
+            continue;
+        }
+        if rpr && BOOLEAN_RPR.contains(&local.as_str()) && key_local == "val" {
+            let lowered = value.to_ascii_lowercase();
+            if FALSE_VALUES.contains(&lowered.as_str()) {
+                return None;
+            }
+            if TRUE_VALUES.contains(&lowered.as_str()) {
+                continue;
+            }
+        }
+        attributes.push((key, value));
+    }
+    attributes.sort();
+
+    let mut children: Vec<Canon> = Vec::new();
+    for &child in &node.children {
+        if let Some(canonical) = canonical_element(bytes, nodes, &nodes[child], rpr) {
+            children.push(canonical);
+        }
+    }
+    if rpr {
+        // Python: `children.sort(key=repr)`. The canonical form is meant to be
+        // order-insensitive, which is why this is a repr sort and not the
+        // schema order the synthesis lane uses.
+        children.sort_by_key(canon_python_repr);
+    }
+    Some(Canon::Seq(vec![
+        Canon::Text(name),
+        Canon::Seq(
+            attributes
+                .into_iter()
+                .map(|(key, value)| Canon::Seq(vec![Canon::Text(key), Canon::Text(value)]))
+                .collect(),
+        ),
+        // `element.text or ""` -- run properties carry no text.
+        Canon::Text(String::new()),
+        Canon::Seq(children),
+    ]))
+}
+
+/// Python's `canonical_rpr`: the rPr with `w:rPrChange` dropped, canonicalised
+/// and serialized with `separators=(",", ":")`.
+pub fn canonical_rpr_json(rpr_xml: &str) -> Result<String, CoreError> {
+    let fragment = RprFragment::parse(rpr_xml)?;
+    let mut children: Vec<Canon> = Vec::new();
+    for child in &fragment.children {
+        if child.name == "rPrChange" {
+            continue;
+        }
+        if let Some(canonical) = canonical_element(&fragment.bytes, &fragment.nodes, child, true) {
+            children.push(canonical);
+        }
+    }
+    children.sort_by_key(canon_python_repr);
+    let mut root_attributes: Vec<(String, String)> =
+        canonical_attribute_pairs(&fragment.bytes[fragment.root.open_start..fragment.root.end])
+            .into_iter()
+            .filter(|(key, _)| !local_of(key).starts_with("rsid"))
+            .collect();
+    root_attributes.sort();
+    let root = Canon::Seq(vec![
+        Canon::Text(element_qname(&fragment.bytes, &fragment.root)),
+        Canon::Seq(
+            root_attributes
+                .into_iter()
+                .map(|(key, value)| Canon::Seq(vec![Canon::Text(key), Canon::Text(value)]))
+                .collect(),
+        ),
+        Canon::Text(String::new()),
+        Canon::Seq(children),
+    ]);
+    Ok(canonical_json(&canon_to_json(&root)))
+}
+
+/// Python's `style_id_for_rpr`: `s_` + the first 16 hex of the canonical form.
+pub fn style_id_for_rpr(rpr_xml: &str) -> Result<String, CoreError> {
+    let canonical = canonical_rpr_json(rpr_xml)?;
+    Ok(format!("s_{}", &bytes_sha256(canonical.as_bytes())[..16]))
+}
+
+/// Attributes as the canonical form needs them: **full** names, with namespace
+/// declarations skipped.
+///
+/// `tag_attribute_pairs` strips the prefix (it exists for local-name
+/// comparisons), but Python's canonical form records `w:val`, not `val` —
+/// measured: using the stripped form produced `["w:sz",[["val","24"]]]` where
+/// the reference produces `["w:sz",[["w:val","24"]]]`, and every style id
+/// diverged. `xmlns` is skipped because ElementTree consumes namespace
+/// declarations, so they never reach `element.attrib`.
+fn canonical_attribute_pairs(tag: &[u8]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut index = 1; // past '<'
+    while index < tag.len() && !tag[index].is_ascii_whitespace() {
+        if tag[index] == b'/' || tag[index] == b'>' {
+            return pairs;
+        }
+        index += 1;
+    }
+    while index < tag.len() {
+        while index < tag.len() && tag[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= tag.len() || tag[index] == b'/' || tag[index] == b'>' {
+            break;
+        }
+        let name_start = index;
+        while index < tag.len() && tag[index] != b'=' && !tag[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let name = String::from_utf8_lossy(&tag[name_start..index]).into_owned();
+        while index < tag.len() && tag[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= tag.len() || tag[index] != b'=' {
+            break;
+        }
+        index += 1;
+        while index < tag.len() && tag[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= tag.len() || (tag[index] != b'"' && tag[index] != b'\'') {
+            break;
+        }
+        let quote = tag[index];
+        index += 1;
+        let value_start = index;
+        while index < tag.len() && tag[index] != quote {
+            index += 1;
+        }
+        let value = String::from_utf8_lossy(&tag[value_start..index]).into_owned();
+        index += 1;
+        let local = local_of(&name);
+        if local == "xmlns" || name.starts_with("xmlns:") {
+            continue;
+        }
+        pairs.push((name, value));
+    }
+    pairs
+}
+
 /// Serialize one empty run-property element under `prefix`.
 fn render_empty_element(prefix: &str, local: &str, attributes: &[(&str, &str)]) -> String {
     let mut out = format!("<{prefix}{local}");
@@ -2555,6 +2814,7 @@ impl RprFragment {
             .map(|&index| nodes[index].clone())
             .collect();
         Ok(Self {
+            nodes: nodes.clone(),
             bytes,
             root,
             children,
@@ -2727,14 +2987,6 @@ pub fn canonical_rpr_bytes(rpr_xml: &str) -> Result<Vec<u8>, CoreError> {
     Ok(out)
 }
 
-/// The content-addressed character style id of one `rPr` (mirror of Python's
-/// `style_id_for_rpr`).
-pub fn style_id_for_rpr(rpr_xml: &str) -> Result<String, CoreError> {
-    Ok(crate::document_projection::content_style_id(
-        &canonical_rpr_bytes(rpr_xml)?,
-    ))
-}
-
 /// Apply a **partial** attribute override to the run properties already in
 /// force (mirror of Python `_rpr_with_overrides`).
 ///
@@ -2860,8 +3112,12 @@ pub fn restyle_run_properties(
             serde_json::Value::Object(attributes.clone())
         )));
     };
-    let canonical = canonical_rpr_bytes(&rpr)?;
-    let style_id = crate::document_projection::content_style_id(&canonical);
+    // The id must come from the SAME canonical form the registry is keyed by,
+    // or a derived style can never be found in it. This was a real defect while
+    // the two schemes coexisted: `restyle_run_properties` hashed raw XML bytes
+    // while `style_id_for_rpr` hashed the reference's JSON form, so the
+    // derived id never matched the registered one.
+    let style_id = style_id_for_rpr(&rpr)?;
     if !available_styles.contains(&style_id) {
         return Err(CoreError::Domain(format!(
             "format-style-unavailable: this document has no run carrying {} on the target's base \
@@ -2871,9 +3127,10 @@ pub fn restyle_run_properties(
             serde_json::Value::Object(attributes.clone())
         )));
     }
+    let canonical_rpr = canonical_rpr_json(&rpr)?;
     Ok(RunRestyle {
         rpr,
-        canonical_rpr: String::from_utf8(canonical).unwrap_or_default(),
+        canonical_rpr,
         style_id,
     })
 }
