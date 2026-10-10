@@ -1265,8 +1265,14 @@ pub fn apply_edits(template: &Path, edits: &[IslandEdit]) -> Result<Vec<u8>, Cor
             };
             if edit.tracked {
                 let replacement = tracked_run_replacement(
-                    TrackedEditContext { part: &part_bytes, leaf: &leaf },
-                    TrackedEditContent { old: &edit.old, new: &edit.new },
+                    TrackedEditContext {
+                        part: &part_bytes,
+                        leaf: &leaf,
+                    },
+                    TrackedEditContent {
+                        old: &edit.old,
+                        new: &edit.new,
+                    },
                     TrackedEditRevision {
                         author: &edit.author,
                         date: &edit.date,
@@ -1350,7 +1356,6 @@ fn tracked_run_replacement(
     content: TrackedEditContent<'_>,
     revision: TrackedEditRevision<'_>,
 ) -> Result<(usize, usize, Vec<u8>), CoreError> {
-
     let before = &ctx.part[..ctx.leaf.text_start];
     let mut run_start = None;
     for index in 0..before.len().saturating_sub(3) {
@@ -1387,8 +1392,18 @@ fn tracked_run_replacement(
                 .map(|end| String::from_utf8_lossy(&run[start..start + end + 8]).into_owned())
         })
         .unwrap_or_default();
-    let prefix = ctx.leaf.text.split_once(content.old).map(|(p, _)| p).unwrap_or("");
-    let suffix = ctx.leaf.text.split_once(content.old).map(|(_, s)| s).unwrap_or("");
+    let prefix = ctx
+        .leaf
+        .text
+        .split_once(content.old)
+        .map(|(p, _)| p)
+        .unwrap_or("");
+    let suffix = ctx
+        .leaf
+        .text
+        .split_once(content.old)
+        .map(|(_, s)| s)
+        .unwrap_or("");
     let attrs = |kind: &str, id: u32| {
         format!(
             "<w:{kind} w:id=\"{id}\" w:author=\"{}\" w:date=\"{}\">",
