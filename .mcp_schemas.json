@@ -930,5 +930,44 @@
   "title": "document_patchArguments",
   "type": "object",
   "additionalProperties": false
+ },
+ "history_diff": {
+  "properties": {
+   "against": {
+    "title": "Against",
+    "type": "string"
+   },
+   "version": {
+    "title": "Version",
+    "type": "string"
+   }
+  },
+  "required": [
+   "version"
+  ],
+  "title": "history_diffArguments",
+  "type": "object",
+  "additionalProperties": false
+ },
+ "history_blame": {
+  "properties": {
+   "paragraph_id": {
+    "title": "Paragraph Id",
+    "type": "string"
+   }
+  },
+  "required": [
+   "paragraph_id"
+  ],
+  "title": "history_blameArguments",
+  "type": "object",
+  "additionalProperties": false
+ },
+ "history_verify": {
+  "properties": {
+  },
+  "title": "history_verifyArguments",
+  "type": "object",
+  "additionalProperties": false
  }
 }

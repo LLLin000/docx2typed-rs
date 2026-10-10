@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 40] = [
+pub const TOOL_NAMES: [&str; 43] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -80,6 +80,9 @@ pub const TOOL_NAMES: [&str; 40] = [
     "document_search",
     "document_read",
     "document_patch",
+    "history_diff",
+    "history_blame",
+    "history_verify",
 ];
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
@@ -1512,6 +1515,70 @@ impl McpSession {
         }
     }
 
+    /// Which paragraphs one version changed, against its parent by default.
+    fn history_diff(&self, args: &Value, build_commit: &str) -> Value {
+        let Some(workdir) = self.workdir.as_deref() else {
+            return self.failure(
+                "history_diff",
+                "workdir-not-open",
+                "no workdir open; call workdir_open first",
+                build_commit,
+            );
+        };
+        let version = args.get("version").and_then(Value::as_str).unwrap_or("");
+        let against = args.get("against").and_then(Value::as_str);
+        match docx2typed_store::versions::history_diff(Path::new(workdir), version, against) {
+            Ok(data) => self.success("history_diff", data, build_commit),
+            Err(error) => {
+                let code = error.code().unwrap_or("store-invalid").to_string();
+                self.failure("history_diff", &code, &error.message(), build_commit)
+            }
+        }
+    }
+
+    /// The version that last changed one paragraph.
+    fn history_blame(&self, args: &Value, build_commit: &str) -> Value {
+        let Some(workdir) = self.workdir.as_deref() else {
+            return self.failure(
+                "history_blame",
+                "workdir-not-open",
+                "no workdir open; call workdir_open first",
+                build_commit,
+            );
+        };
+        let paragraph_id = args
+            .get("paragraph_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        match docx2typed_store::versions::history_blame(Path::new(workdir), paragraph_id) {
+            Ok(data) => self.success("history_blame", data, build_commit),
+            Err(error) => {
+                let code = error.code().unwrap_or("store-invalid").to_string();
+                self.failure("history_blame", &code, &error.message(), build_commit)
+            }
+        }
+    }
+
+    /// Retained-content integrity: a deliberately trimmed version is reported
+    /// as trimmed, never as corruption.
+    fn history_verify(&self, build_commit: &str) -> Value {
+        let Some(workdir) = self.workdir.as_deref() else {
+            return self.failure(
+                "history_verify",
+                "workdir-not-open",
+                "no workdir open; call workdir_open first",
+                build_commit,
+            );
+        };
+        match docx2typed_store::versions::history_verify(Path::new(workdir)) {
+            Ok(data) => self.success("history_verify", data, build_commit),
+            Err(error) => {
+                let code = error.code().unwrap_or("store-invalid").to_string();
+                self.failure("history_verify", &code, &error.message(), build_commit)
+            }
+        }
+    }
+
     /// Apply a batch of edits to the draft in one atomic call.
     fn document_patch(&self, args: &Value, build_commit: &str) -> Value {
         let hunks = args.get("hunks").cloned();
@@ -1972,6 +2039,24 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
         "document_patch" => {
             let mut json = serde_json::to_string(&session.document_patch(&args, build_commit))
                 .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "history_diff" => {
+            let mut json = serde_json::to_string(&session.history_diff(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "history_blame" => {
+            let mut json = serde_json::to_string(&session.history_blame(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "history_verify" => {
+            let mut json =
+                serde_json::to_string(&session.history_verify(build_commit)).expect("serializes");
             json.insert_str(0, "OK ");
             json
         }
