@@ -7,3 +7,9 @@ capabilities/manifest.json -text
 corpus/release/*.docx -text
 qualification/rust_tracer62/fixtures/legacy/** -text
 qualification/rust_tracer62/fixtures/edits.json -text
+
+# Captured reference expectations are compared BYTE FOR BYTE (styles.json is a
+# canonical asset whose bytes are hashed into the tree digest), so a CRLF
+# checkout on Windows must not rewrite them. Found the hard way: this failed
+# only on the Windows runner.
+crates/docx2typed-core/tests/fixtures/* -text
