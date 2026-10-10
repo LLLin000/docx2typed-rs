@@ -52,12 +52,6 @@
       "status": "missing"
     },
     {
-      "tool": "history_list",
-      "python_site": "mcp_server.py:5934",
-      "rust_owner": "review/history.rs:163",
-      "status": "partial"
-    },
-    {
       "tool": "history_restore",
       "python_site": "mcp_server.py:5951",
       "rust_owner": "store/store.rs",
