@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 39] = [
+pub const TOOL_NAMES: [&str; 40] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -79,6 +79,7 @@ pub const TOOL_NAMES: [&str; 39] = [
     "history_list",
     "document_search",
     "document_read",
+    "document_patch",
 ];
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
@@ -1510,6 +1511,43 @@ impl McpSession {
             }
         }
     }
+
+    /// Apply a batch of edits to the draft in one atomic call.
+    fn document_patch(&self, args: &Value, build_commit: &str) -> Value {
+        let hunks = args.get("hunks").cloned();
+        let diff = args.get("diff").and_then(Value::as_str).map(str::to_string);
+        let base_revision = args
+            .get("base_revision")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let allow_comment_text = args
+            .get("allow_comment_text")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let tracked = self.track;
+        let author = self.author.clone();
+        self.draft_tool("document_patch", args, build_commit, move |target| {
+            draft::ensure_projection(target)
+                .map_err(|error| MutationError::new(error.code, error.detail))?;
+            let hunk_slice = hunks
+                .as_ref()
+                .and_then(Value::as_array)
+                .map(|values| values.as_slice());
+            draft::document_patch(
+                target,
+                hunk_slice,
+                diff.as_deref(),
+                base_revision.as_deref(),
+                allow_comment_text,
+                draft::EditTracking {
+                    tracked,
+                    author: author.as_deref(),
+                    date: None,
+                },
+            )
+            .map_err(|error| MutationError::new(error.code, error.detail))
+        })
+    }
 }
 
 /// `draft_dirty`: the same freshness rule as `diff_preview`/`workdir_status`
@@ -1927,6 +1965,12 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
         }
         "document_read" => {
             let mut json = serde_json::to_string(&session.document_read(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "document_patch" => {
+            let mut json = serde_json::to_string(&session.document_patch(&args, build_commit))
                 .expect("serializes");
             json.insert_str(0, "OK ");
             json

@@ -897,5 +897,38 @@
   "title": "document_readArguments",
   "type": "object",
   "additionalProperties": false
+ },
+ "document_patch": {
+  "properties": {
+   "allow_comment_text": {
+    "default": false,
+    "title": "Allow Comment Text",
+    "type": "boolean"
+   },
+   "base_revision": {
+    "title": "Base Revision",
+    "type": "string"
+   },
+   "diff": {
+    "title": "Diff",
+    "type": "string"
+   },
+   "hunks": {
+    "items": {"type": "object"},
+    "title": "Hunks",
+    "type": "array"
+   },
+   "operation_id": {
+    "title": "Operation Id",
+    "type": "string"
+   },
+   "track": {
+    "title": "Track",
+    "type": "boolean"
+   }
+  },
+  "title": "document_patchArguments",
+  "type": "object",
+  "additionalProperties": false
  }
 }
