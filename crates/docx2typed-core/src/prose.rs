@@ -2352,9 +2352,537 @@ pub fn apply_build(
     patch_zip_member(&package, &part_path("document"), &new_part)
 }
 
+// ---------------------------------------------------------------------------
+// Character formatting: the `format_span` run-property lane
+// ---------------------------------------------------------------------------
+
+/// The main OOXML namespace (`w:`).
+pub const WORD_NAMESPACE: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+/// `CT_RPr` child sequence (ECMA-376 §17.3.2.28) — the single source of truth
+/// for the order of `w:rPr` children.
+///
+/// Word rejects an `rPr` whose children are out of sequence. Python's first
+/// `format_span` port shipped exactly that defect (fix #98): it *appended* the
+/// synthesized `w:vertAlign`, which is schema-invalid whenever the base run
+/// properties already carried a later element (`w:lang`, `w:rtl`,
+/// `w:rPrChange`, ...). Every insertion in this lane goes through
+/// [`insert_rpr_child`], which places the element in this sequence and never
+/// appends.
+pub const RPR_ORDER: [&str; 40] = [
+    "rStyle",
+    "rFonts",
+    "b",
+    "bCs",
+    "i",
+    "iCs",
+    "caps",
+    "smallCaps",
+    "strike",
+    "dstrike",
+    "outline",
+    "shadow",
+    "emboss",
+    "imprint",
+    "noProof",
+    "snapToGrid",
+    "vanish",
+    "webHidden",
+    "color",
+    "spacing",
+    "w",
+    "kern",
+    "position",
+    "sz",
+    "szCs",
+    "highlight",
+    "u",
+    "effect",
+    "bdr",
+    "shd",
+    "fitText",
+    "vertAlign",
+    "rtl",
+    "cs",
+    "em",
+    "lang",
+    "eastAsianLayout",
+    "specVanish",
+    "oMath",
+    "rPrChange",
+];
+
+/// Sort key of one `w:rPr` child; unknown properties sort last.
+pub fn rpr_schema_position(local: &str) -> usize {
+    RPR_ORDER
+        .iter()
+        .position(|name| *name == local)
+        .unwrap_or(RPR_ORDER.len())
+}
+
+/// The outcome of one character restyle: the new run properties, their
+/// canonical bytes, and the content-addressed character style they register
+/// under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRestyle {
+    /// The restyled `w:rPr` element, ready to replace the run's own.
+    pub rpr: String,
+    /// Canonical bytes of `rpr` (`w:rPrChange` dropped) — the style identity.
+    pub canonical_rpr: String,
+    /// The `s_<sha256[:16]>` id of `canonical_rpr`.
+    pub style_id: String,
+}
+
+impl RunRestyle {
+    /// Register the derived character style under its id: `style_id` -> `rPr`.
+    /// Content-addressed ids make this idempotent — an existing entry is left
+    /// untouched, and the id is returned either way.
+    pub fn register(&self, styles: &mut BTreeMap<String, String>) -> String {
+        styles
+            .entry(self.style_id.clone())
+            .or_insert_with(|| self.rpr.clone());
+        self.style_id.clone()
+    }
+}
+
+/// One `<w:rPr>` fragment taken apart for byte-level surgery.
+struct RprFragment {
+    bytes: Vec<u8>,
+    root: ElementNode,
+    children: Vec<ElementNode>,
+}
+
+/// The index of the single root element of one parsed fragment.
+fn root_index(nodes: &[ElementNode]) -> Result<usize, CoreError> {
+    let roots: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.parent.is_none())
+        .map(|(index, _)| index)
+        .collect();
+    match roots.as_slice() {
+        [index] => Ok(*index),
+        _ => Err(CoreError::Domain(
+            "invalid-xml: the fragment must hold exactly one element".to_string(),
+        )),
+    }
+}
+
+/// The attribute pairs of one element's opening tag, as (local name, value)
+/// in document order.
+fn tag_attribute_pairs(tag: &[u8]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut index = 1; // past '<'
+    while index < tag.len() && !tag[index].is_ascii_whitespace() {
+        if tag[index] == b'/' || tag[index] == b'>' {
+            return pairs;
+        }
+        index += 1;
+    }
+    while index < tag.len() {
+        while index < tag.len() && tag[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= tag.len() || tag[index] == b'/' || tag[index] == b'>' {
+            break;
+        }
+        let name_start = index;
+        while index < tag.len() && tag[index] != b'=' && !tag[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let name = String::from_utf8_lossy(&tag[name_start..index]).into_owned();
+        while index < tag.len() && tag[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= tag.len() || tag[index] != b'=' {
+            break;
+        }
+        index += 1;
+        while index < tag.len() && tag[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= tag.len() || (tag[index] != b'"' && tag[index] != b'\'') {
+            break;
+        }
+        let quote = tag[index];
+        index += 1;
+        let value_start = index;
+        while index < tag.len() && tag[index] != quote {
+            index += 1;
+        }
+        let value = String::from_utf8_lossy(&tag[value_start..index]).into_owned();
+        index += 1;
+        pairs.push((crate::xml_walker::local_name(&name), value));
+    }
+    pairs
+}
+
+/// Serialize one empty run-property element under `prefix`.
+fn render_empty_element(prefix: &str, local: &str, attributes: &[(&str, &str)]) -> String {
+    let mut out = format!("<{prefix}{local}");
+    for (name, value) in attributes {
+        out.push_str(&format!(r#" {prefix}{name}="{}""#, xml_attr(value)));
+    }
+    out.push_str("/>");
+    out
+}
+
+/// One malformed-argument refusal (`format-invalid-attribute`).
+fn invalid_attribute(detail: impl Into<String>) -> CoreError {
+    CoreError::Domain(format!("format-invalid-attribute: {}", detail.into()))
+}
+
+impl RprFragment {
+    /// Parse `rpr_xml`; `""` is the empty default run properties, exactly as
+    /// Python's `_rpr_with_overrides` reads a run that carries no `rPr`.
+    fn parse(rpr_xml: &str) -> Result<Self, CoreError> {
+        let text = if rpr_xml.trim().is_empty() {
+            format!(r#"<w:rPr xmlns:w="{WORD_NAMESPACE}"/>"#)
+        } else {
+            rpr_xml.to_string()
+        };
+        let bytes = text.into_bytes();
+        let nodes = build_tree(&scan_tags(&bytes))?;
+        let root = nodes[root_index(&nodes)?].clone();
+        if root.name != "rPr" {
+            return Err(CoreError::Domain(
+                "invalid-rpr: run properties must be a single <w:rPr> element".to_string(),
+            ));
+        }
+        let children = root
+            .children
+            .iter()
+            .map(|&index| nodes[index].clone())
+            .collect();
+        Ok(Self {
+            bytes,
+            root,
+            children,
+        })
+    }
+
+    /// The namespace prefix the fragment writes (`w:` for `w:rPr`, `""` for a
+    /// bare `rPr` relying on a default namespace declaration).
+    fn prefix(&self) -> &str {
+        match self.root.raw_name.find(':') {
+            Some(index) => &self.root.raw_name[..=index],
+            None => "",
+        }
+    }
+
+    /// The fragment's bytes, verbatim.
+    fn slice(&self, start: usize, end: usize) -> &str {
+        if start >= end {
+            return "";
+        }
+        // Offsets are tag boundaries inside a `&str`, so they always sit on
+        // char boundaries and the slice is valid UTF-8.
+        std::str::from_utf8(&self.bytes[start..end]).unwrap_or_default()
+    }
+
+    /// The opening tag in open form: a self-closing tag is expanded, because
+    /// the rebuilt fragment carries children.
+    fn open_form(&self) -> String {
+        let raw = self.slice(self.root.open_start, self.root.open_end);
+        let body = raw
+            .trim_end()
+            .trim_end_matches('>')
+            .trim_end()
+            .trim_end_matches('/')
+            .trim_end();
+        format!("{body}>")
+    }
+
+    /// The matching closing tag.
+    fn close_form(&self) -> String {
+        format!("</{}>", self.root.raw_name)
+    }
+
+    /// The child region: from the first child (or the end of the open tag) to
+    /// the start of the closing tag.
+    fn children_region(&self) -> (usize, usize) {
+        let start = self
+            .children
+            .first()
+            .map_or(self.root.open_end, |child| child.open_start);
+        let end = if self.root.self_closing {
+            self.root.open_end
+        } else {
+            self.root.close_start
+        };
+        (start, end)
+    }
+
+    /// The child carrying `local`, when the fragment has one.
+    fn child(&self, local: &str) -> Option<&ElementNode> {
+        self.children.iter().find(|child| child.name == local)
+    }
+
+    /// The attributes already in force for `local` — `None` when there is no
+    /// such child, or when it is not an empty property element.
+    fn child_attributes(&self, local: &str) -> Option<Vec<(String, String)>> {
+        let child = self.child(local)?;
+        if !child.children.is_empty() {
+            return None;
+        }
+        Some(tag_attribute_pairs(
+            &self.bytes[child.open_start..child.end],
+        ))
+    }
+
+    /// Rebuild the fragment with every `local`-named child dropped and
+    /// `element` (when given) inserted at `local`'s `CT_RPr` slot. Untouched
+    /// children, and all text between them, keep their original bytes: only
+    /// the moved element travels.
+    fn restyled(&self, local: &str, element: Option<&str>) -> String {
+        let (region_start, region_end) = self.children_region();
+        let order = rpr_schema_position(local);
+        let mut out = self.open_form();
+        let mut cursor = region_start;
+        let mut last_kept_end = region_start;
+        let mut placed = false;
+        for child in &self.children {
+            if child.name == local {
+                out.push_str(self.slice(cursor, child.open_start));
+                cursor = child.end;
+                continue;
+            }
+            if !placed && rpr_schema_position(&child.name) > order {
+                if let Some(text) = element {
+                    out.push_str(self.slice(cursor, child.open_start));
+                    out.push_str(text);
+                    cursor = child.open_start;
+                    placed = true;
+                }
+            }
+            out.push_str(self.slice(cursor, child.end));
+            cursor = child.end;
+            last_kept_end = child.end;
+        }
+        if let Some(text) = element {
+            if !placed {
+                // Sorts last: right after the final surviving child, before
+                // whatever text trails it.
+                let at = last_kept_end.max(cursor);
+                out.push_str(self.slice(cursor, at));
+                out.push_str(text);
+                cursor = at;
+            }
+        }
+        out.push_str(self.slice(cursor, region_end));
+        out.push_str(&self.close_form());
+        out
+    }
+}
+
+/// Insert `child_xml` into `rpr_xml` at its `CT_RPr` schema position, replacing
+/// any existing child of the same local name (mirror of Python's
+/// `insert_rpr_child`). Existing children are never reordered — only the
+/// inserted element moves to its slot.
+pub fn insert_rpr_child(rpr_xml: &str, child_xml: &str) -> Result<String, CoreError> {
+    let fragment = RprFragment::parse(rpr_xml)?;
+    let child_bytes = child_xml.as_bytes();
+    let nodes = build_tree(&scan_tags(child_bytes))?;
+    let child = nodes[root_index(&nodes)?].clone();
+    let element =
+        std::str::from_utf8(&child_bytes[child.open_start..child.end]).unwrap_or_default();
+    Ok(fragment.restyled(&child.name, Some(element)))
+}
+
+/// Remove every `local`-named child from `rpr_xml`; the boolean reports whether
+/// anything was removed (`false` means the fragment replays unchanged).
+pub fn remove_rpr_child(rpr_xml: &str, local: &str) -> Result<(String, bool), CoreError> {
+    let fragment = RprFragment::parse(rpr_xml)?;
+    if fragment.child(local).is_none() {
+        return Ok((rpr_xml.to_string(), false));
+    }
+    Ok((fragment.restyled(local, None), true))
+}
+
+/// The canonical bytes of one `rPr`: opening tag, every child except
+/// `w:rPrChange` (format history is not a format property), closing tag. This
+/// is the byte sequence the projection hashes into `s_<sha256[:16]>` style
+/// ids, so a restyled run lands on the id the read path already reports.
+pub fn canonical_rpr_bytes(rpr_xml: &str) -> Result<Vec<u8>, CoreError> {
+    let fragment = RprFragment::parse(rpr_xml)?;
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        fragment
+            .slice(fragment.root.open_start, fragment.root.open_end)
+            .as_bytes(),
+    );
+    for child in &fragment.children {
+        if child.name == "rPrChange" {
+            continue;
+        }
+        out.extend_from_slice(fragment.slice(child.open_start, child.end).as_bytes());
+    }
+    if !fragment.root.self_closing {
+        out.extend_from_slice(
+            fragment
+                .slice(fragment.root.close_start, fragment.root.end)
+                .as_bytes(),
+        );
+    }
+    Ok(out)
+}
+
+/// The content-addressed character style id of one `rPr` (mirror of Python's
+/// `style_id_for_rpr`).
+pub fn style_id_for_rpr(rpr_xml: &str) -> Result<String, CoreError> {
+    Ok(crate::document_projection::content_style_id(
+        &canonical_rpr_bytes(rpr_xml)?,
+    ))
+}
+
+/// Apply a **partial** attribute override to the run properties already in
+/// force (mirror of Python `_rpr_with_overrides`).
+///
+/// Every property not named in `attributes` keeps its bytes and its slot;
+/// each named one is placed by `CT_RPr` schema order. Returns `None` when the
+/// request changes nothing — the second application of the same attributes.
+///
+/// Supported: `vertAlign` (`"superscript"`/`"subscript"`, or `""`/`"baseline"`/
+/// `"none"`/`null` to clear a `w:vertAlign` already in force), `bold` and
+/// `italic` (`true`/`false`). Anything else is `format-invalid-attribute`.
+pub fn rpr_with_overrides(
+    base_rpr: &str,
+    attributes: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<String>, CoreError> {
+    use serde_json::Value;
+
+    let mut current: Option<String> = None;
+    let mut changed = false;
+    for (name, value) in attributes {
+        let text = current.as_deref().unwrap_or(base_rpr);
+        let fragment = RprFragment::parse(text)?;
+        let prefix = fragment.prefix().to_string();
+        let (local, element) = match name.as_str() {
+            "vertAlign" => {
+                let requested = match value {
+                    Value::Null => None,
+                    Value::String(text) if text.is_empty() => None,
+                    Value::String(text) if matches!(text.as_str(), "baseline" | "none") => None,
+                    Value::String(text) if matches!(text.as_str(), "superscript" | "subscript") => {
+                        Some(text.clone())
+                    }
+                    Value::String(text) => {
+                        return Err(invalid_attribute(format!(
+                            "vertAlign must be superscript or subscript, got {text:?}"
+                        )))
+                    }
+                    other => {
+                        return Err(invalid_attribute(format!(
+                            "vertAlign must be superscript or subscript, got {other}"
+                        )))
+                    }
+                };
+                let Some(align) = requested else {
+                    // Clearing: a schema-2 vertical marker is not part of the
+                    // run properties at all, so only a literal w:vertAlign is
+                    // removed — a real mutation when one is there.
+                    let (restyled, removed) = remove_rpr_child(text, "vertAlign")?;
+                    if removed {
+                        current = Some(restyled);
+                        changed = true;
+                    }
+                    continue;
+                };
+                if fragment.child_attributes("vertAlign")
+                    == Some(vec![("val".to_string(), align.clone())])
+                {
+                    continue; // already in force, verbatim
+                }
+                let element = render_empty_element(&prefix, "vertAlign", &[("val", &align)]);
+                ("vertAlign".to_string(), element)
+            }
+            "bold" | "italic" => {
+                let Value::Bool(enabled) = value else {
+                    return Err(invalid_attribute(format!(
+                        "{name} must be true or false, got {value}"
+                    )));
+                };
+                let local = if name == "bold" { "b" } else { "i" };
+                let attributes: Vec<(&str, &str)> = if *enabled {
+                    Vec::new()
+                } else {
+                    vec![("val", "0")]
+                };
+                if fragment.child_attributes(local)
+                    == Some(
+                        attributes
+                            .iter()
+                            .map(|(name, value)| (name.to_string(), value.to_string()))
+                            .collect(),
+                    )
+                {
+                    continue;
+                }
+                (
+                    local.to_string(),
+                    render_empty_element(&prefix, local, &attributes),
+                )
+            }
+            other => {
+                return Err(invalid_attribute(format!(
+                    "unsupported attribute {other:?}; supported: vertAlign \
+                     (superscript|subscript|baseline), bold, italic"
+                )))
+            }
+        };
+        current = Some(fragment.restyled(&local, Some(&element)));
+        changed = true;
+    }
+    Ok(if changed { current } else { None })
+}
+
+/// The `format_span` property lane: restyle the run properties already in
+/// force on one span of text and derive the character style that results.
+///
+/// `available_styles` is the document's style inventory (`styles.json` must
+/// mirror the source document): the derived variant is *reused* when the
+/// document already carries it and refused with `format-style-unavailable`
+/// when it does not — this engine never invents a style variable. Register the
+/// result with [`RunRestyle::register`].
+///
+/// Failure codes: `format-noop` (the request produces the properties already
+/// in force), `format-invalid-attribute`, `format-style-unavailable`. The
+/// remaining `format_span` refusals need paragraph context (region verticals,
+/// revision boundaries, span addressing) and belong to the caller.
+pub fn restyle_run_properties(
+    base_rpr: &str,
+    attributes: &serde_json::Map<String, serde_json::Value>,
+    available_styles: &BTreeSet<String>,
+) -> Result<RunRestyle, CoreError> {
+    let Some(rpr) = rpr_with_overrides(base_rpr, attributes)? else {
+        return Err(CoreError::Domain(format!(
+            "format-noop: the requested attributes already match the target's run properties ({})",
+            serde_json::Value::Object(attributes.clone())
+        )));
+    };
+    let canonical = canonical_rpr_bytes(&rpr)?;
+    let style_id = crate::document_projection::content_style_id(&canonical);
+    if !available_styles.contains(&style_id) {
+        return Err(CoreError::Domain(format!(
+            "format-style-unavailable: this document has no run carrying {} on the target's base \
+             formatting, and style variables cannot be invented (styles.json must mirror the source \
+             document). Reuse an existing variant by passing style_id=..., or apply the formatting \
+             once in Word and re-extract",
+            serde_json::Value::Object(attributes.clone())
+        )));
+    }
+    Ok(RunRestyle {
+        rpr,
+        canonical_rpr: String::from_utf8(canonical).unwrap_or_default(),
+        style_id,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Map, Value};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     fn fixture(name: &str) -> PathBuf {
@@ -2825,5 +3353,232 @@ mod tests {
             manifest.insert(name, hex::encode(Sha256::digest(&bytes)));
         }
         manifest
+    }
+
+    // -- format_span run-property lane --------------------------------------
+
+    fn rpr(body: &str) -> String {
+        format!(r#"<w:rPr xmlns:w="{WORD_NAMESPACE}">{body}</w:rPr>"#)
+    }
+
+    fn attributes(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect()
+    }
+
+    /// The rPr root's children, in document order.
+    fn child_order(rpr_xml: &str) -> Vec<String> {
+        let nodes = build_tree(&scan_tags(rpr_xml.as_bytes())).expect("well-formed rPr");
+        let root = &nodes[root_index(&nodes).expect("one root")];
+        root.children
+            .iter()
+            .map(|&index| nodes[index].name.clone())
+            .collect()
+    }
+
+    /// Layer 1 of the #98 regression: every child sits in CT_RPr sequence.
+    fn assert_schema_order(rpr_xml: &str) {
+        let order = child_order(rpr_xml);
+        let positions: Vec<usize> = order.iter().map(|name| rpr_schema_position(name)).collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] <= pair[1]),
+            "rPr children out of CT_RPr order: {order:?}"
+        );
+    }
+
+    #[test]
+    fn vertalign_is_inserted_in_schema_order() {
+        // The #98 case verbatim: `w:lang` must follow `w:vertAlign`, so a
+        // blind append is schema-invalid and Word can reject the document.
+        let base = rpr(
+            r#"<w:rFonts w:ascii="Times New Roman" w:eastAsia="宋体"/><w:sz w:val="21"/><w:szCs w:val="21"/><w:lang w:val="en-US" w:eastAsia="zh-CN"/>"#,
+        );
+        let restyled =
+            rpr_with_overrides(&base, &attributes(&[("vertAlign", json!("superscript"))]))
+                .expect("valid")
+                .expect("changed");
+        assert_schema_order(&restyled);
+        assert_eq!(
+            restyled,
+            rpr(
+                r#"<w:rFonts w:ascii="Times New Roman" w:eastAsia="宋体"/><w:sz w:val="21"/><w:szCs w:val="21"/><w:vertAlign w:val="superscript"/><w:lang w:val="en-US" w:eastAsia="zh-CN"/>"#
+            )
+        );
+        assert_eq!(
+            child_order(&restyled),
+            ["rFonts", "sz", "szCs", "vertAlign", "lang"]
+        );
+    }
+
+    #[test]
+    fn format_history_stays_last() {
+        let base =
+            rpr(r#"<w:rFonts w:ascii="Arial"/><w:lang w:val="en-US"/><w:rPrChange w:id="1"/>"#);
+        let restyled = rpr_with_overrides(&base, &attributes(&[("bold", json!(true))]))
+            .expect("valid")
+            .expect("changed");
+        assert_schema_order(&restyled);
+        assert_eq!(child_order(&restyled), ["rFonts", "b", "lang", "rPrChange"]);
+        // Format history is not a format property: the style identity drops it.
+        let canonical = canonical_rpr_bytes(&restyled).expect("canonical");
+        assert!(!String::from_utf8_lossy(&canonical).contains("rPrChange"));
+    }
+
+    #[test]
+    fn unnamed_run_properties_survive_untouched() {
+        let base = rpr(r#"<w:rFonts w:ascii="Arial"/><w:sz w:val="24"/><w:lang w:val="en-US"/>"#);
+        let restyled = rpr_with_overrides(&base, &attributes(&[("bold", json!(false))]))
+            .expect("valid")
+            .expect("changed");
+        // Dropping the one synthesized element reproduces the base byte for
+        // byte: every unnamed property kept its bytes *and* its slot.
+        assert_eq!(restyled.replace(r#"<w:b w:val="0"/>"#, ""), base);
+        assert_eq!(child_order(&restyled), ["rFonts", "b", "sz", "lang"]);
+    }
+
+    #[test]
+    fn applying_the_same_attributes_twice_changes_nothing() {
+        let base = rpr(r#"<w:sz w:val="21"/><w:lang w:val="en-US"/>"#);
+        let request = attributes(&[("vertAlign", json!("subscript"))]);
+        let once = rpr_with_overrides(&base, &request)
+            .expect("valid")
+            .expect("changed");
+        assert_eq!(rpr_with_overrides(&once, &request).expect("valid"), None);
+
+        // …and the lane reports the repeat as the frozen format-noop code.
+        let inventory = BTreeSet::from([style_id_for_rpr(&once).expect("style id")]);
+        let restyle = restyle_run_properties(&base, &request, &inventory).expect("first restyle");
+        assert_eq!(restyle.rpr, once);
+        let noop = restyle_run_properties(&restyle.rpr, &request, &inventory).expect_err("noop");
+        assert!(noop.to_string().starts_with("format-noop:"), "{noop}");
+    }
+
+    #[test]
+    fn registering_the_derived_style_is_idempotent() {
+        let base = rpr(r#"<w:sz w:val="21"/>"#);
+        let request = attributes(&[("italic", json!(true))]);
+        let derived = style_id_for_rpr(&rpr(r#"<w:i/><w:sz w:val="21"/>"#)).expect("style id");
+        let restyle = restyle_run_properties(&base, &request, &BTreeSet::from([derived.clone()]))
+            .expect("variant in the document");
+        assert_eq!(restyle.style_id, derived);
+
+        let mut styles = BTreeMap::new();
+        assert_eq!(restyle.register(&mut styles), restyle.style_id);
+        let registered = styles.clone();
+        restyle.register(&mut styles);
+        assert_eq!(styles, registered);
+        assert_eq!(styles.get(&restyle.style_id), Some(&restyle.rpr));
+    }
+
+    #[test]
+    fn clearing_a_vertical_alignment_removes_it() {
+        let base = rpr(
+            r#"<w:rFonts w:ascii="Arial"/><w:vertAlign w:val="superscript"/><w:lang w:val="en-US"/>"#,
+        );
+        let cleared = rpr(r#"<w:rFonts w:ascii="Arial"/><w:lang w:val="en-US"/>"#);
+        for request in [json!(null), json!("baseline"), json!("none"), json!("")] {
+            let restyled = rpr_with_overrides(&base, &attributes(&[("vertAlign", request)]))
+                .expect("valid")
+                .expect("changed");
+            assert_eq!(restyled, cleared);
+            assert_schema_order(&restyled);
+        }
+        // Nothing to clear is a no-op, not a mutation.
+        assert_eq!(
+            rpr_with_overrides(&cleared, &attributes(&[("vertAlign", json!("none"))]))
+                .expect("valid"),
+            None
+        );
+        // A different alignment replaces the one in force, in its own slot.
+        let swapped = rpr_with_overrides(&base, &attributes(&[("vertAlign", json!("subscript"))]))
+            .expect("valid")
+            .expect("changed");
+        assert_eq!(
+            swapped,
+            rpr(
+                r#"<w:rFonts w:ascii="Arial"/><w:vertAlign w:val="subscript"/><w:lang w:val="en-US"/>"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_run_without_properties_gets_an_explicit_rpr() {
+        let restyled = rpr_with_overrides("", &attributes(&[("italic", json!(true))]))
+            .expect("valid")
+            .expect("changed");
+        assert_eq!(restyled, rpr("<w:i/>"));
+        assert_schema_order(&restyled);
+    }
+
+    #[test]
+    fn unsupported_or_mistyped_attributes_are_refused() {
+        let base = rpr(r#"<w:rFonts w:ascii="Arial"/>"#);
+        for request in [
+            attributes(&[("underline", json!(true))]),
+            attributes(&[("vertAlign", json!("middle"))]),
+            attributes(&[("vertAlign", json!(3))]),
+            attributes(&[("bold", json!("yes"))]),
+        ] {
+            let error = rpr_with_overrides(&base, &request).expect_err("refused");
+            assert!(
+                error.to_string().starts_with("format-invalid-attribute:"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_variant_the_document_cannot_express_is_refused() {
+        let base = rpr(r#"<w:rFonts w:ascii="Arial"/>"#);
+        let request = attributes(&[("bold", json!(true))]);
+        let unavailable = restyle_run_properties(&base, &request, &BTreeSet::new())
+            .expect_err("no such variant in the document");
+        assert!(
+            unavailable
+                .to_string()
+                .starts_with("format-style-unavailable:"),
+            "{unavailable}"
+        );
+
+        // With the variant in the inventory it is reused, not invented.
+        let target = rpr(r#"<w:rFonts w:ascii="Arial"/><w:b/>"#);
+        let style_id = style_id_for_rpr(&target).expect("style id");
+        let restyle = restyle_run_properties(&base, &request, &BTreeSet::from([style_id.clone()]))
+            .expect("variant in the document");
+        assert_eq!(restyle.rpr, target);
+        assert_eq!(restyle.style_id, style_id);
+    }
+
+    #[test]
+    fn insert_rpr_child_places_by_schema_position_and_replaces_in_place() {
+        let base = rpr(r#"<w:rFonts w:ascii="Arial"/><w:lang w:val="en-US"/>"#);
+        let inserted =
+            insert_rpr_child(&base, r#"<w:vertAlign w:val="subscript"/>"#).expect("insert");
+        assert_eq!(
+            inserted,
+            rpr(
+                r#"<w:rFonts w:ascii="Arial"/><w:vertAlign w:val="subscript"/><w:lang w:val="en-US"/>"#
+            )
+        );
+        assert_schema_order(&inserted);
+        let replaced =
+            insert_rpr_child(&inserted, r#"<w:vertAlign w:val="superscript"/>"#).expect("replace");
+        assert_eq!(child_order(&replaced), ["rFonts", "vertAlign", "lang"]);
+        assert!(replaced.contains(r#"<w:vertAlign w:val="superscript"/>"#));
+        // A self-closing root is expanded; an empty base grows the default rPr.
+        assert_eq!(
+            insert_rpr_child(&rpr(""), "<w:b/>").expect("insert"),
+            rpr("<w:b/>")
+        );
+        assert_eq!(
+            remove_rpr_child(&replaced, "vertAlign").expect("remove").0,
+            rpr(r#"<w:rFonts w:ascii="Arial"/><w:lang w:val="en-US"/>"#)
+        );
+        assert_eq!(
+            remove_rpr_child(&base, "vertAlign").expect("remove"),
+            (base, false)
+        );
     }
 }
