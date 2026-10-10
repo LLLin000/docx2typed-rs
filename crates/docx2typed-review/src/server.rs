@@ -526,6 +526,53 @@ pub fn store_mutation_framed(
     expected_manifest_sha256: &str,
     run: impl FnOnce(&Path) -> Result<Value, MutationError> + Send + 'static,
 ) -> Result<Value, MutationError> {
+    store_mutation_boundary(
+        workdir,
+        operation,
+        operation_id,
+        canonical_args,
+        expected_generation,
+        expected_manifest_sha256,
+        false,
+        run,
+    )
+}
+
+/// A mutation that IS a save boundary, and so may record a Version (#37).
+///
+/// Only the tools the reference marks with `tx.mark_save_boundary` belong
+/// here: `commit_sync`, `history_restore`, `decide_all` and the table ops.
+/// Anything else must not, or a draft edit would mint a version.
+pub fn store_save_boundary(
+    workdir: &Path,
+    operation: &str,
+    operation_id: &str,
+    canonical_args: &Value,
+    run: impl FnOnce(&Path) -> Result<Value, MutationError> + Send + 'static,
+) -> Result<Value, MutationError> {
+    store_mutation_boundary(
+        workdir,
+        operation,
+        operation_id,
+        canonical_args,
+        "",
+        "",
+        true,
+        run,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn store_mutation_boundary(
+    workdir: &Path,
+    operation: &str,
+    operation_id: &str,
+    canonical_args: &Value,
+    expected_generation: &str,
+    expected_manifest_sha256: &str,
+    save_boundary: bool,
+    run: impl FnOnce(&Path) -> Result<Value, MutationError> + Send + 'static,
+) -> Result<Value, MutationError> {
     let canonical = canonical_operation_input(operation, canonical_args);
     let backed = docx2typed_store::has_store(workdir);
     let mut expected = expected_generation.to_string();
@@ -609,6 +656,7 @@ pub fn store_mutation_framed(
         input_sha256: manifest,
         expected_generation: expected,
         generation: true,
+        save_boundary,
         ledger_anchor: None,
         ledger_directory: true,
         evidence_path: None,

@@ -237,6 +237,7 @@ impl McpSession {
 
     /// Run one store-wrapped mutation against the session workdir and wrap
     /// the result as a CallToolResult (replay byte-exact via the ledger).
+    #[allow(clippy::too_many_arguments)]
     fn run_mutation(
         &self,
         operation: &str,
@@ -244,18 +245,30 @@ impl McpSession {
         canonical_args: Value,
         run: impl FnOnce(&Path) -> Result<Value, MutationError> + Send + 'static,
         build_commit: &str,
+        save_boundary: bool,
     ) -> Value {
         let workdir = match self.require_workdir() {
             Ok(workdir) => workdir.to_string(),
             Err(failure) => return failure,
         };
-        match store_mutation(
-            Path::new(&workdir),
-            operation,
-            operation_id,
-            &canonical_args,
-            run,
-        ) {
+        let result = if save_boundary {
+            docx2typed_review::server::store_save_boundary(
+                Path::new(&workdir),
+                operation,
+                operation_id,
+                &canonical_args,
+                run,
+            )
+        } else {
+            store_mutation(
+                Path::new(&workdir),
+                operation,
+                operation_id,
+                &canonical_args,
+                run,
+            )
+        };
+        match result {
             Ok(data) => self.success(operation, data, build_commit),
             Err(error) => self.failure(operation, &error.code, &error.detail, build_commit),
         }
@@ -425,6 +438,20 @@ impl McpSession {
         build_commit: &str,
         run: impl FnOnce(&Path) -> Result<Value, MutationError> + Send + 'static,
     ) -> Value {
+        self.draft_tool_with_boundary(operation, args, build_commit, false, run)
+    }
+
+    /// `save_boundary` declares that this mutation may record a Version (#37).
+    /// Only `commit_sync` sets it; every other draft tool must not, because in
+    /// Rust a draft edit already moves the canonical tree.
+    fn draft_tool_with_boundary(
+        &self,
+        operation: &str,
+        args: &Value,
+        build_commit: &str,
+        save_boundary: bool,
+        run: impl FnOnce(&Path) -> Result<Value, MutationError> + Send + 'static,
+    ) -> Value {
         let operation_id = match self.require_operation_id(operation, args, build_commit) {
             Ok(id) => id,
             Err(failure) => return failure,
@@ -433,7 +460,14 @@ impl McpSession {
             "workdir": self.workdir.clone().unwrap_or_default(),
             "args": args,
         });
-        self.run_mutation(operation, &operation_id, canonical_args, run, build_commit)
+        self.run_mutation(
+            operation,
+            &operation_id,
+            canonical_args,
+            run,
+            build_commit,
+            save_boundary,
+        )
     }
 
     fn replace_text(&self, args: &Value, build_commit: &str) -> Value {
@@ -549,7 +583,7 @@ impl McpSession {
     fn commit_sync(&self, args: &Value, build_commit: &str) -> Value {
         let tracked = self.track;
         let author = self.author.clone();
-        self.draft_tool("commit_sync", args, build_commit, move |target| {
+        self.draft_tool_with_boundary("commit_sync", args, build_commit, true, move |target| {
             let changed =
                 draft::apply_projection_with_options(target, tracked, author.as_deref(), None)
                     .map_err(|error| MutationError::new(error.code, error.detail))?;
@@ -1044,6 +1078,7 @@ impl McpSession {
                     .map_err(|error| MutationError::new(error.code, error.detail))
             },
             build_commit,
+            false,
         )
     }
 
@@ -1073,6 +1108,7 @@ impl McpSession {
                     .map_err(|error| MutationError::new(error.code, error.detail))
             },
             build_commit,
+            false,
         )
     }
 
@@ -1102,6 +1138,7 @@ impl McpSession {
                     .map_err(|error| MutationError::new(error.code, error.detail))
             },
             build_commit,
+            false,
         )
     }
 
@@ -1202,6 +1239,7 @@ impl McpSession {
                 Ok(json!({ "acknowledged": acknowledged, "counts": counts }))
             },
             build_commit,
+            false,
         )
     }
 

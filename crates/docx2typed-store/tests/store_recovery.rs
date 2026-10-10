@@ -68,6 +68,11 @@ fn simple_run(text: &str) -> MutateRun {
 }
 
 fn mutate(store: &Store, operation_id: &str) -> Result<Value, StoreError> {
+    mutate_as(store, operation_id, false)
+}
+
+/// `save_boundary` is what lets a commit record a Version (#37).
+fn mutate_as(store: &Store, operation_id: &str, save_boundary: bool) -> Result<Value, StoreError> {
     let pin = store.pin().expect("pin");
     store.mutate(StoreMutateRequest {
         workdir: store.root.clone(),
@@ -77,6 +82,7 @@ fn mutate(store: &Store, operation_id: &str) -> Result<Value, StoreError> {
         input_sha256: pin.manifest_sha256.clone().unwrap_or_default(),
         expected_generation: pin.generation,
         generation: true,
+        save_boundary,
         ledger_anchor: None,
         ledger_directory: true,
         evidence_path: None,
@@ -170,6 +176,7 @@ fn writer_busy_and_bounded_timeout_use_frozen_codes() {
         input_sha256: pin.manifest_sha256.clone().unwrap_or_default(),
         expected_generation: pin.generation,
         generation: true,
+        save_boundary: false,
         ledger_anchor: None,
         ledger_directory: true,
         evidence_path: None,
@@ -218,6 +225,7 @@ fn stale_writer_generation_conflict() {
             input_sha256: planned.manifest_sha256.clone().unwrap_or_default(),
             expected_generation: planned.generation,
             generation: true,
+            save_boundary: false,
             ledger_anchor: None,
             ledger_directory: true,
             evidence_path: None,
@@ -262,6 +270,7 @@ fn cas_race_yields_one_winner() {
                 input_sha256: planned_manifest,
                 expected_generation: planned_gen,
                 generation: true,
+                save_boundary: false,
                 ledger_anchor: None,
                 ledger_directory: true,
                 evidence_path: None,
@@ -373,6 +382,7 @@ fn replay_same_operation_id_no_second_effect() {
             input_sha256: pin.manifest_sha256.clone().unwrap_or_default(),
             expected_generation: pin.generation,
             generation: true,
+            save_boundary: false,
             ledger_anchor: None,
             ledger_directory: true,
             evidence_path: None,
@@ -547,6 +557,7 @@ fn kill_during_external_publish_rolls_back_verified_backup() {
             input_sha256: pin.manifest_sha256.clone().unwrap_or_default(),
             expected_generation: pin.generation,
             generation: false,
+            save_boundary: false,
             ledger_anchor: Some(output_for_run.clone()),
             ledger_directory: false,
             evidence_path: Some(PathBuf::from(format!("{}.evidence.json", output.display()))),
@@ -600,6 +611,7 @@ fn kill_after_external_publish_recovers_forward() {
             input_sha256: pin.manifest_sha256.clone().unwrap_or_default(),
             expected_generation: pin.generation,
             generation: false,
+            save_boundary: false,
             ledger_anchor: Some(output_for_run.clone()),
             ledger_directory: false,
             evidence_path: Some(PathBuf::from(format!("{}.evidence.json", output.display()))),
@@ -743,6 +755,7 @@ fn corruption_yields_needs_recovery() {
             input_sha256: planned_manifest,
             expected_generation: planned_gen,
             generation: true,
+            save_boundary: false,
             ledger_anchor: None,
             ledger_directory: true,
             evidence_path: None,
@@ -925,4 +938,65 @@ fn a_mutation_does_not_invent_a_version_head() {
             "{field} must not be invented: a mutation is not a save"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The save boundary decides whether a Version is recorded (#37).
+// ---------------------------------------------------------------------------
+
+/// A mutation that is NOT a save boundary must not record a version, even
+/// though it moves the canonical tree.
+///
+/// This is the regression for a real defect found while wiring the writer:
+/// Rust's draft lane writes `typed.md` at edit time, so deriving the boundary
+/// from the tree digest recorded V1 for a `replace_text` and V2 for the first
+/// `commit_sync` -- where the reference gives nothing for the edit and V1 for
+/// the save. The flag is what makes the two distinguishable.
+#[test]
+fn a_draft_edit_records_no_version_but_a_save_does() {
+    let _guard = suite_lock();
+    let root = scratch("boundary");
+    let store = init_store(&root);
+
+    // A draft edit: same tree-moving run, no boundary.
+    mutate_as(&store, &op(), false).expect("draft mutate");
+    let after_draft: Value =
+        serde_json::from_str(&fs::read_to_string(root.join("workdir.json")).unwrap()).unwrap();
+    assert!(
+        after_draft.get("head_version").is_none(),
+        "a draft edit must not name a version"
+    );
+
+    // A save: identical run, boundary set.
+    mutate_as(&store, &op(), true).expect("save mutate");
+    let after_save: Value =
+        serde_json::from_str(&fs::read_to_string(root.join("workdir.json")).unwrap()).unwrap();
+    assert_eq!(after_save["head_version"], "V1", "the first save is V1");
+    assert_eq!(after_save["version_seq"], 1);
+    assert_eq!(
+        after_save["head_version_generation"], after_save["generation"],
+        "a version names the generation it was recorded at"
+    );
+    assert!(after_save["head_tree"].is_string());
+    assert!(after_save["head_commit"].is_string());
+    assert!(after_save["head_tree_object"].is_string());
+
+    // The objects it names are really in the pool, and the tree materialises
+    // back to the state that was saved.
+    let tree_id = after_save["head_tree_object"].as_str().unwrap();
+    let destination = scratch("boundary-materialized");
+    let written = docx2typed_store::materialize(&root, tree_id, &destination).expect("materialize");
+    assert!(written.contains(&"typed.md".to_string()));
+    assert_eq!(
+        fs::read_to_string(destination.join("typed.md")).unwrap(),
+        fs::read_to_string(store.pin().expect("pin").path.join("typed.md")).unwrap()
+    );
+
+    // A second save whose tree is UNCHANGED records no version, which is the
+    // reference's measured behaviour for a no-op save.
+    mutate_as(&store, &op(), true).expect("no-op save");
+    let after_noop: Value =
+        serde_json::from_str(&fs::read_to_string(root.join("workdir.json")).unwrap()).unwrap();
+    assert_eq!(after_noop["head_version"], "V1");
+    assert_eq!(after_noop["version_seq"], 1);
 }

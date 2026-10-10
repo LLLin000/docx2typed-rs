@@ -650,11 +650,98 @@ const VERSION_POINTER_FIELDS: [&str; 7] = [
 /// 0044) — while only a save boundary replaces them. Writing them off here is
 /// not "no opinion": it erases a timeline, and leaves the objects it named in
 /// the pool with nothing referencing them.
+/// What a save boundary adds to a Version's metadata. `origin` names who
+/// asked for the save; `label` and `pin` are retention inputs — only an
+/// intentional name pins a version past retention, so a system label must
+/// never be mistaken for one.
+#[derive(Clone, Debug, Default)]
+pub struct SaveBoundary {
+    pub origin: String,
+    pub label: Option<String>,
+    pub pin: bool,
+    pub baseline_epoch: Option<i64>,
+}
+
+/// Record a Version at a save boundary: objects first, then the pointer.
+///
+/// Returns the version record, or `None` when the canonical tree did not
+/// change — which is the ordinary case the reference defines (measured:
+/// committing a clean draft advances the generation and creates no version).
+///
+/// Ordering is the whole point. Objects land before the pointer that names
+/// them, so a crash between the two leaves an unreferenced object and a
+/// recoverable workdir; the reverse would leave a pointer naming nothing.
+pub fn record_version(
+    root: &Path,
+    state_dir: &Path,
+    boundary: &SaveBoundary,
+) -> Result<Option<Value>, StoreError> {
+    let Some(previous) = read_json_file(&root.join(POINTER_FILE)).ok() else {
+        return Ok(None);
+    };
+    if previous.get("schema").and_then(Value::as_str) != Some(POINTER_SCHEMA) {
+        return Ok(None);
+    }
+    let digest = crate::objects::canonical_tree_digest(state_dir)?;
+    // The save-boundary rule, and the only one: a version exists because the
+    // canonical tree changed, never because a commit happened.
+    if previous.get("head_tree").and_then(Value::as_str) == Some(digest.as_str()) {
+        return Ok(None);
+    }
+    let sequence = previous
+        .get("version_seq")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        + 1;
+    let tree = crate::objects::build_tree(root, state_dir, Some(&digest))?;
+    let head_tree_object = tree
+        .get("tree")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let version = format!("V{sequence}");
+    let baseline_epoch = boundary
+        .baseline_epoch
+        .or_else(|| previous.get("baseline_epoch").and_then(Value::as_i64))
+        .unwrap_or(1);
+    let commit = crate::objects::write_commit(
+        root,
+        &json!({
+            "version": version,
+            "seq": sequence,
+            "parent_version": previous.get("head_version").cloned().unwrap_or(Value::Null),
+            "parent_generation": previous.get("head_version_generation").cloned().unwrap_or(Value::Null),
+            "parent_commit": previous.get("head_commit").cloned().unwrap_or(Value::Null),
+            "head_tree": digest,
+            "tree_object": head_tree_object,
+            "baseline_epoch": baseline_epoch,
+            "origin": boundary.origin,
+            "label": boundary.label,
+            "pin": boundary.pin,
+            "restored_from": Value::Null,
+            "created_at": now_iso(),
+        }),
+    )?;
+
+    // Objects are written; naming them is the caller's pointer write, so the
+    // version lands in ONE write rather than a second one racing the first.
+    Ok(Some(json!({
+        "version": version,
+        "seq": sequence,
+        "tree": digest,
+        "tree_object": head_tree_object,
+        "commit": commit,
+        "baseline_epoch": baseline_epoch,
+        "head_version_generation": previous.get("generation").cloned().unwrap_or(Value::Null),
+    })))
+}
+
 fn pointer_payload(
     root: &Path,
     generation: &str,
     operation_id: Option<&str>,
     manifest_sha256: &str,
+    version: Option<&Value>,
 ) -> Value {
     let mut payload = json!({
         "schema": POINTER_SCHEMA,
@@ -675,6 +762,25 @@ fn pointer_payload(
                     }
                 }
             }
+        }
+    }
+    if let Some(version) = version {
+        if let Some(object) = payload.as_object_mut() {
+            for (field, key) in [
+                ("head_version", "version"),
+                ("head_tree", "tree"),
+                ("head_tree_object", "tree_object"),
+                ("head_commit", "commit"),
+                ("baseline_epoch", "baseline_epoch"),
+                ("version_seq", "seq"),
+            ] {
+                if let Some(value) = version.get(key) {
+                    object.insert(field.to_string(), value.clone());
+                }
+            }
+            // The generation this version was recorded at is the one being
+            // committed now, not the previous pointer's.
+            object.insert("head_version_generation".to_string(), json!(generation));
         }
     }
     payload
@@ -1186,6 +1292,9 @@ impl Store {
                     .get("assets_sha256")
                     .and_then(Value::as_str)
                     .unwrap_or(""),
+                // Birth publishes the first generation. It is not a save, so
+                // it names no version -- a fresh workdir has no timeline yet.
+                None,
             );
             let mut bytes = canonical_json(&pointer).into_bytes();
             bytes.push(b'\n');
@@ -1664,13 +1773,43 @@ impl Store {
         Ok(())
     }
 
+    /// Publish HEAD.
+    ///
+    /// `gen_dir` is `Some` when this commit publishes a new generation whose
+    /// canonical tree may have changed — the save boundary. The version is
+    /// recorded here rather than by the caller so it lands in the SAME pointer
+    /// write: a second write would race the first and would not be covered by
+    /// the generation CAS.
+    ///
+    /// `origin` names the operation, which is what the reference records too
+    /// (`commit_sync`, `accept all revisions`, a restore).
     fn commit_pointer(
         &self,
         generation: &str,
         operation_id: &str,
         manifest_sha256: &str,
-    ) -> Result<(), StoreError> {
-        let pointer = pointer_payload(&self.root, generation, Some(operation_id), manifest_sha256);
+        gen_dir: Option<&Path>,
+        origin: &str,
+        save_boundary: bool,
+    ) -> Result<Option<Value>, StoreError> {
+        let version = match gen_dir.filter(|_| save_boundary) {
+            Some(gen_dir) => record_version(
+                &self.root,
+                gen_dir,
+                &SaveBoundary {
+                    origin: origin.to_string(),
+                    ..SaveBoundary::default()
+                },
+            )?,
+            None => None,
+        };
+        let pointer = pointer_payload(
+            &self.root,
+            generation,
+            Some(operation_id),
+            manifest_sha256,
+            version.as_ref(),
+        );
         let mut bytes = canonical_json(&pointer).into_bytes();
         bytes.push(b'\n');
         write_durable(
@@ -1679,7 +1818,8 @@ impl Store {
             Some("pointer-write"),
             Some("pointer-flush"),
             Some("pointer-rename"),
-        )
+        )?;
+        Ok(version)
     }
 
     fn write_evidence(&self, path: &Path, evidence: &Value) -> Result<(), StoreError> {
@@ -2595,7 +2735,14 @@ impl Store {
                     .expect("record_sha256"),
             );
             if request.generation {
-                self.commit_pointer(&generation_id, &request.operation_id, &manifest_sha)?;
+                self.commit_pointer(
+                    &generation_id,
+                    &request.operation_id,
+                    &manifest_sha,
+                    Some(&gen_dir),
+                    &request.operation,
+                    request.save_boundary,
+                )?;
             }
             pointer_committed.set(request.generation);
             write_journal_record(&tx_dir, &committed)?;
@@ -2761,7 +2908,9 @@ impl Store {
                 } else {
                     String::new()
                 };
-                let _ = self.commit_pointer(parent, "", &parent_manifest);
+                // A rollback republishes an existing generation; it is not a
+                // save, so it records no version.
+                let _ = self.commit_pointer(parent, "", &parent_manifest, None, "recovery", false);
             }
         }
         let _ = fs::remove_dir_all(self.generations_dir.join(generation));
@@ -2904,6 +3053,16 @@ pub struct StoreMutateRequest {
     /// `true` mutates a fresh immutable generation snapshot and commits the
     /// pointer; `false` only publishes external outputs (build).
     pub generation: bool,
+    /// Whether this commit is a SAVE BOUNDARY, and so may record a Version.
+    ///
+    /// Explicit, not derived from the tree digest. Rust's draft lane writes
+    /// `typed.md` at edit time while the reference keeps a draft in `edit.md`
+    /// until commit, so in Rust *every* draft edit moves the canonical tree.
+    /// Deriving the boundary from the digest would record a version per
+    /// keystroke; measured, before this flag existed: `replace_text` produced
+    /// V1 and the first `commit_sync` produced V2, where the reference gives
+    /// V1 for the save and nothing for the edit.
+    pub save_boundary: bool,
     pub ledger_anchor: Option<PathBuf>,
     pub ledger_directory: bool,
     pub evidence_path: Option<PathBuf>,
