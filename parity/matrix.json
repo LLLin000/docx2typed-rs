@@ -12,20 +12,8 @@
     {
       "tool": "format_span",
       "python_site": "mcp_server.py:3783",
-      "rust_owner": "core/prose.rs (primitive landed, #28)",
+      "rust_owner": "core/prose.rs (primitive landed #28; design #39)",
       "status": "partial"
-    },
-    {
-      "tool": "history_blame",
-      "python_site": "mcp_server.py:5886",
-      "rust_owner": null,
-      "status": "missing"
-    },
-    {
-      "tool": "history_diff",
-      "python_site": "mcp_server.py:5865",
-      "rust_owner": null,
-      "status": "missing"
     },
     {
       "tool": "history_gc",
@@ -40,21 +28,9 @@
       "status": "missing"
     },
     {
-      "tool": "history_verify",
-      "python_site": "mcp_server.py:5905",
-      "rust_owner": null,
-      "status": "missing"
-    },
-    {
       "tool": "workspace_adopt",
       "python_site": "mcp_server.py:2935",
       "rust_owner": "identity landed (#19); resolver + tool open",
-      "status": "partial"
-    },
-    {
-      "tool": "workspace_fork",
-      "python_site": "mcp_server.py:2984",
-      "rust_owner": "identity landed (#19); tool open",
       "status": "partial"
     }
   ]

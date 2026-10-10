@@ -32,21 +32,67 @@ _NON_TOOL_KEYS = {"table_ref", "workdir_out"}
 
 #: Python definition sites for the tools Rust does not expose yet, and the
 #: Rust crate that must own each capability. Kept here (not in the JSON) so the
-#: mapping is reviewed in code; ``status`` is asserted against the computed gap.
+#: mapping is reviewed in code, and checked against the computed gap in BOTH
+#: directions by the check below.
 _CAPABILITY_OWNERS = {
-    # Still missing from Rust. Entries are removed as each lands; the count is
-    # asserted against the computed gap, so a stale entry cannot hide a tool
-    # and a missing one cannot go unreported.
+    # Still missing from Rust. Entries are removed as each lands --
+    # `history_diff`, `history_blame`, `history_verify` and `workspace_fork` went
+    # with the commits that wired them, which the both-directions check forces.
     "document_replace": ("mcp_server.py:4947", None, "missing"),
-    "format_span": ("mcp_server.py:3783", "core/prose.rs (primitive landed, #28)", "partial"),
-    "history_diff": ("mcp_server.py:5865", None, "missing"),
-    "history_blame": ("mcp_server.py:5886", None, "missing"),
-    "history_verify": ("mcp_server.py:5905", None, "missing"),
+    "format_span": ("mcp_server.py:3783", "core/prose.rs (primitive landed #28; design #39)", "partial"),
     "history_restore": ("mcp_server.py:5951", "store/store.rs", "missing"),
     "history_gc": ("mcp_server.py:5917", "store/store.rs", "missing"),
     "workspace_adopt": ("mcp_server.py:2935", "identity landed (#19); resolver + tool open", "partial"),
-    "workspace_fork": ("mcp_server.py:2984", "identity landed (#19); tool open", "partial"),
 }
+
+
+def sync_matrix_md(rs: Path, p_tools: set[str], r_tools: set[str], missing: list[str]) -> None:
+    """Rewrite the count-bearing lines of matrix.md from the computed surface.
+
+    matrix.json is generated and matrix.md is prose, so every number quoted in
+    the prose was hand-maintained and free to drift -- it said "36 tools" and
+    "9 missing" while the computed surface was 44 and 5. The prose stays
+    hand-written; the numbers are substituted, so they cannot disagree with
+    the JSON sitting next to them.
+    """
+    path = rs / "parity" / "matrix.md"
+    text = path.read_text(encoding="utf-8")
+    n_missing, n_shared = len(missing), len(r_tools & p_tools)
+    subs = [
+        # | MCP tools | **49** | **40** | 9 missing, 0 extra |
+        (r"(\| MCP tools \| \*\*\d+\*\* \| \*\*)\d+(\*\* \| )[\d]+ missing",
+         lambda m: f"{m.group(1)}{len(r_tools)}{m.group(2)}{n_missing} missing"),
+        (r"exposes \d+ tools and lacks \*\*exactly the \d+ tools",
+         f"exposes {len(p_tools)} tools and lacks **exactly the {n_missing} tools"),
+        (r"## 2\. The \d+ missing MCP tools", f"## 2. The {n_missing} missing MCP tools"),
+        (r"among the \d+ shared tools", f"among the {n_shared} shared tools"),
+    ]
+    for pattern, replacement in subs:
+        text, count = re.subn(pattern, replacement, text)
+        if count != 1:
+            raise SystemExit(
+                f"error: matrix.md pattern {pattern!r} matched {count} times, expected 1 "
+                "-- the prose moved and the substitution would silently stop applying"
+            )
+
+    # The table rows come from the same map the check above validates, so a
+    # landed tool cannot leave a row behind: the row set IS the map.
+    def owner_cell(value: str | None) -> str:
+        if not value:
+            return "—"
+        # Bare paths read as code; prose stays prose.
+        return f"`{value}`" if " " not in value else value
+
+    rows = "\n".join(
+        f"| {i} | `{name}` | `{_CAPABILITY_OWNERS[name][0]}` | "
+        f"{owner_cell(_CAPABILITY_OWNERS[name][1])} | `{_CAPABILITY_OWNERS[name][2]}` |"
+        for i, name in enumerate(sorted(missing), 1)
+    )
+    start = text.index("| # | Tool | Python site | Rust infrastructure | Status |")
+    header_end = text.index("\n", text.index("|---|", start)) + 1
+    table_end = text.index("\n\n", header_end)
+    text = text[:header_end] + rows + text[table_end:]
+    path.write_text(text, encoding="utf-8")
 
 
 def python_tools(repo: Path) -> set[str]:
@@ -102,6 +148,17 @@ def main() -> int:
     untracked = [t for t in missing if t not in _CAPABILITY_OWNERS]
     if untracked:
         print(f"error: missing tools without a capability mapping: {untracked}", file=sys.stderr)
+        return 1
+    # The other direction, which was unchecked: a mapping whose tool has since
+    # landed. Such an entry claims a gap that is already closed, and it is
+    # exactly the entry a reader consults to decide what to build next.
+    lingering = sorted(t for t in _CAPABILITY_OWNERS if t not in missing)
+    if lingering:
+        print(
+            "error: capability mappings for tools that are no longer missing: "
+            f"{lingering} -- remove them; the gap is now {len(missing)}",
+            file=sys.stderr,
+        )
         return 1
 
     lock: dict[str, Any] = {
@@ -169,6 +226,7 @@ def main() -> int:
     (rs / "parity/python-lock.json").write_text(
         json.dumps(lock, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    sync_matrix_md(rs, p_tools, r_tools, missing)
     (rs / "parity/matrix.json").write_text(
         json.dumps(matrix, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
