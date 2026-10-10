@@ -889,6 +889,199 @@ fn base64_urlsafe(bytes: &[u8]) -> String {
     out
 }
 
+/// Inverse of [`base64_urlsafe`]. Python re-pads to a multiple of four before
+/// decoding, so a reference round-trips across the two engines.
+fn base64_urlsafe_decode(text: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut lookup = [255u8; 256];
+    for (index, byte) in ALPHABET.iter().enumerate() {
+        lookup[*byte as usize] = index as u8;
+    }
+    let mut out = Vec::with_capacity(text.len() * 3 / 4 + 3);
+    let mut packed: u32 = 0;
+    let mut bits = 0u32;
+    for byte in text.bytes() {
+        let value = lookup[byte as usize];
+        if value == 255 {
+            return None;
+        }
+        packed = (packed << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((packed >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// One decoded `match_ref` payload — the opaque, version-bound span address
+/// `document_search` hands out and `document_patch` consumes. Byte-compatible
+/// with Python's `_encode_match_ref`/`_decode_match_ref`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchRefPayload {
+    pub revision: String,
+    pub paragraph_id: String,
+    /// Char offsets into the paragraph's flattened visible text.
+    pub start: usize,
+    pub end: usize,
+    /// `sha256(text)[:16]` of the addressed text.
+    pub sha256: String,
+}
+
+/// Stable code for an unreadable span reference.
+pub const MATCH_REF_INVALID: &str = "match-ref-invalid";
+
+/// Decode a `match_ref`. Mirrors Python's `_decode_match_ref`: the prefix and
+/// every payload key are required, and anything unreadable fails closed rather
+/// than resolving to a guessed span.
+pub fn decode_match_ref(reference: &str) -> Result<MatchRefPayload, CoreError> {
+    let invalid = |detail: &str| CoreError::Domain(format!("{MATCH_REF_INVALID}: {detail}"));
+    let Some(body) = reference.strip_prefix("ref_") else {
+        return Err(invalid(&format!("not a span reference: {reference:?}")));
+    };
+    let raw = base64_urlsafe_decode(body)
+        .ok_or_else(|| invalid(&format!("span reference is corrupt: {reference:?}")))?;
+    let text = String::from_utf8(raw)
+        .map_err(|_| invalid(&format!("span reference is corrupt: {reference:?}")))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| invalid(&format!("span reference is corrupt: {reference:?}")))?;
+    let field = |name: &str| {
+        value
+            .get(name)
+            .ok_or_else(|| invalid(&format!("span reference is missing {name:?}")))
+    };
+    Ok(MatchRefPayload {
+        revision: field("revision")?
+            .as_str()
+            .ok_or_else(|| invalid("revision is not a string"))?
+            .to_string(),
+        paragraph_id: field("paragraph_id")?
+            .as_str()
+            .ok_or_else(|| invalid("paragraph_id is not a string"))?
+            .to_string(),
+        start: field("start")?
+            .as_u64()
+            .ok_or_else(|| invalid("start is not an integer"))? as usize,
+        end: field("end")?
+            .as_u64()
+            .ok_or_else(|| invalid("end is not an integer"))? as usize,
+        sha256: field("sha256")?
+            .as_str()
+            .ok_or_else(|| invalid("sha256 is not a string"))?
+            .to_string(),
+    })
+}
+
+/// `sha256(text)[:16]`, the digest a `match_ref` binds to its text.
+pub fn match_ref_digest(text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+/// Stable code for a reference that no longer addresses what it was issued for.
+pub const MATCH_REF_STALE: &str = "match-ref-stale";
+
+/// A `match_ref` resolved against the current draft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedMatchRef {
+    pub paragraph_id: String,
+    /// The exact visible text the reference addresses, now.
+    pub text: String,
+    /// Char offset of that text inside the paragraph's visible text.
+    pub start: usize,
+}
+
+/// Resolve a span reference to `(paragraph_id, exact text)` against the
+/// CURRENT draft — mirror of Python's `_resolve_match_ref`, including its
+/// recoverability: a stale reference reports what the document says at those
+/// offsets now, so the caller can re-issue in one step instead of
+/// re-searching.
+///
+/// The reference binds the draft revision, the paragraph, the char offsets and
+/// a digest of the addressed text. Any disagreement is `match-ref-stale`, not
+/// a guessed span: editing the wrong place silently is the failure mode this
+/// address exists to prevent.
+pub fn resolve_match_ref(workdir: &Path, reference: &str) -> Result<ResolvedMatchRef, CoreError> {
+    let payload = decode_match_ref(reference)?;
+    let current = classify_edit_state(workdir)?.edit_body_sha256;
+    let view = crate::document_view::document_read_view(workdir, None, 0, 0, "content")?;
+    let (_header, blocks) = crate::document_view::split_edit_blocks(&view.content)?;
+    let body = blocks
+        .iter()
+        .find(|block| {
+            crate::document_view::block_ident(block)
+                .map(|(_, id)| id == payload.paragraph_id)
+                .unwrap_or(false)
+        })
+        .map(|block| crate::document_view::block_body(block));
+    let Some(body) = body else {
+        return Err(stale(
+            &format!(
+                "{} is no longer in the draft; re-run document_search",
+                payload.paragraph_id
+            ),
+            &payload,
+            &current,
+            "",
+            0,
+        ));
+    };
+    let (flat, _boundaries) = body_boundaries(&body)?;
+    let chars: Vec<char> = flat.chars().collect();
+    if payload.start >= payload.end || payload.end > chars.len() {
+        let tail = if payload.start < chars.len() {
+            chars[payload.start..].iter().collect::<String>()
+        } else {
+            String::new()
+        };
+        return Err(stale(
+            &format!("span reference points outside {}", payload.paragraph_id),
+            &payload,
+            &current,
+            &tail,
+            payload.start,
+        ));
+    }
+    let candidate: String = chars[payload.start..payload.end].iter().collect();
+    if match_ref_digest(&candidate) != payload.sha256 {
+        return Err(stale(
+            &format!(
+                "the text at {}[{}:{}] changed since the reference was issued",
+                payload.paragraph_id, payload.start, payload.end
+            ),
+            &payload,
+            &current,
+            &candidate,
+            payload.start,
+        ));
+    }
+    Ok(ResolvedMatchRef {
+        paragraph_id: payload.paragraph_id,
+        text: candidate,
+        start: payload.start,
+    })
+}
+
+/// A refusal that hands back what the document says at those offsets now.
+fn stale(
+    reason: &str,
+    payload: &MatchRefPayload,
+    current_revision: &str,
+    current_text: &str,
+    offset: usize,
+) -> CoreError {
+    let details = serde_json::json!({
+        "current_revision": current_revision,
+        "ref_revision": payload.revision,
+        "paragraph_id": payload.paragraph_id,
+        "offset": offset,
+        "current_text": current_text,
+        "expected_sha256": payload.sha256,
+    });
+    CoreError::Domain(format!("{MATCH_REF_STALE}: {reason} | {details}"))
+}
+
 /// First char offset of `needle` in `haystack` at or after `from`, mirroring
 /// Python `str.find` (char offsets, not byte offsets).
 fn find_chars(haystack: &[char], needle: &[char], from: usize) -> Option<usize> {
