@@ -14,6 +14,7 @@ pub mod edit_state;
 pub mod govern;
 pub mod inspect;
 pub mod prose;
+pub mod workspace_identity;
 pub mod xml_walker;
 
 use std::collections::BTreeMap;
