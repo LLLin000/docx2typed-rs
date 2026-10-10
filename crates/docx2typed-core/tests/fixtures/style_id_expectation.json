@@ -1,0 +1,141 @@
+{
+ "schema": "docx2typed-style-id-expectation-1",
+ "note": "Captured from the Python reference (scripts.typed_core). Rust must reproduce both the canonical string and the id exactly, because the id is content-addressed over a canonical form the two engines must agree on -- and styles.json is a canonical asset, so a disagreement also moves the tree digest and the version chain.",
+ "cases": [
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"/>",
+   "canonical": "[\"w:rPr\",[],\"\",[]]",
+   "style_id": "s_9f5c04f8681ebd4e"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"/>",
+   "canonical": "[\"w:rPr\",[],\"\",[]]",
+   "style_id": "s_9f5c04f8681ebd4e"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:b w:val=\"false\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[]]",
+   "style_id": "s_9f5c04f8681ebd4e"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:b w:val=\"true\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:b\",[],\"\",[]]]]",
+   "style_id": "s_7bcd5993147ef730"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:b/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:b\",[],\"\",[]]]]",
+   "style_id": "s_7bcd5993147ef730"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:b/><w:sz w:val=\"24\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:b\",[],\"\",[]],[\"w:sz\",[[\"w:val\",\"24\"]],\"\",[]]]]",
+   "style_id": "s_8625025d2d375d76"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:caps/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:caps\",[],\"\",[]]]]",
+   "style_id": "s_dcd94e547970cfe0"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:color w:val=\"0563C1\"/><w:u w:val=\"single\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:color\",[[\"w:val\",\"0563C1\"]],\"\",[]],[\"w:u\",[[\"w:val\",\"single\"]],\"\",[]]]]",
+   "style_id": "s_3429feeb3ea4b5e2"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:color w:val=\"C00000\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:color\",[[\"w:val\",\"C00000\"]],\"\",[]]]]",
+   "style_id": "s_79ed9ea70784c422"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:dstrike/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:dstrike\",[],\"\",[]]]]",
+   "style_id": "s_4ca43f10abbcf0b8"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:highlight w:val=\"yellow\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:highlight\",[[\"w:val\",\"yellow\"]],\"\",[]]]]",
+   "style_id": "s_6f010b45bc828f80"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:i/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:i\",[],\"\",[]]]]",
+   "style_id": "s_865fd27a096a0aea"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:lang w:val=\"en-US\"/><w:vertAlign w:val=\"superscript\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:lang\",[[\"w:val\",\"en-US\"]],\"\",[]],[\"w:vertAlign\",[[\"w:val\",\"superscript\"]],\"\",[]]]]",
+   "style_id": "s_83a38adb9cfe6316"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:rFonts w:ascii=\"Times New Roman\" w:hAnsi=\"Times New Roman\" w:rsidR=\"00A\"/><w:i/><w:sz w:val=\"28\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:i\",[],\"\",[]],[\"w:rFonts\",[[\"w:ascii\",\"Times New Roman\"],[\"w:hAnsi\",\"Times New Roman\"]],\"\",[]],[\"w:sz\",[[\"w:val\",\"28\"]],\"\",[]]]]",
+   "style_id": "s_c78500cf2e02409a"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:rFonts w:ascii=\"Times New Roman\" w:hAnsi=\"Times New Roman\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:rFonts\",[[\"w:ascii\",\"Times New Roman\"],[\"w:hAnsi\",\"Times New Roman\"]],\"\",[]]]]",
+   "style_id": "s_adcd924781ac8b4e"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:rFonts w:ascii=\"宋体\" w:hAnsi=\"宋体\" w:eastAsia=\"宋体\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:rFonts\",[[\"w:ascii\",\"宋体\"],[\"w:eastAsia\",\"宋体\"],[\"w:hAnsi\",\"宋体\"]],\"\",[]]]]",
+   "style_id": "s_22a1dd1510eee8bd"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:rPrChange w:id=\"1\"><w:rPr><w:b/></w:rPr></w:rPrChange><w:i/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:i\",[],\"\",[]]]]",
+   "style_id": "s_865fd27a096a0aea"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:rStyle w:val=\"CommentReference\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:rStyle\",[[\"w:val\",\"CommentReference\"]],\"\",[]]]]",
+   "style_id": "s_5a5c44909786068c"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:rStyle w:val=\"FixtureCode\"/><w:highlight w:val=\"lightGray\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:highlight\",[[\"w:val\",\"lightGray\"]],\"\",[]],[\"w:rStyle\",[[\"w:val\",\"FixtureCode\"]],\"\",[]]]]",
+   "style_id": "s_6f00760eda053fa8"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:shadow/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:shadow\",[],\"\",[]]]]",
+   "style_id": "s_de1499e4e850bce2"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:smallCaps/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:smallCaps\",[],\"\",[]]]]",
+   "style_id": "s_2afff47550decd30"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:strike/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:strike\",[],\"\",[]]]]",
+   "style_id": "s_ddbf77bebb070424"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:sz w:val=\"24\"/><w:b/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:b\",[],\"\",[]],[\"w:sz\",[[\"w:val\",\"24\"]],\"\",[]]]]",
+   "style_id": "s_8625025d2d375d76"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:u w:val=\"single\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:u\",[[\"w:val\",\"single\"]],\"\",[]]]]",
+   "style_id": "s_99f4505161139d6b"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:vertAlign w:val=\"subscript\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:vertAlign\",[[\"w:val\",\"subscript\"]],\"\",[]]]]",
+   "style_id": "s_ce77620e06398689"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:vertAlign w:val=\"superscript\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:vertAlign\",[[\"w:val\",\"superscript\"]],\"\",[]]]]",
+   "style_id": "s_0643e469379d4443"
+  },
+  {
+   "rpr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:vertAlign w:val=\"superscript\"/><w:lang w:val=\"en-US\"/></w:rPr>",
+   "canonical": "[\"w:rPr\",[],\"\",[[\"w:lang\",[[\"w:val\",\"en-US\"]],\"\",[]],[\"w:vertAlign\",[[\"w:val\",\"superscript\"]],\"\",[]]]]",
+   "style_id": "s_83a38adb9cfe6316"
+  }
+ ]
+}

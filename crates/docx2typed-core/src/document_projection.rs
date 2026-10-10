@@ -910,8 +910,12 @@ impl<'a> SegmentWalker<'a> {
 
     fn style_id_for_rpr(&mut self, rpr_idx: usize) -> String {
         let node = &self.nodes[rpr_idx];
-        let canonical = self.canonical_rpr_bytes(node);
-        let style_id = content_style_id(&canonical);
+        // Same canonical form as `prose::style_id_for_rpr`, so the read
+        // surface and the format lane agree on what a style IS. Falls back to
+        // the byte form only if the fragment cannot be canonicalised at all.
+        let fragment = String::from_utf8_lossy(&self.xml[node.open_start..node.end]).into_owned();
+        let style_id = crate::prose::style_id_for_rpr(&fragment)
+            .unwrap_or_else(|_| content_style_id(&self.canonical_rpr_bytes(node)));
         let (label, features) = rpr_semantics(node, self.nodes, self.xml);
         self.styles.ensure(&style_id, label, features)
     }
