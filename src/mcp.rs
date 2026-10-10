@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 38] = [
+pub const TOOL_NAMES: [&str; 39] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -78,6 +78,7 @@ pub const TOOL_NAMES: [&str; 38] = [
     "verify_output",
     "history_list",
     "document_search",
+    "document_read",
 ];
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
@@ -1454,6 +1455,61 @@ impl McpSession {
             }
         }
     }
+
+    /// The editable projection as a virtual text file. `content` doubles as
+    /// the diff base for `document_patch`, and `revision` is the token to pass
+    /// back as its `base_revision`.
+    fn document_read(&self, args: &Value, build_commit: &str) -> Value {
+        let Some(workdir) = self.workdir.as_deref() else {
+            return self.failure(
+                "document_read",
+                "workdir-not-open",
+                "no workdir open; call workdir_open first",
+                build_commit,
+            );
+        };
+        // Same projection requirement as document_search: a Rust-extracted
+        // workdir is header-only, so a windowed read must materialise the
+        // projection first (idempotent).
+        if let Err(error) = draft::ensure_projection(Path::new(workdir)) {
+            return self.failure("document_read", &error.code, &error.detail, build_commit);
+        }
+        let anchor = args.get("anchor").and_then(Value::as_str);
+        let number = |name: &str, default: usize| {
+            args.get(name)
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(default)
+        };
+        let view = args.get("view").and_then(Value::as_str).unwrap_or("auto");
+        match docx2typed_core::document_view::document_read_view(
+            Path::new(workdir),
+            anchor,
+            number("before", 5),
+            number("after", 8),
+            view,
+        ) {
+            Ok(data) => match serde_json::to_value(data) {
+                Ok(value) => self.success("document_read", value, build_commit),
+                Err(error) => self.failure(
+                    "document_read",
+                    "workdir-invalid",
+                    &error.to_string(),
+                    build_commit,
+                ),
+            },
+            Err(error) => {
+                let message = error.to_string();
+                let (code, detail) = match message.split_once(':') {
+                    Some((code, detail)) if !code.contains(' ') => {
+                        (code.to_string(), detail.trim().to_string())
+                    }
+                    _ => ("workdir-invalid".to_string(), message),
+                };
+                self.failure("document_read", &code, &detail, build_commit)
+            }
+        }
+    }
 }
 
 /// `draft_dirty`: the same freshness rule as `diff_preview`/`workdir_status`
@@ -1865,6 +1921,12 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
         }
         "document_search" => {
             let mut json = serde_json::to_string(&session.document_search(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "document_read" => {
+            let mut json = serde_json::to_string(&session.document_read(&args, build_commit))
                 .expect("serializes");
             json.insert_str(0, "OK ");
             json
