@@ -81,7 +81,11 @@ pub fn write_identity(workdir: &Path, identity: &Identity) -> Result<PathBuf, Co
     // `preserve_order` feature unification elsewhere in the workspace.
     let mut payload: BTreeMap<String, serde_json::Value> = match serde_json::to_value(identity) {
         Ok(serde_json::Value::Object(fields)) => fields.into_iter().collect(),
-        Ok(_) => return Err(CoreError::message("identity does not serialize to an object")),
+        Ok(_) => {
+            return Err(CoreError::message(
+                "identity does not serialize to an object",
+            ))
+        }
         Err(error) => return Err(CoreError::message(error.to_string())),
     };
     payload.insert(
@@ -179,9 +183,9 @@ mod tests {
 
     /// `<prefix>_<32 hex>`, exactly what Python's `uuid4().hex` produces.
     fn shaped(prefix: &str, value: &str) -> bool {
-        value.strip_prefix(prefix).is_some_and(|hex| {
-            hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
+        value
+            .strip_prefix(prefix)
+            .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
     }
 
     #[test]
