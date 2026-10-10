@@ -34,19 +34,18 @@ _NON_TOOL_KEYS = {"table_ref", "workdir_out"}
 #: Rust crate that must own each capability. Kept here (not in the JSON) so the
 #: mapping is reviewed in code; ``status`` is asserted against the computed gap.
 _CAPABILITY_OWNERS = {
-    "document_read": ("mcp_server.py:3462", "core/document_projection.rs", "partial"),
-    "document_search": ("mcp_server.py:3580", "core/govern.rs", "partial"),
+    # Still missing from Rust. Entries are removed as each lands; the count is
+    # asserted against the computed gap, so a stale entry cannot hide a tool
+    # and a missing one cannot go unreported.
     "document_replace": ("mcp_server.py:4947", None, "missing"),
-    "document_patch": ("mcp_server.py:5232", "review/draft.rs", "partial"),
-    "format_span": ("mcp_server.py:3783", "core/prose.rs", "partial"),
-    "history_list": ("mcp_server.py:5934", "review/history.rs:163", "partial"),
+    "format_span": ("mcp_server.py:3783", "core/prose.rs (primitive landed, #28)", "partial"),
     "history_diff": ("mcp_server.py:5865", None, "missing"),
     "history_blame": ("mcp_server.py:5886", None, "missing"),
     "history_verify": ("mcp_server.py:5905", None, "missing"),
     "history_restore": ("mcp_server.py:5951", "store/store.rs", "missing"),
     "history_gc": ("mcp_server.py:5917", "store/store.rs", "missing"),
-    "workspace_adopt": ("mcp_server.py:2935", None, "missing"),
-    "workspace_fork": ("mcp_server.py:2984", None, "missing"),
+    "workspace_adopt": ("mcp_server.py:2935", "identity landed (#19); resolver + tool open", "partial"),
+    "workspace_fork": ("mcp_server.py:2984", "identity landed (#19); tool open", "partial"),
 }
 
 

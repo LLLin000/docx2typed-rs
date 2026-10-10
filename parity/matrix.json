@@ -4,33 +4,15 @@
   "target_commit": "324cd055096e841fd5c97757def982b91ed93e15",
   "missing_tools": [
     {
-      "tool": "document_patch",
-      "python_site": "mcp_server.py:5232",
-      "rust_owner": "review/draft.rs",
-      "status": "partial"
-    },
-    {
-      "tool": "document_read",
-      "python_site": "mcp_server.py:3462",
-      "rust_owner": "core/document_projection.rs",
-      "status": "partial"
-    },
-    {
       "tool": "document_replace",
       "python_site": "mcp_server.py:4947",
       "rust_owner": null,
       "status": "missing"
     },
     {
-      "tool": "document_search",
-      "python_site": "mcp_server.py:3580",
-      "rust_owner": "core/govern.rs",
-      "status": "partial"
-    },
-    {
       "tool": "format_span",
       "python_site": "mcp_server.py:3783",
-      "rust_owner": "core/prose.rs",
+      "rust_owner": "core/prose.rs (primitive landed, #28)",
       "status": "partial"
     },
     {
@@ -66,14 +48,14 @@
     {
       "tool": "workspace_adopt",
       "python_site": "mcp_server.py:2935",
-      "rust_owner": null,
-      "status": "missing"
+      "rust_owner": "identity landed (#19); resolver + tool open",
+      "status": "partial"
     },
     {
       "tool": "workspace_fork",
       "python_site": "mcp_server.py:2984",
-      "rust_owner": null,
-      "status": "missing"
+      "rust_owner": "identity landed (#19); tool open",
+      "status": "partial"
     }
   ]
 }
