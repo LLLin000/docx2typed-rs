@@ -280,6 +280,103 @@ fn typed_markup_from_draft(body: &str) -> String {
                     .unwrap_or("");
                 out.push_str(&format!("<docx-range id=\"{id}\" kind=\"{kind}\">"));
             }
+            // A revision is a range in `typed.md` and a keyword in the draft.
+            // Falling through to the `kind` dispatch below matched nothing for
+            // them (the keyword IS the kind) and emitted `<docx-opaque kind="">`,
+            // which dropped the revision's text from the typed view. Measured on
+            // a real patent: the tree side then read `Fe` where the typed side
+            // read `[opaque:]`, every revision-bearing paragraph looked rewritten,
+            // `commit_sync` recorded 23 phantom paragraphs as inserted and
+            // deleted, and the build refused the workdir it had just written.
+            "insert" | "move-to" => {
+                let id = attrs
+                    .split("id=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                let kind_name = if keyword == "insert" {
+                    "insert"
+                } else {
+                    "move_to"
+                };
+                out.push_str(&format!("<docx-revision id=\"{id}\" kind=\"{kind_name}\""));
+                for pair in attrs.split(' ') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        if key == "id" || key == "kind" {
+                            continue;
+                        }
+                        out.push_str(&format!(" {key}={value}"));
+                    }
+                }
+                out.push('>');
+            }
+            "/insert" | "/move-to" => out.push_str("</docx-revision>"),
+            "revision-gap" => {
+                let id = attrs
+                    .split("id=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                out.push_str(&format!("<docx-revision id=\"{id}\" kind=\"{kind}\""));
+                for pair in attrs.split(' ') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        if key == "id" || key == "kind" {
+                            continue;
+                        }
+                        out.push_str(&format!(" {key}={value}"));
+                    }
+                }
+                out.push_str("></docx-revision>");
+            }
+            // The engine classifies a token; the renderer must not re-invent
+            // that classification. Ask it, so the two views of one paragraph
+            // cannot drift apart.
+            _ if docx2typed_core::token_table::is_anchor_token_kind(&kind) => {
+                let id = attrs
+                    .split("id=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                out.push_str(&format!("<docx-anchor id=\"{id}\" kind=\"{kind}\""));
+                for pair in attrs.split(' ') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        if key == "id" || key == "kind" {
+                            continue;
+                        }
+                        out.push_str(&format!(" {key}={value}"));
+                    }
+                }
+                out.push_str("/>");
+            }
+            _ if docx2typed_core::token_table::is_inline_token_kind(&kind) => {
+                let id = attrs
+                    .split("id=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                let style = attrs
+                    .split("style=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                let style_attr = if style.is_empty() {
+                    String::new()
+                } else {
+                    format!(" style=\"{style}\"")
+                };
+                out.push_str(&format!(
+                    "<docx-inline id=\"{id}\" kind=\"{kind}\"{style_attr}"
+                ));
+                for pair in attrs.split(' ') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        if key == "id" || key == "kind" || key == "style" {
+                            continue;
+                        }
+                        out.push_str(&format!(" {key}={value}"));
+                    }
+                }
+                out.push_str("/>");
+            }
             _ => match kind.as_str() {
                 "tab"
                 | "br"
@@ -333,11 +430,40 @@ fn typed_markup_from_draft(body: &str) -> String {
     out
 }
 
-/// Python `_visible_text` for a token-free draft body: the body itself
-/// (escaping is identity for plain text without `\`, `⟦`, `⟧`).
+/// The token-free text an editor sees: `⟦...⟧` placeholders removed.
+///
+/// The editable projection carries a placeholder for every comment anchor,
+/// revision boundary and embedded object, and those placeholders are long —
+/// measured on a real patent, one paragraph held 39 of them, 1882 of its 2199
+/// characters. Search offsets, by contrast, are reported in the token-free
+/// space (a match at prose offset 87 sat at body offset 295 in that
+/// paragraph), and the template's leaves are token-free too. Comparing or
+/// counting against the raw body therefore measures a different string than
+/// the one every caller here means.
+///
+/// Measured consequence while this returned the body unchanged: any paragraph
+/// carrying a comment anchor reported a draft length that could never equal
+/// its template's, so `paragraph_lengths_differ` declared it permanently
+/// length-changed and every edit to it was refused with an instruction to run
+/// `commit_sync` — which cannot change either side of that comparison.
 pub fn visible_text(body: &str) -> String {
-    body.to_string()
+    let mut out = String::with_capacity(body.len());
+    let mut depth = 0usize;
+    for ch in body.chars() {
+        match ch {
+            TOKEN_START => depth += 1,
+            TOKEN_END => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
 }
+
+/// `⟦` — opens a placeholder in the editable projection.
+const TOKEN_START: char = '\u{27e6}';
+/// `⟧` — closes one.
+const TOKEN_END: char = '\u{27e7}';
 
 /// Index of the block addressing a paragraph id, whichever marker carries it.
 ///
@@ -1547,6 +1673,42 @@ fn span_crosses_boundary(paragraph_id: &str, body: &str, old: &str) -> Option<Co
 /// Replace `old` at the recorded offset. Spans are applied in descending
 /// offset order, so every offset validated against the pre-batch body is still
 /// exact when its turn comes (mirror of `_replace_in_body(start_offset=...)`).
+/// Translate a byte offset in the token-free visible text back into the byte
+/// offset of the same position in the raw body, whose `⟦...⟧`
+/// placeholders occupy bytes the visible text does not contain.
+///
+/// Two spaces, and before `visible_text` stripped placeholders they were the
+/// same string so nothing had to convert. They are not the same once a
+/// paragraph carries a comment anchor: search reports visible offsets, the
+/// island record needs visible offsets, and only the draft-body update indexes
+/// the raw text. Feeding a visible offset straight to `replace_at` lands inside
+/// a placeholder and refuses with `text-not-found` on text that is plainly
+/// there.
+fn raw_offset_for_visible(body: &str, visible_byte: usize) -> usize {
+    let mut depth = 0usize;
+    let mut emitted = 0usize;
+    for (raw, ch) in body.char_indices() {
+        match ch {
+            TOKEN_START => depth += 1,
+            TOKEN_END => depth = depth.saturating_sub(1),
+            _ if depth == 0 => {
+                // Only a visible character can be the target. Returning the
+                // offset of a leading placeholder would hand `replace_at` a
+                // position whose text is `⟦`, not the text being replaced —
+                // measured on a real patent, a paragraph that is one comment
+                // anchor around its whole body reported "背景技术 is no longer at
+                // offset 0" while sitting at visible offset 0.
+                if emitted == visible_byte {
+                    return raw;
+                }
+                emitted += ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    body.len()
+}
+
 fn replace_at(
     body: &str,
     start: usize,
@@ -1926,7 +2088,8 @@ fn plan_patch(
         let mut ordered: Vec<&ReplaceSpan> = spans.iter().collect();
         ordered.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
         for (start, old, new) in ordered {
-            body = replace_at(&body, *start, old, new, paragraph_id)?;
+            let raw = raw_offset_for_visible(&body, *start);
+            body = replace_at(&body, raw, old, new, paragraph_id)?;
         }
         blocks[index] = if body.is_empty() {
             marker
