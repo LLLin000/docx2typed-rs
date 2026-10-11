@@ -91,3 +91,7 @@ path = "rust-tests/tracer62.rs"
 [[test]]
 name = "replace_semantics"
 path = "rust-tests/replace_semantics.rs"
+
+[[test]]
+name = "facade"
+path = "rust-tests/facade.rs"

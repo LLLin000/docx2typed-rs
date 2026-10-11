@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 49] = [
+pub const TOOL_NAMES: [&str; 53] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -90,6 +90,10 @@ pub const TOOL_NAMES: [&str; 49] = [
     "workspace_fork",
     "format_span",
     "workspace_adopt",
+    "facade_locate",
+    "facade_edit",
+    "facade_verify",
+    "facade_resolve",
 ];
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
@@ -1791,6 +1795,96 @@ impl McpSession {
         }
     }
 
+    /// Facade Locate: find every occurrence with a stable, version-checked
+    /// handle and a capability verdict; report the scanned coverage.
+    ///
+    /// The Facade talks about the logical document. It is a thin composition
+    /// over the engine's search/plan/verify primitives and adds no new editing
+    /// machinery -- only the agent-facing vocabulary (`supported` /
+    /// `unsupported` / `ambiguous` / `stale_revision`) and the coverage block
+    /// that stops a `0` count from reading as proof of absence.
+    fn facade_locate(&self, args: &Value, build_commit: &str) -> Value {
+        let workdir = match self.require_workdir() {
+            Ok(workdir) => workdir.to_string(),
+            Err(failure) => return failure,
+        };
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+        let scope = args.get("scope").and_then(Value::as_str).unwrap_or("body");
+        match docx2typed_review::facade::locate(Path::new(&workdir), query, scope) {
+            Ok(data) => self.success("facade_locate", data, build_commit),
+            Err(error) => self.failure("facade_locate", &error.code, &error.detail, build_commit),
+        }
+    }
+
+    fn facade_edit(&self, args: &Value, build_commit: &str) -> Value {
+        let workdir = match self.require_workdir() {
+            Ok(workdir) => workdir.to_string(),
+            Err(failure) => return failure,
+        };
+        let dry_run = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let edits: Vec<docx2typed_review::facade::EditRequest> = match args.get("edits") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect(),
+            _ => Vec::new(),
+        };
+        if edits.is_empty() {
+            return self.failure(
+                "facade_edit",
+                "edit-empty",
+                "at least one {handle, replace_with} edit is required",
+                build_commit,
+            );
+        }
+        match docx2typed_review::facade::edit(Path::new(&workdir), &edits, dry_run) {
+            Ok(data) => self.success("facade_edit", data, build_commit),
+            Err(error) => self.failure("facade_edit", &error.code, &error.detail, build_commit),
+        }
+    }
+
+    fn facade_verify(&self, args: &Value, build_commit: &str) -> Value {
+        let _ = args;
+        let workdir = match self.require_workdir() {
+            Ok(workdir) => workdir.to_string(),
+            Err(failure) => return failure,
+        };
+        match docx2typed_review::facade::verify(Path::new(&workdir)) {
+            Ok(data) => self.success("facade_verify", data, build_commit),
+            Err(error) => self.failure("facade_verify", &error.code, &error.detail, build_commit),
+        }
+    }
+
+    fn facade_resolve(&self, args: &Value, build_commit: &str) -> Value {
+        let workdir = match self.require_workdir() {
+            Ok(workdir) => workdir.to_string(),
+            Err(failure) => return failure,
+        };
+        let find = args.get("find").and_then(Value::as_str).unwrap_or("");
+        let replace_with = args
+            .get("replace_with")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let scope = args.get("scope").and_then(Value::as_str).unwrap_or("body");
+        let dry_run = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match docx2typed_review::facade::resolve_and_edit(
+            Path::new(&workdir),
+            find,
+            replace_with,
+            scope,
+            dry_run,
+        ) {
+            Ok(data) => self.success("facade_resolve", data, build_commit),
+            Err(error) => self.failure("facade_resolve", &error.code, &error.detail, build_commit),
+        }
+    }
+
     /// Apply a batch of edits to the draft in one atomic call.
     /// Change the FORMATTING of existing text -- the lane text replacement
     /// cannot express (#33).
@@ -2561,6 +2655,30 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
         }
         "workspace_adopt" => {
             let mut json = serde_json::to_string(&session.workspace_adopt(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "facade_locate" => {
+            let mut json = serde_json::to_string(&session.facade_locate(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "facade_edit" => {
+            let mut json = serde_json::to_string(&session.facade_edit(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "facade_verify" => {
+            let mut json = serde_json::to_string(&session.facade_verify(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "facade_resolve" => {
+            let mut json = serde_json::to_string(&session.facade_resolve(&args, build_commit))
                 .expect("serializes");
             json.insert_str(0, "OK ");
             json

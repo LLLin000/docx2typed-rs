@@ -340,7 +340,7 @@ pub fn visible_text(body: &str) -> String {
 }
 
 /// Parse one block marker line into (kind, id, extra attrs).
-fn marker_of(block: &str) -> Option<(String, String, String)> {
+pub(crate) fn marker_of(block: &str) -> Option<(String, String, String)> {
     let line = block.split('\n').next().unwrap_or("").trim();
     if let Some(rest) = line.strip_prefix("<!--@p id=\"") {
         let id = rest.split('"').next().unwrap_or("");
@@ -445,7 +445,10 @@ fn next_temp_id(blocks: &[String]) -> String {
 /// baseline (committed typed.md record where present, else the template
 /// inventory body). New blocks are always changed; delete markers are
 /// changed only when the id existed in the baseline.
-fn compute_changed(workdir: &Path, blocks: &[String]) -> Result<Vec<String>, CollaborationError> {
+pub(crate) fn compute_changed(
+    workdir: &Path,
+    blocks: &[String],
+) -> Result<Vec<String>, CollaborationError> {
     let typed_path = workdir.join("typed.md");
     let mut old_paragraphs: std::collections::BTreeMap<String, String> = if typed_path.is_file() {
         let text = fs::read_to_string(&typed_path)
@@ -466,7 +469,14 @@ fn compute_changed(workdir: &Path, blocks: &[String]) -> Result<Vec<String>, Col
         };
         match kind.as_str() {
             "p" => {
-                let body = block_body(block);
+                // Compare like with like. The draft speaks the token dialect
+                // (`⟦token id="N0" kind="empty-run"⟧`) while `old_paragraphs`
+                // holds typed.md reduced to VISIBLE TEXT, so a raw draft body
+                // never equals its own record for any paragraph carrying an
+                // inline token — every such paragraph read as "changed", and a
+                // real patent showed 5 of them (P7, P17, P58, P68, P81) with no
+                // edit at all. Reduce the draft the same way first.
+                let body = typed_body_visible_text(&typed_markup_from_draft(&block_body(block)));
                 let prior = old_paragraphs.get(&id).cloned().unwrap_or_default();
                 if prior != body {
                     changed.push(id);
@@ -823,6 +833,39 @@ fn leaf_in_inventory_covers(
     false
 }
 
+/// The leaf index that carries the whole visible span, or None.
+///
+/// The same walk as [`leaf_in_inventory_covers`], returning the index so a
+/// handle-addressed edit can name its leaf instead of re-searching the text.
+fn leaf_index_for_span(
+    workdir: &Path,
+    paragraph_id: &str,
+    offset: usize,
+    length: usize,
+) -> Option<usize> {
+    if length == 0 {
+        return None;
+    }
+    let package = fs::read(workdir.join("_template.docx")).ok()?;
+    let inventory = docx2typed_core::prose::enumerate_package_bytes(&package).ok()?;
+    let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)?;
+    let span_end = offset + length;
+    let mut cursor = 0usize;
+    for leaf in inventory
+        .leaves
+        .iter()
+        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
+    {
+        let leaf_start = cursor;
+        let leaf_end = cursor + leaf.text.chars().count();
+        cursor = leaf_end;
+        if offset >= leaf_start && span_end <= leaf_end {
+            return Some(leaf.leaf_index);
+        }
+    }
+    None
+}
+
 /// The template leaf one island edit lands in, or None for a synthesised
 /// paragraph: it has no baseline leaf to replace (it is rendered from the
 /// inherit paragraph at build time and rewritten in the structure sidecar at
@@ -1010,16 +1053,26 @@ pub fn delete_paragraph(workdir: &Path, paragraph_id: &str) -> Result<Value, Col
 
 /// The hunk keys the tool accepts (Python `_normalize_patch_hunks` known set,
 /// sorted): an unrecognised key would be silently ignored, so it is refused.
-const PATCH_HUNK_KEYS: [&str; 8] = [
+const PATCH_HUNK_KEYS: [&str; 10] = [
     "delete",
     "inherit",
     "insert_after",
+    "leaf_index",
     "match_ref",
     "new",
     "old",
     "paragraph_id",
+    "start",
     "text",
 ];
+
+/// One deferred per-leaf replacement: `(paragraph, leaf, char start, char
+/// length, replacement text)`. Several occurrences can land in one run, and the
+/// island record rewrites the whole leaf, so they are merged before recording.
+type LeafSpan = (String, usize, usize, usize, String);
+
+/// One replacement inside a leaf: `(char start, char length, replacement)`.
+type LeafReplacement = (usize, usize, String);
 
 /// One normalized patch hunk.
 #[derive(Clone, Debug)]
@@ -1028,6 +1081,17 @@ enum PatchHunk {
         paragraph_id: String,
         old: String,
         new: String,
+        /// Char offset of `old` inside the paragraph's visible text, when the
+        /// caller addressed the span with a `match_ref`. A handle names an
+        /// exact span, so the patch must use it rather than re-searching the
+        /// text — the text can legitimately occur twice in one paragraph
+        /// (measured on a real patent: 13 of 34 hunks), and a search would
+        /// then refuse a span the handle proved unique.
+        start: Option<usize>,
+        /// The template leaf carrying the span, when a handle named it. The
+        /// island record addresses that leaf directly rather than re-searching
+        /// the text for it.
+        leaf_index: Option<usize>,
     },
     Insert {
         insert_after: String,
@@ -1198,6 +1262,16 @@ fn expand_match_ref_hunks(
             "paragraph_id": resolved.paragraph_id,
             "old": resolved.text,
             "new": new,
+            // The handle's own anchor: the commit applies the span at this
+            // offset instead of re-finding the text, and records the island
+            // against the leaf that carries it.
+            "start": resolved.start,
+            "leaf_index": leaf_index_for_span(
+                workdir,
+                &resolved.paragraph_id,
+                resolved.start,
+                resolved.text.chars().count(),
+            ),
         }));
     }
     Ok(expanded)
@@ -1251,10 +1325,20 @@ fn normalize_patch_hunks(hunks: &[Value]) -> Result<Vec<PatchHunk>, Collaboratio
                     "hunks[{index}]: replace hunk needs string old (non-empty) and new"
                 )));
             };
+            let start = object
+                .get("start")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize);
+            let leaf_index = object
+                .get("leaf_index")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize);
             normalized.push(PatchHunk::Replace {
                 paragraph_id: paragraph_id.to_string(),
                 old: old.to_string(),
                 new: new.to_string(),
+                start,
+                leaf_index,
             });
         } else if object.contains_key("insert_after") {
             let Some(insert_after) = string("insert_after").filter(|value| !value.is_empty())
@@ -1300,6 +1384,18 @@ fn normalize_patch_hunks(hunks: &[Value]) -> Result<Vec<PatchHunk>, Collaboratio
         }
     }
     Ok(normalized)
+}
+
+/// The char offset a `match_ref`-derived hunk carries, if any.
+///
+/// `normalize_patch_hunks` keeps the offset on the `PatchHunk::Replace`
+/// variant; the validation arm reads it back through this helper so the
+/// anchor can be checked against the live visible text before it is used.
+fn anchor_from_hunk(hunk: &PatchHunk) -> Option<usize> {
+    match hunk {
+        PatchHunk::Replace { start, .. } => *start,
+        _ => None,
+    }
 }
 
 /// The `⟦...⟧` inline token chunks of a draft body: flat visible text plus the
@@ -1473,6 +1569,13 @@ fn plan_patch(
     let mut insert_specs: Vec<(String, String, Option<String>)> = Vec::new();
     let mut pending: PendingSpans = Vec::new();
     let mut islands: Vec<docx2typed_core::prose::IslandEdit> = Vec::new();
+    // Deferred per-leaf replacements: (paragraph, leaf, char_start, char_len,
+    // replacement). Several occurrences can land in ONE run, and each island
+    // record rewrites the WHOLE leaf — recording them separately would make the
+    // second expect a leaf text the first already changed. They are merged into
+    // one whole-leaf edit per leaf below, which is also what makes the count
+    // the Facade reports equal the count the build applies.
+    let mut leaf_spans: Vec<LeafSpan> = Vec::new();
     let mut applied: Vec<Value> = Vec::new();
 
     for (index, hunk) in hunks.iter().enumerate() {
@@ -1482,6 +1585,8 @@ fn plan_patch(
                 paragraph_id,
                 old,
                 new,
+                start: _,
+                leaf_index,
             } => {
                 let Some(block_index) = find_block(blocks, "p", paragraph_id) else {
                     hunk_problem(
@@ -1543,35 +1648,61 @@ fn plan_patch(
                 }
                 let body = block_body(&blocks[block_index]);
                 let visible = visible_text(&body);
-                let count = visible.matches(old.as_str()).count();
-                if count != 1 {
-                    // A span that is contiguous only once the inline tokens are
-                    // stripped is not one editable run: name the boundary
-                    // instead of reporting a bare text-not-found.
-                    if let Some(error) = span_crosses_boundary(paragraph_id, &body, old) {
+                // A hunk that arrived through a `match_ref` carries the
+                // handle's own char offset. That anchor is authoritative: the
+                // text can occur twice in one paragraph while the handle still
+                // addresses exactly one span (measured on a real patent, 13 of
+                // 34 occurrences). Verify the anchor, do not re-search it.
+                // The handle's offset is in CHARS of the visible text; the
+                // span application below indexes BYTES of the block body, and
+                // the leaf walk indexes CHARS again. For CJK text bytes and
+                // chars diverge (one char is three bytes), so the anchor is
+                // validated in char space and both forms are kept.
+                let anchored_chars: Option<usize> = anchor_from_hunk(hunk).and_then(|start| {
+                    let chars: Vec<char> = visible.chars().collect();
+                    let end = start + old.chars().count();
+                    if end > chars.len() || chars[start..end].iter().collect::<String>() != *old {
+                        return None;
+                    }
+                    Some(start)
+                });
+                let anchored = anchored_chars.map(|start| {
+                    let chars: Vec<char> = visible.chars().collect();
+                    chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>()
+                });
+                let start = if let Some(start) = anchored {
+                    start
+                } else {
+                    let count = visible.matches(old.as_str()).count();
+                    if count != 1 {
+                        // A span that is contiguous only once the inline tokens
+                        // are stripped is not one editable run: name the
+                        // boundary instead of reporting a bare text-not-found.
+                        if let Some(error) = span_crosses_boundary(paragraph_id, &body, old) {
+                            hunk_problem(&mut problems, number, hunk, error);
+                            continue;
+                        }
+                        let error = if count > 1 {
+                            CollaborationError::new(
+                                "text-ambiguous",
+                                format!(
+                                    "{paragraph_id}: {old:?} appears {count} times — resend with a \
+                                     longer unique span"
+                                ),
+                            )
+                        } else {
+                            CollaborationError::new(
+                                "text-not-found",
+                                format!("{paragraph_id}: {old:?} not found in paragraph"),
+                            )
+                        };
                         hunk_problem(&mut problems, number, hunk, error);
                         continue;
                     }
-                    let error = if count > 1 {
-                        CollaborationError::new(
-                            "text-ambiguous",
-                            format!(
-                                "{paragraph_id}: {old:?} appears {count} times — resend with a \
-                                 longer unique span"
-                            ),
-                        )
-                    } else {
-                        CollaborationError::new(
-                            "text-not-found",
-                            format!("{paragraph_id}: {old:?} not found in paragraph"),
-                        )
-                    };
-                    hunk_problem(&mut problems, number, hunk, error);
-                    continue;
-                }
-                let start = visible
-                    .find(old.as_str())
-                    .expect("count == 1 implies a match");
+                    visible
+                        .find(old.as_str())
+                        .expect("count == 1 implies a match")
+                };
                 let spans = match pending.iter().position(|(id, _)| id == paragraph_id) {
                     Some(index) => &mut pending[index].1,
                     None => {
@@ -1599,18 +1730,21 @@ fn plan_patch(
                 }
                 // The build's island record must land inside ONE text leaf, so
                 // the leaf is resolved (read-only) with the rest of validation.
-                match island_leaf_for(workdir, paragraph_id, old, None) {
-                    Ok(Some((part, leaf_index))) => {
-                        islands.push(docx2typed_core::prose::IslandEdit {
-                            part,
-                            paragraph_id: paragraph_id.clone(),
-                            leaf_index,
-                            old: old.clone(),
-                            new: new.clone(),
-                            tracked: tracking.tracked,
-                            author: tracking.author.unwrap_or("").to_string(),
-                            date: tracking.date.unwrap_or("").to_string(),
-                        })
+                match island_leaf_for(workdir, paragraph_id, old, *leaf_index) {
+                    Ok(Some((_part, resolved_leaf))) => {
+                        // Defer: merge with any other occurrence in this leaf
+                        // so one whole-leaf edit carries them all. The leaf walk
+                        // indexes CHARS, so a text-searched hunk converts its
+                        // byte offset before deferring.
+                        let char_start =
+                            anchored_chars.unwrap_or_else(|| visible[..start].chars().count());
+                        leaf_spans.push((
+                            paragraph_id.clone(),
+                            resolved_leaf,
+                            char_start,
+                            old.chars().count(),
+                            new.to_string(),
+                        ));
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -1783,11 +1917,96 @@ fn plan_patch(
             }
         }
     }
+    // One island per (paragraph, leaf), carrying EVERY replacement that lands
+    // in that leaf. The island record rewrites the whole run, so two records
+    // for the same leaf would each expect the pre-edit text and the second
+    // would silently fail to apply — measured on a real patent: 34 occurrences
+    // reported, 28 applied. Merging makes the reported count the applied count.
+    leaf_spans.sort_by(|a, b| {
+        a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(b.2.cmp(&a.2)) // descending offset within a leaf
+    });
+    let mut merged: std::collections::BTreeMap<(String, usize), Vec<LeafReplacement>> =
+        std::collections::BTreeMap::new();
+    for (paragraph_id, leaf_index, start, len, replacement) in leaf_spans {
+        merged
+            .entry((paragraph_id, leaf_index))
+            .or_default()
+            .push((start, len, replacement));
+    }
+    for ((paragraph_id, leaf_index), spans) in merged {
+        // A leaf the walk cannot map is a refusal, never a half-recorded edit:
+        // an island with an empty `old` would silently do nothing at build time
+        // while the call still reported success.
+        let (record_old, record_new) =
+            merged_leaf_island(workdir, &paragraph_id, leaf_index, &spans).ok_or_else(|| {
+                CollaborationError::new(
+                    "invalid-edit",
+                    format!(
+                        "{paragraph_id}: cannot map {} replacement(s) onto leaf {leaf_index}; \
+                         nothing was written",
+                        spans.len()
+                    ),
+                )
+            })?;
+        islands.push(docx2typed_core::prose::IslandEdit {
+            part: "document".to_string(),
+            paragraph_id,
+            leaf_index,
+            old: record_old,
+            new: record_new,
+            tracked: tracking.tracked,
+            author: tracking.author.unwrap_or("").to_string(),
+            date: tracking.date.unwrap_or("").to_string(),
+        });
+    }
     Ok(PatchPlan {
         blocks,
         applied,
         islands,
     })
+}
+
+/// The whole-leaf form of one island edit, carrying every replacement that
+/// lands in that leaf (offsets are char positions inside the paragraph's
+/// visible text, applied right-to-left so earlier anchors never shift).
+fn merged_leaf_island(
+    workdir: &Path,
+    paragraph_id: &str,
+    leaf_index: usize,
+    spans: &[LeafReplacement],
+) -> Option<(String, String)> {
+    let package = fs::read(workdir.join("_template.docx")).ok()?;
+    let inventory = docx2typed_core::prose::enumerate_package_bytes(&package).ok()?;
+    let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)?;
+    let mut cursor = 0usize;
+    for leaf in inventory
+        .leaves
+        .iter()
+        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
+    {
+        let mut chars: Vec<char> = leaf.text.chars().collect();
+        let leaf_start = cursor;
+        cursor += chars.len();
+        if leaf.leaf_index != leaf_index {
+            continue;
+        }
+        let mut ordered: Vec<&LeafReplacement> = spans.iter().collect();
+        ordered.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+        for (start, len, replacement) in ordered {
+            let local = start.checked_sub(leaf_start)?;
+            let end = local + len;
+            if end > chars.len() {
+                return None;
+            }
+            let mut next: Vec<char> = Vec::with_capacity(chars.len() + replacement.len());
+            next.extend_from_slice(&chars[..local]);
+            next.extend(replacement.chars());
+            next.extend_from_slice(&chars[end..]);
+            chars = next;
+        }
+        return Some((leaf.text.clone(), chars.into_iter().collect()));
+    }
+    None
 }
 
 /// The draft's opaque revision token: the canonical edit-body hash of

@@ -68,7 +68,7 @@ fn extract(fixture_path: &Path, outdir: &Path) {
 }
 
 /// The frozen MCP tool surface (mirror of `scripts/mcp_server.py`).
-const TOOL_NAMES: [&str; 49] = [
+const TOOL_NAMES: [&str; 53] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -118,6 +118,10 @@ const TOOL_NAMES: [&str; 49] = [
     "workspace_fork",
     "format_span",
     "workspace_adopt",
+    "facade_locate",
+    "facade_edit",
+    "facade_verify",
+    "facade_resolve",
 ];
 
 /// Drive one MCP(stdout) session: each stdin line is

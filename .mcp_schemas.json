@@ -324,6 +324,99 @@
     "type": "object",
     "additionalProperties": false
   },
+  "facade_edit": {
+    "additionalProperties": false,
+    "properties": {
+      "dry_run": {
+        "default": false,
+        "title": "Dry Run",
+        "type": "boolean"
+      },
+      "edits": {
+        "items": {
+          "type": "object"
+        },
+        "title": "Edits",
+        "type": "array"
+      },
+      "workdir": {
+        "title": "Workdir",
+        "type": "string"
+      }
+    },
+    "required": [
+      "edits"
+    ],
+    "title": "facade_editArguments",
+    "type": "object"
+  },
+  "facade_locate": {
+    "additionalProperties": false,
+    "properties": {
+      "query": {
+        "title": "Query",
+        "type": "string"
+      },
+      "scope": {
+        "default": "body",
+        "title": "Scope",
+        "type": "string"
+      },
+      "workdir": {
+        "title": "Workdir",
+        "type": "string"
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "title": "facade_locateArguments",
+    "type": "object"
+  },
+  "facade_resolve": {
+    "additionalProperties": false,
+    "properties": {
+      "dry_run": {
+        "default": false,
+        "title": "Dry Run",
+        "type": "boolean"
+      },
+      "find": {
+        "title": "Find",
+        "type": "string"
+      },
+      "replace_with": {
+        "title": "Replace With",
+        "type": "string"
+      },
+      "scope": {
+        "default": "body",
+        "title": "Scope",
+        "type": "string"
+      },
+      "workdir": {
+        "title": "Workdir",
+        "type": "string"
+      }
+    },
+    "required": [
+      "find",
+      "replace_with"
+    ],
+    "title": "facade_resolveArguments",
+    "type": "object"
+  },
+  "facade_verify": {
+    "additionalProperties": false,
+    "properties": {
+      "workdir": {
+        "title": "Workdir",
+        "type": "string"
+      }
+    },
+    "title": "facade_verifyArguments",
+    "type": "object"
+  },
   "format_span": {
     "properties": {
       "attributes": {

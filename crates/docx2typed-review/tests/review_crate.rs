@@ -902,15 +902,23 @@ fn document_patch_applies_replace_insert_delete_in_one_batch() {
         serde_json::from_str(&fs::read_to_string(wd.join("islands.json")).expect("islands"))
             .expect("islands json");
     let edits = islands["edits"].as_array().expect("edits");
-    assert_eq!(edits.len(), 3, "one island record per replace hunk");
+    // ONE record per (paragraph, leaf), not one per hunk. The island rewrites
+    // the whole run, so P0's two replacements must travel in a single record:
+    // two records would each expect the pre-edit leaf and the second would
+    // silently not apply (measured on a real patent: 34 reported, 28 applied).
+    assert_eq!(edits.len(), 2, "one island record per leaf");
     assert_eq!(edits[0]["paragraph_id"], "P0");
-    assert_eq!(edits[0]["old"], "本发明");
-    assert_eq!(edits[0]["new"], "我们");
-    assert_eq!(edits[1]["paragraph_id"], "P0");
-    assert_eq!(edits[1]["old"], "20 mg");
-    assert_eq!(edits[1]["new"], "40 mg");
-    assert_eq!(edits[2]["paragraph_id"], "P1");
-    assert_eq!(edits[2]["old"], "250 mg");
+    assert_eq!(
+        edits[0]["old"], "本发明涉及生物医用材料技术领域。剂量为 20 mg。",
+        "the record carries the whole leaf as it stands"
+    );
+    assert_eq!(
+        edits[0]["new"], "我们涉及生物医用材料技术领域。剂量为 40 mg。",
+        "both replacements land in the one record"
+    );
+    assert_eq!(edits[1]["paragraph_id"], "P1");
+    assert_eq!(edits[1]["old"], "实施例1采用 250 mg 剂量。");
+    assert_eq!(edits[1]["new"], "实施例1采用 500 mg 剂量。");
     // The batch result is commit-ready.
     let changed = draft::apply_projection(&wd).expect("commit");
     assert!(changed.contains(&"P0".to_string()));
