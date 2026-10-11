@@ -281,13 +281,34 @@ fn typed_markup_from_draft(body: &str) -> String {
                 out.push_str(&format!("<docx-range id=\"{id}\" kind=\"{kind}\">"));
             }
             _ => match kind.as_str() {
-                "tab" | "br" | "cr" => {
+                "tab"
+                | "br"
+                | "cr"
+                | "empty-run"
+                | "separator"
+                | "continuationSeparator"
+                | "noBreakHyphen"
+                | "softHyphen"
+                | "sym"
+                | "dayShort" => {
                     let id = attrs
                         .split("id=\"")
                         .nth(1)
                         .and_then(|rest| rest.split('"').next())
                         .unwrap_or("");
-                    out.push_str(&format!("<docx-inline id=\"{id}\" kind=\"{kind}\"/>"));
+                    let style = attrs
+                        .split("style=\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("");
+                    let style_attr = if style.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" style=\"{style}\"")
+                    };
+                    out.push_str(&format!(
+                        "<docx-inline id=\"{id}\" kind=\"{kind}\"{style_attr}/>"
+                    ));
                 }
                 _ => {
                     let id = attrs
@@ -2197,7 +2218,67 @@ pub fn document_replace(
         };
     }
 
+    let inventory = docx2typed_core::prose::enumerate_package(&workdir.join("_template.docx")).ok();
+    let mut new_islands: Vec<docx2typed_core::prose::IslandEdit> = Vec::new();
+    if let Some(inv) = &inventory {
+        for entry in &plan {
+            let pid = entry["paragraph_id"].as_str().unwrap_or("");
+            for leaf in inv
+                .leaves
+                .iter()
+                .filter(|l| l.part_key == "document" && l.paragraph_id == pid)
+            {
+                let matches_find = if let Some(re) = &regex_pattern {
+                    re.is_match(&leaf.text)
+                } else if args.case_sensitive {
+                    leaf.text.contains(args.find)
+                } else {
+                    leaf.text.to_lowercase().contains(&args.find.to_lowercase())
+                };
+                if matches_find {
+                    let old_text = leaf.text.clone();
+                    let new_text = if let Some(re) = &regex_pattern {
+                        re.replace_all(&old_text, args.replace).to_string()
+                    } else if args.case_sensitive {
+                        old_text.replace(args.find, args.replace)
+                    } else {
+                        let mut res = String::new();
+                        let lower_old = old_text.to_lowercase();
+                        let lower_find = args.find.to_lowercase();
+                        let mut cursor = 0usize;
+                        while let Some(pos) = lower_old[cursor..].find(&lower_find) {
+                            res.push_str(&old_text[cursor..cursor + pos]);
+                            res.push_str(args.replace);
+                            cursor += pos + lower_find.len();
+                        }
+                        res.push_str(&old_text[cursor..]);
+                        res
+                    };
+                    if old_text != new_text
+                        && !new_islands
+                            .iter()
+                            .any(|e| e.paragraph_id == pid && e.leaf_index == leaf.leaf_index)
+                    {
+                        new_islands.push(docx2typed_core::prose::IslandEdit {
+                            part: "document".to_string(),
+                            paragraph_id: pid.to_string(),
+                            leaf_index: leaf.leaf_index,
+                            old: old_text,
+                            new: new_text,
+                            tracked: tracking.tracked,
+                            author: tracking.author.unwrap_or("").to_string(),
+                            date: tracking.date.unwrap_or("").to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     write_draft(workdir, &header, &blocks)?;
+    if !new_islands.is_empty() {
+        append_island_edits(workdir, &new_islands)?;
+    }
     let revision_after = current_revision(workdir)?;
     Ok(serde_json::json!({
         "scope": args.scope,
@@ -2449,6 +2530,7 @@ pub fn apply_projection_with_options(
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let mut recorded = 0usize;
     let mut structured = false;
+    let inventory = docx2typed_core::prose::enumerate_package(&workdir.join("_template.docx")).ok();
     let committed = parse_typed_paragraphs(
         &fs::read_to_string(workdir.join("typed.md"))
             .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?,
@@ -2522,18 +2604,54 @@ pub fn apply_projection_with_options(
         if islands.iter().any(|edit| edit.paragraph_id == *id) {
             continue;
         }
-        islands.retain(|edit| edit.paragraph_id != *id);
-        islands.push(docx2typed_core::prose::IslandEdit {
-            part: "document".to_string(),
-            paragraph_id: id.clone(),
-            leaf_index: 0,
-            old: old_body.clone(),
-            new: new_body.clone(),
-            tracked,
-            author: author.unwrap_or("").to_string(),
-            date: date.unwrap_or("").to_string(),
+        let is_single_leaf = inventory.as_ref().is_some_and(|inv| {
+            let mut leaves = inv
+                .leaves
+                .iter()
+                .filter(|l| l.part_key == "document" && &l.paragraph_id == id);
+            let first = leaves.next();
+            let second = leaves.next();
+            second.is_none() && first.is_some_and(|l| &l.text == old_body)
         });
-        recorded += 1;
+        if is_single_leaf {
+            islands.retain(|edit| edit.paragraph_id != *id);
+            islands.push(docx2typed_core::prose::IslandEdit {
+                part: "document".to_string(),
+                paragraph_id: id.clone(),
+                leaf_index: 0,
+                old: old_body.clone(),
+                new: new_body.clone(),
+                tracked,
+                author: author.unwrap_or("").to_string(),
+                date: date.unwrap_or("").to_string(),
+            });
+            recorded += 1;
+        } else {
+            let next_anchor = next_live_paragraph(&blocks, id);
+            if !structure
+                .deleted_paragraphs
+                .iter()
+                .any(|p| p.paragraph_id == *id)
+            {
+                structure
+                    .deleted_paragraphs
+                    .push(docx2typed_core::prose::DeletedParagraph {
+                        part: "document".to_string(),
+                        paragraph_id: id.clone(),
+                    });
+            }
+            structure.new_paragraphs.retain(|p| p.paragraph_id != *id);
+            structure
+                .new_paragraphs
+                .push(docx2typed_core::prose::NewParagraph {
+                    part: "document".to_string(),
+                    paragraph_id: id.clone(),
+                    inherit: id.clone(),
+                    body: new_body.clone(),
+                    insert_before: next_anchor,
+                });
+            structured = true;
+        }
     }
     if recorded > 0 {
         docx2typed_core::prose::save_islands(workdir, &islands)
