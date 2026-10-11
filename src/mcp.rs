@@ -1840,7 +1840,25 @@ impl McpSession {
                 build_commit,
             );
         }
-        match docx2typed_review::facade::edit(Path::new(&workdir), &edits, dry_run) {
+        let tracked = args
+            .get("track")
+            .and_then(Value::as_bool)
+            .unwrap_or(self.track);
+        let author = args
+            .get("author")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.author.clone());
+        match docx2typed_review::facade::edit(
+            Path::new(&workdir),
+            &edits,
+            dry_run,
+            docx2typed_review::draft::EditTracking {
+                tracked,
+                author: author.as_deref(),
+                date: None,
+            },
+        ) {
             Ok(data) => self.success("facade_edit", data, build_commit),
             Err(error) => self.failure("facade_edit", &error.code, &error.detail, build_commit),
         }
@@ -1875,12 +1893,26 @@ impl McpSession {
             .get("dry_run")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let tracked = args
+            .get("track")
+            .and_then(Value::as_bool)
+            .unwrap_or(self.track);
+        let author = args
+            .get("author")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.author.clone());
         match docx2typed_review::facade::resolve_and_edit(
             Path::new(&workdir),
             find,
             replace_with,
             scope,
             dry_run,
+            docx2typed_review::draft::EditTracking {
+                tracked,
+                author: author.as_deref(),
+                date: None,
+            },
         ) {
             Ok(data) => self.success("facade_resolve", data, build_commit),
             Err(error) => self.failure("facade_resolve", &error.code, &error.detail, build_commit),

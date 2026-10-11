@@ -27,6 +27,7 @@ use docx2typed_core::prose;
 
 use crate::collab::CollaborationError;
 use crate::draft;
+use crate::draft::EditTracking;
 
 /// The capability verdict for one target. Free-text errors are for humans;
 /// this is what the agent branches on.
@@ -280,6 +281,7 @@ pub fn edit(
     workdir: &Path,
     edits: &[EditRequest],
     dry_run: bool,
+    tracking: EditTracking,
 ) -> Result<Value, CollaborationError> {
     if edits.is_empty() {
         return Err(CollaborationError::new(
@@ -318,20 +320,10 @@ pub fn edit(
         .iter()
         .map(|entry| json!({ "match_ref": entry.handle, "new": entry.new_text }))
         .collect();
-    let result = draft::document_patch(
-        workdir,
-        Some(&hunks),
-        None,
-        None,
-        false,
-        draft::EditTracking {
-            tracked: false,
-            author: None,
-            date: None,
-        },
-    )?;
+    let result = draft::document_patch(workdir, Some(&hunks), None, None, false, tracking)?;
     Ok(json!({
         "outcome": "committed",
+        "edit_mode": if tracking.tracked { "track" } else { "direct" },
         "staged": staged.len(),
         "staged_targets": staged,
         "engine": result,
@@ -539,6 +531,7 @@ pub fn resolve_and_edit(
     replace_with: &str,
     scope: &str,
     dry_run: bool,
+    tracking: EditTracking,
 ) -> Result<Value, CollaborationError> {
     let located = locate(workdir, find, scope)?;
     let targets = located["targets"].as_array().cloned().unwrap_or_default();
@@ -577,7 +570,7 @@ pub fn resolve_and_edit(
             })
         })
         .collect();
-    let result = edit(workdir, &requests, dry_run)?;
+    let result = edit(workdir, &requests, dry_run, tracking)?;
     Ok(json!({
         "find": find,
         "replace_with": replace_with,

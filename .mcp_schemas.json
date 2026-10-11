@@ -342,6 +342,15 @@
       "workdir": {
         "title": "Workdir",
         "type": "string"
+      },
+      "track": {
+        "title": "Track",
+        "type": "boolean",
+        "description": "true = write tracked revisions (w:ins/w:del), false = direct. Required for the advisor-comment revision workflow."
+      },
+      "author": {
+        "title": "Author",
+        "type": "string"
       }
     },
     "required": [
@@ -396,6 +405,15 @@
       },
       "workdir": {
         "title": "Workdir",
+        "type": "string"
+      },
+      "track": {
+        "title": "Track",
+        "type": "boolean",
+        "description": "true = write tracked revisions (w:ins/w:del), false = direct. Required for the advisor-comment revision workflow."
+      },
+      "author": {
+        "title": "Author",
         "type": "string"
       }
     },
