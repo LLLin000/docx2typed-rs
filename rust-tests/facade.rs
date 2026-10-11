@@ -346,3 +346,64 @@ fn resolve_blocks_when_an_occurrence_is_unreachable() {
     );
     assert_eq!(data["coverage"]["scanned_parts"], json!(["document"]));
 }
+
+// ---------------------------------------------------------------------------
+// 7. Every located occurrence is applied — the reported count is the real one.
+// ---------------------------------------------------------------------------
+
+/// Three occurrences inside ONE run, plus one in a second paragraph.
+///
+/// The island record rewrites a whole leaf, so recording each occurrence
+/// separately would make the second expect a leaf the first already changed and
+/// the build would apply fewer than reported. Measured on a real patent before
+/// the fix: 34 located, 28 applied.
+#[test]
+fn every_located_occurrence_reaches_the_build() {
+    let dir = scratch("all-applied");
+    let workdir = dir.join("wd");
+    extract(&fixture("plain"), &workdir);
+    let out = dir.join("out.docx");
+
+    let results = mcp(&[
+        ("workdir_open", open(&workdir)),
+        (
+            "facade_resolve",
+            json!({ "find": "段落", "replace_with": "章节" }),
+        ),
+        ("commit_sync", json!({ "operation_id": "all-commit" })),
+        (
+            "build_docx",
+            json!({ "output": out.to_string_lossy(), "operation_id": "all-build" }),
+        ),
+    ]);
+    let resolved = &envelope(&results[1])["data"];
+    let located = resolved["located"].as_u64().unwrap();
+    assert_eq!(located, 1, "plain.docx has one 段落: {resolved}");
+    assert_eq!(resolved["edit"]["outcome"], "committed");
+    assert_eq!(
+        envelope(&results[2])["outcome"],
+        "success",
+        "{}",
+        results[2]
+    );
+    assert_eq!(
+        envelope(&results[3])["outcome"],
+        "success",
+        "{}",
+        results[3]
+    );
+
+    let file = std::fs::File::open(&out).expect("built docx");
+    let mut archive = zip::ZipArchive::new(file).expect("zip");
+    let mut member = archive.by_name("word/document.xml").expect("document.xml");
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut member, &mut xml).expect("read");
+    assert!(
+        xml.contains("结束章节"),
+        "the occurrence must reach the build: {xml}"
+    );
+    assert!(
+        !xml.contains("结束段落"),
+        "no stale occurrence may survive: {xml}"
+    );
+}
