@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use docx2typed_protocol::{bytes_sha256, canonical_json};
 
+use crate::document_projection::Segment;
 use crate::xml_walker::{build_tree, scan_tags, ElementNode};
 use crate::CoreError;
 
@@ -1832,6 +1833,198 @@ pub struct RprEdit {
     pub attributes: serde_json::Value,
     /// The derived character style, already present in `styles.json`.
     pub style_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// typed.md serialization (#52)
+// ---------------------------------------------------------------------------
+
+/// The style a paragraph's plain text is measured against: the one covering the
+/// most characters, ties broken by first appearance.
+///
+/// Mirrors `choose_base_style`. It matters because the markup only wraps a span
+/// when its style DIFFERS from this, so getting it wrong changes every byte.
+fn choose_base_style(segments: &[Segment], fallback: &str) -> String {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut first: BTreeMap<String, usize> = BTreeMap::new();
+    let mut order = 0usize;
+    for segment in segments {
+        if segment.text.is_empty() {
+            continue;
+        }
+        *counts.entry(segment.style_id.clone()).or_default() += segment.text.chars().count();
+        first.entry(segment.style_id.clone()).or_insert(order);
+        order += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(style_id, count)| (*count, std::cmp::Reverse(first[style_id])))
+        .map(|(style_id, _)| style_id)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// XML-escape exactly as the reference's `xml_escape` does: three entities,
+/// in this order, and nothing else.
+fn xml_escape_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn attr_value(text: &str) -> String {
+    format!("\"{}\"", xml_escape_text(text).replace('"', "&quot;"))
+}
+
+/// The body of one paragraph: merged adjacent runs, each wrapped in a `<span>`
+/// only when its style differs from the paragraph's base style.
+///
+/// Mirrors `_node_to_markup` for the text case, which is the whole of it until
+/// revisions and anchors are carried too.
+fn paragraph_markup(segments: &[Segment], base_style: &str) -> String {
+    // `merge_adjacent_text`: same style merges, so a run split by the scanner
+    // does not become two spans.
+    let mut merged: Vec<(&str, &str)> = Vec::new();
+    for segment in segments {
+        if segment.text.is_empty() {
+            continue;
+        }
+        match merged.last_mut() {
+            Some((style, text)) if *style == segment.style_id => {
+                let mut combined = text.to_string();
+                combined.push_str(&segment.text);
+                *text = Box::leak(combined.into_boxed_str());
+            }
+            _ => merged.push((segment.style_id.as_str(), segment.text.as_str())),
+        }
+    }
+    let mut out = String::new();
+    for (style_id, text) in merged {
+        let escaped = xml_escape_text(text);
+        if style_id == base_style {
+            out.push_str(&escaped);
+        } else {
+            out.push_str(&format!(
+                "<span data-s={}>{}</span>",
+                attr_value(style_id),
+                escaped
+            ));
+        }
+    }
+    out
+}
+
+/// Serialize the typed projection exactly as the reference does.
+///
+/// Rust wrote a header-only file (#52), so the tree digest could never match:
+/// this is the whole document, which is what `styles.json` is keyed against and
+/// what a version's tree is computed over.
+pub fn serialize_typed(
+    source_name: &str,
+    projection: &crate::document_projection::DocumentProjection,
+) -> String {
+    let header = format!(
+        "<!--@typed schema=\"2\" format=\"format.json\" styles=\"styles.json\" template=\"_template.docx\" source={}-->",
+        attr_value(source_name)
+    );
+    let mut blocks = vec![header];
+    // The walk starts at the BODY's key, which is the empty string: the
+    // reference initialises `current_part = ""`, so the first body paragraph
+    // emits no marker and a header only does.
+    let mut current_part = Some(String::new());
+    // The body's part key is the empty string in this format; the projection
+    // names it "document". Mapping rather than renaming, because the island and
+    // format lanes address "document" and this is a serialization concern.
+    let mut fallback = crate::document_projection::default_style_id();
+    for paragraph in &projection.paragraphs {
+        let part = if paragraph.part == "document" {
+            String::new()
+        } else {
+            paragraph.part.clone()
+        };
+        if current_part.as_deref() != Some(part.as_str()) {
+            blocks.push(format!("<!--@part key={}-->", attr_value(&part)));
+            current_part = Some(part);
+        }
+        let base_style = choose_base_style(&paragraph.segments, &fallback);
+        fallback = base_style.clone();
+        let body = paragraph_markup(&paragraph.segments, &base_style);
+        let marker = format!(
+            "<!--@p id={} base={}-->",
+            attr_value(&paragraph.paragraph_id),
+            attr_value(&base_style)
+        );
+        blocks.push(if body.is_empty() {
+            marker
+        } else {
+            format!("{marker}\n{body}")
+        });
+    }
+    let mut text = blocks.join("\n\n");
+    text.push('\n');
+    text
+}
+
+/// The `skeleton` of a paragraph: its run sequence by style, which is what the
+/// reference records instead of the text itself.
+///
+/// Mirrors `skeleton` for the text case. Anchor, inline, opaque and revision
+/// nodes carry token ids this projection does not yet surface, so a paragraph
+/// containing one is reported by the differential rather than silently
+/// flattened into text.
+fn paragraph_skeleton(segments: &[Segment]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut last: Option<&str> = None;
+    for segment in segments {
+        if segment.text.is_empty() {
+            continue;
+        }
+        if last == Some(segment.style_id.as_str()) {
+            continue;
+        }
+        last = Some(segment.style_id.as_str());
+        out.push(serde_json::json!(["text", segment.style_id]));
+    }
+    out
+}
+
+/// The `format.json` paragraph records, one per paragraph in extract order.
+pub fn format_paragraphs(
+    projection: &crate::document_projection::DocumentProjection,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut fallback = crate::document_projection::default_style_id();
+    for (index, paragraph) in projection.paragraphs.iter().enumerate() {
+        let base_style = choose_base_style(&paragraph.segments, &fallback);
+        fallback = base_style.clone();
+        // The reference: the paragraph mark's rPr, then the first text run,
+        // then the base style. The projection does not surface the mark, so a
+        // paragraph WITH text uses its first run, which is the same answer.
+        let insertion_style = paragraph
+            .segments
+            .iter()
+            .find(|segment| !segment.text.is_empty())
+            .map(|segment| segment.style_id.clone())
+            .unwrap_or_else(|| base_style.clone());
+        let part_key = if paragraph.part == "document" {
+            String::new()
+        } else {
+            paragraph.part.clone()
+        };
+        out.push(serde_json::json!({
+            "id": paragraph.paragraph_id,
+            "base_style": base_style,
+            "insertion_style": insertion_style,
+            "skeleton": paragraph_skeleton(&paragraph.segments),
+            "token_ids": Vec::<serde_json::Value>::new(),
+            "section_bearing": false,
+            "editable": paragraph.editable,
+            "mark_revision": serde_json::Value::Null,
+            "original_index": index,
+            "part_key": part_key,
+            "part_entry_id": "",
+        }));
+    }
+    out
 }
 
 /// Read the restyle sidecar of a workdir (missing file = no edits).

@@ -681,7 +681,11 @@ pub fn content_style_id(canonical_rpr_bytes: &[u8]) -> String {
 
 /// The style id of a run with no `rPr` (the "Normal" default).
 pub fn default_style_id() -> String {
-    content_style_id(b"")
+    // The SAME canonical form as every other style id (#50). This was
+    // `content_style_id(b"")` -- the old byte scheme -- so the projection's
+    // Normal was the one style that never matched the registry or the
+    // reference: `s_e3b0c44298fc1c14` against `s_9f5c04f8681ebd4e`.
+    crate::prose::style_id_for_rpr("").unwrap_or_else(|_| content_style_id(b""))
 }
 
 struct StyleRegistry {

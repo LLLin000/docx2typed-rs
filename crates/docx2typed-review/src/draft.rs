@@ -54,6 +54,29 @@ pub struct InventoryParagraph {
 /// Enumerate the workdir's document body via the prose inventory (mirror of
 /// `enumerate` over the template). Only body paragraphs (empty part key)
 /// are listed — container/part paragraphs are out of the editable surface.
+/// Every paragraph of every part, keyed as typed.md keys them.
+///
+/// `inventory_paragraphs` deliberately narrows to the BODY, because the draft
+/// projection is body-only. This check needs the other end of the comparison:
+/// typed.md carries header, footer and note paragraphs too, and a baseline
+/// that lacks them reads each one as an unrecorded edit. That was latent until
+/// #52 -- typed.md had no paragraphs at all, so nothing ever failed to match.
+fn inventory_paragraphs_all_parts(
+    workdir: &Path,
+) -> Result<Vec<InventoryParagraph>, CollaborationError> {
+    let package = workdir.join("_template.docx");
+    let inventory = docx2typed_core::prose::enumerate_package(&package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    Ok(inventory
+        .paragraphs
+        .into_iter()
+        .map(|paragraph| InventoryParagraph {
+            id: paragraph.paragraph_id.clone(),
+            visible_text: paragraph.visible_text.clone(),
+        })
+        .collect())
+}
+
 pub fn inventory_paragraphs(workdir: &Path) -> Result<Vec<InventoryParagraph>, CollaborationError> {
     let package = workdir.join("_template.docx");
     if !package.is_file() {
@@ -2120,10 +2143,11 @@ pub fn has_unrecorded_typed_edits(workdir: &Path) -> Result<bool, CollaborationE
     let typed = fs::read_to_string(workdir.join("typed.md"))
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     let recorded = parse_typed_paragraphs(&typed);
-    let baseline: std::collections::BTreeMap<String, String> = inventory_paragraphs(workdir)?
-        .into_iter()
-        .map(|paragraph| (paragraph.id, paragraph.visible_text))
-        .collect();
+    let baseline: std::collections::BTreeMap<String, String> =
+        inventory_paragraphs_all_parts(workdir)?
+            .into_iter()
+            .map(|paragraph| (paragraph.id, paragraph.visible_text))
+            .collect();
     for (id, body) in &recorded {
         match baseline.get(id) {
             Some(baseline_body) => {
@@ -2139,6 +2163,91 @@ pub fn has_unrecorded_typed_edits(workdir: &Path) -> Result<bool, CollaborationE
 
 /// Parse committed typed.md paragraph records: id -> body, plus the
 /// deleted id set (marker grammar `<!--@p id="X"-->` / `<!--@delete id="X"-->`).
+/// The visible (final-view) text of one typed.md paragraph body.
+///
+/// Mirrors `visible_text`: spans and ranges pass their children through,
+/// revisions pass children ONLY for insert/move_to (deletions are hidden), an
+/// inline `tab`/`br`/`cr` becomes whitespace, and an opaque block becomes its
+/// `[opaque:kind]` placeholder.
+///
+/// This was latent until #52: typed.md had no paragraph bodies, so the parser
+/// never had markup to strip, and `has_unrecorded_typed_edits` compared the
+/// markup against the template's plain text and declared every workdir edited.
+fn typed_body_visible_text(body: &str) -> String {
+    let bytes: Vec<char> = body.chars().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    let mut stack: Vec<String> = Vec::new();
+    while index < bytes.len() {
+        if bytes[index] == '<' {
+            let Some(close) = bytes[index..].iter().position(|c| *c == '>') else {
+                out.push(bytes[index]);
+                index += 1;
+                continue;
+            };
+            let tag: String = bytes[index..index + close + 1].iter().collect();
+            let lowered = tag.to_ascii_lowercase();
+            if let Some(name) = lowered
+                .strip_prefix("</")
+                .and_then(|rest| rest.split(|c: char| c.is_whitespace() || c == '>').next())
+            {
+                let _ = name;
+                stack.pop();
+            } else if lowered.starts_with("<span") || lowered.starts_with("<docx-range") {
+                stack.push("pass".to_string());
+            } else if lowered.starts_with("<docx-revision") {
+                let passes = lowered.contains("kind=\"insert\"") || lowered.contains("kind=\"move_to\"");
+                stack.push(if passes { "pass".into() } else { "skip".into() });
+            } else if lowered.starts_with("<docx-anchor") {
+                // AnchorNode contributes no text.
+                if !lowered.ends_with("/>") {
+                    stack.push("skip".to_string());
+                }
+            } else if lowered.starts_with("<docx-inline") {
+                if lowered.contains("kind=\"tab\"") {
+                    out.push('\t');
+                } else if lowered.contains("kind=\"br\"") || lowered.contains("kind=\"cr\"") {
+                    out.push('\n');
+                }
+            } else if lowered.starts_with("<docx-opaque") {
+                let kind = lowered
+                    .split("kind=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                out.push_str(&format!("[opaque:{kind}]"));
+            }
+            index += close + 1;
+            continue;
+        }
+        let skipped = stack.iter().any(|state| state == "skip");
+        let character = bytes[index];
+        if !skipped {
+            // `^{text}` / `_{text}`: the schema-2 vertical marker is markup, the
+            // text inside it is the text.
+            if (character == '^' || character == '_')
+                && bytes.get(index + 1) == Some(&'{')
+            {
+                index += 2;
+                let mut depth = 1usize;
+                while index < bytes.len() && depth > 0 {
+                    match bytes[index] {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        c if depth > 0 => out.push(c),
+                        _ => {}
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+            out.push(character);
+        }
+        index += 1;
+    }
+    out.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+
 fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, String> {
     let mut records: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut current: Option<String> = None;
@@ -2149,10 +2258,10 @@ fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, Stri
         if let Some(id) = current.take() {
             records.insert(
                 id,
-                body_lines.join(
+                typed_body_visible_text(&body_lines.join(
                     "
 ",
-                ),
+                )),
             );
             body_lines.clear();
         }

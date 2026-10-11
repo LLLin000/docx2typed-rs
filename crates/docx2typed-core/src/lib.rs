@@ -179,6 +179,46 @@ fn read_member<R: std::io::Read + std::io::Seek>(
 /// `word/document.xml`, and computes the extract ChangeSet. `outdir` is the
 /// target workdir the assets will be committed into (used for the relative
 /// source path record).
+/// The reference's `PART_KEYS_PATTERN`: headers, footers, footnotes, endnotes
+/// and comments -- and deliberately NOT `document.xml`, whose digest lives in
+/// `document_xml_sha256`. Getting this set wrong is a whole-key difference in
+/// format.json, so it is spelled out rather than approximated by "every xml".
+fn is_part_key(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("word/") else {
+        return false;
+    };
+    let Some(stem) = rest.strip_suffix(".xml") else {
+        return false;
+    };
+    if matches!(stem, "footnotes" | "endnotes" | "comments") {
+        return true;
+    }
+    for prefix in ["header", "footer"] {
+        if let Some(digits) = stem.strip_prefix(prefix) {
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `sha256` of each header/footer/note part's XML, keyed as the reference keys
+/// them.
+fn part_digests(package: &[u8]) -> Result<BTreeMap<String, String>, CoreError> {
+    let mut out = BTreeMap::new();
+    let reader = std::io::Cursor::new(package);
+    let mut archive = ZipArchive::new(reader)
+        .map_err(|error| CoreError::Message(format!("not a valid DOCX: {error}")))?;
+    for index in 0..archive.len() {
+        let (name, bytes) = read_member(&mut archive, index)?;
+        if is_part_key(&name) {
+            out.insert(name, bytes_sha256(&bytes));
+        }
+    }
+    Ok(out)
+}
+
 pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError> {
     let source_path = resolve_path(source);
     if !source_path.is_file() {
@@ -216,11 +256,12 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| source_path.to_string_lossy().into_owned());
 
-    let typed_md = format!(
-        "<!--@typed schema=\"1\" format=\"format.json\" styles=\"styles.json\" template=\"_template.docx\" source=\"{}\"-->\n",
-        source_name
-    );
-    let typed_sha256 = bytes_sha256(typed_md.as_bytes());
+    // The whole typed projection, not a header (#52): this file is what
+    // `styles.json` is keyed against and what a version's tree is computed
+    // over, so a header-only stub could never match the reference.
+    let package_bytes = std::fs::read(&source_path).map_err(CoreError::io)?;
+    let projection = crate::document_projection::project_document_bytes(&package_bytes)?;
+    let typed_md = crate::prose::serialize_typed(&source_name, &projection);
 
     // The registry, built from the document's own runs. This was a hardcoded
     // empty object (#48), which made the format lane inert: a restyle is
@@ -253,14 +294,27 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
         "document_xml_sha256": document_xml_sha256,
         "package_manifest": package_manifest,
         "styles_sha256": styles_sha256,
-        "parts": {},
-        "paragraphs": [],
+        // Per-part digests, and the paragraph records (#52). Both were empty,
+        // which is most of why format.json could not match the reference.
+        "parts": part_digests(&package_bytes)?,
+        "paragraphs": crate::prose::format_paragraphs(&projection),
         "tokens": {},
         "source_track_enabled": source_track_enabled,
         "uses_date_utc": false,
-        "typed_sha256": typed_sha256,
+        "vertical_promotion": { "schema": "2", "promoted": 0 },
+        // `typed_sha256` is deliberately absent: the reference pins typed.md
+        // through the edit-state sidecar instead, and `validate_workdir`
+        // already treats an undeclared fingerprint as authoritative.
     });
-    let format_bytes = serde_json::to_vec_pretty(&format).expect("format serializes");
+    // The reference writes every canonical JSON asset as
+    // `json.dumps(..., ensure_ascii=False, indent=2, sort_keys=True) + "\n"`.
+    // The trailing newline is part of the file, and these bytes are hashed into
+    // the tree digest -- it was the last byte of the difference.
+    let format_bytes = {
+        let mut text = serde_json::to_string_pretty(&format).expect("format serializes");
+        text.push('\n');
+        text.into_bytes()
+    };
 
     Ok(ChangeSet {
         assets: vec![
