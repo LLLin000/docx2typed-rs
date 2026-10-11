@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 45] = [
+pub const TOOL_NAMES: [&str; 46] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -81,6 +81,7 @@ pub const TOOL_NAMES: [&str; 45] = [
     "document_search",
     "document_read",
     "document_patch",
+    "document_replace",
     "history_diff",
     "history_blame",
     "history_verify",
@@ -1845,6 +1846,71 @@ impl McpSession {
             .map_err(|error| MutationError::new(error.code, error.detail))
         })
     }
+    fn document_replace(&self, args: &Value, build_commit: &str) -> Value {
+        let find = args
+            .get("find")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let replace = args
+            .get("replace")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("body")
+            .to_string();
+        let regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
+        let case_sensitive = args
+            .get("case_sensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let expected_matches = args
+            .get("expected_matches")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let allow_comment_text = args
+            .get("allow_comment_text")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let base_revision = args
+            .get("base_revision")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let dry_run = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let tracked = self.track;
+        let author = self.author.clone();
+
+        self.draft_tool("document_replace", args, build_commit, move |target| {
+            draft::ensure_projection(target)
+                .map_err(|error| MutationError::new(error.code, error.detail))?;
+            draft::document_replace(
+                target,
+                draft::DocumentReplaceArgs {
+                    find: &find,
+                    replace: &replace,
+                    scope: &scope,
+                    regex,
+                    case_sensitive,
+                    expected_matches,
+                    allow_comment_text,
+                    base_revision: base_revision.as_deref(),
+                    dry_run,
+                },
+                draft::EditTracking {
+                    tracked,
+                    author: author.as_deref(),
+                    date: None,
+                },
+            )
+            .map_err(|error| MutationError::new(error.code, error.detail))
+        })
+    }
 }
 
 /// `draft_dirty`: the same freshness rule as `diff_preview`/`workdir_status`
@@ -2366,6 +2432,12 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
         }
         "document_patch" => {
             let mut json = serde_json::to_string(&session.document_patch(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "document_replace" => {
+            let mut json = serde_json::to_string(&session.document_replace(&args, build_commit))
                 .expect("serializes");
             json.insert_str(0, "OK ");
             json

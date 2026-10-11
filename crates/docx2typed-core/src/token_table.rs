@@ -214,21 +214,28 @@ fn with_namespace(
 
     // Rename every unregistered prefix, in the order ElementTree met them.
     let mut renames: Vec<(String, String, String)> = Vec::new();
+    let mut seen_uris: Vec<String> = Vec::new();
     for prefix in &used {
         let Some(uri) = namespaces.get(prefix) else {
             continue;
         };
         if REGISTERED.iter().any(|(_, known_uri)| known_uri == uri) {
+            if !seen_uris.contains(uri) {
+                seen_uris.push(uri.clone());
+            }
             continue;
         }
         let assigned = match unknown.get(uri) {
             Some(existing) => existing.clone(),
             None => {
-                let next = format!("ns{}", unknown.len());
+                let next = format!("ns{}", seen_uris.len());
                 unknown.insert(uri.clone(), next.clone());
                 next
             }
         };
+        if !seen_uris.contains(uri) {
+            seen_uris.push(uri.clone());
+        }
         renames.push((prefix.clone(), assigned, uri.clone()));
     }
 
@@ -647,6 +654,7 @@ pub struct ParagraphNodes {
     pub nodes: Vec<TypedNode>,
     /// `(kind, token_id, attrs)` when the paragraph mark carries a revision.
     pub mark: Option<(String, String, BTreeMap<String, String>)>,
+    pub section_bearing: bool,
 }
 
 /// `merge_adjacent_text`: same style AND same vertical alignment merges, so a
@@ -875,7 +883,8 @@ impl<'a> Walker<'a> {
                 continue;
             }
             if name == "proofErr" {
-                let (_, attrs) = self.tag(&node);
+                let mut attrs = BTreeMap::new();
+                attrs.insert("tag".to_string(), "w:proofErr".to_string());
                 self.add("opaque", attrs, &node);
                 continue;
             }
@@ -995,7 +1004,8 @@ impl<'a> Walker<'a> {
                 continue;
             }
             if name == "proofErr" {
-                let (_, attrs) = self.tag(&node);
+                let mut attrs = BTreeMap::new();
+                attrs.insert("tag".to_string(), "w:proofErr".to_string());
                 let token_id = self.add("opaque", attrs.clone(), &node);
                 out.push(TypedNode::Opaque {
                     token_id,
@@ -1325,6 +1335,14 @@ pub fn paragraph_nodes(package: &[u8]) -> Result<Vec<ParagraphNodes>, CoreError>
             let children = walker.container_nodes(&root.children.clone());
             // Rule 2: the mark is allocated after the container.
             let mark = walker.paragraph_mark_token(&root.children.clone());
+            let section_bearing = root.children.iter().any(|child_idx| {
+                let child = &nodes[*child_idx];
+                child.name == "pPr"
+                    && child
+                        .children
+                        .iter()
+                        .any(|pchild_idx| nodes[*pchild_idx].name == "sectPr")
+            });
             out.push(ParagraphNodes {
                 part: part_key.clone(),
                 paragraph_id,
@@ -1332,6 +1350,7 @@ pub fn paragraph_nodes(package: &[u8]) -> Result<Vec<ParagraphNodes>, CoreError>
                 part_entry_id: part_entry_id(&part_key, start, xml),
                 nodes: children,
                 mark,
+                section_bearing,
             });
         }
     }

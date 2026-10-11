@@ -4,12 +4,6 @@
   "target_commit": "324cd055096e841fd5c97757def982b91ed93e15",
   "missing_tools": [
     {
-      "tool": "document_replace",
-      "python_site": "mcp_server.py:4947",
-      "rust_owner": null,
-      "status": "missing"
-    },
-    {
       "tool": "history_gc",
       "python_site": "mcp_server.py:5917",
       "rust_owner": "store/store.rs",

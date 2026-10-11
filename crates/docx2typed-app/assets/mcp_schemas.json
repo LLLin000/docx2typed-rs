@@ -1,1032 +1,1095 @@
 {
- "accept_revision": {
-  "properties": {
-   "expected_fingerprint": {
-    "title": "Expected Fingerprint",
-    "type": "string"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "revision_key": {
-    "title": "Revision Key",
-    "type": "string"
-   }
-  },
-  "required": [
-   "revision_key",
-   "expected_fingerprint",
-   "operation_id"
-  ],
-  "title": "accept_revisionArguments",
-  "type": "object",
-  "additionalProperties": false
- },
- "batch_edit": {
-  "properties": {
-   "edits": {
-    "items": {
-     "additionalProperties": true,
-     "type": "object"
-    },
-    "title": "Edits",
-    "type": "array"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "paragraph_id": {
-    "title": "Paragraph Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "paragraph_id",
-   "edits",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "build_docx": {
-  "properties": {
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "output": {
-    "anyOf": [
-     {
-      "type": "string"
-     },
-     {
-      "type": "null"
-     }
-    ],
-    "default": null,
-    "title": "Output"
-   }
-  },
-  "required": [
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "commit_sync": {
-  "properties": {
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "decide_all": {
-  "properties": {
-   "action": {
-    "title": "Action",
-    "type": "string"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "output": {
-    "title": "Output",
-    "type": "string"
-   },
-   "workdir_out": {
-    "title": "Workdir Out",
-    "type": "string"
-   }
-  },
-  "required": [
-   "action",
-   "output",
-   "workdir_out",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "delete_comment": {
-  "properties": {
-   "comment_id": {
-    "title": "Comment Id",
-    "type": "string"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "comment_id",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "delete_paragraph": {
-  "properties": {
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "paragraph_id": {
-    "title": "Paragraph Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "paragraph_id",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "diff_preview": {
-  "properties": {},
-  "type": "object",
-  "additionalProperties": false
- },
- "engine_info": {
-  "properties": {},
-  "type": "object",
-  "additionalProperties": false
- },
- "get_comment": {
-  "properties": {
-   "comment_id": {
-    "title": "Comment Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "comment_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "get_paragraph": {
-  "properties": {
-   "paragraph_id": {
-    "title": "Paragraph Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "paragraph_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "insert_paragraph": {
-  "properties": {
-   "after_id": {
-    "title": "After Id",
-    "type": "string"
-   },
-   "inherit": {
-    "anyOf": [
-     {
-      "type": "string"
-     },
-     {
-      "type": "null"
-     }
-    ],
-    "default": null,
-    "title": "Inherit"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "text": {
-    "title": "Text",
-    "type": "string"
-   }
-  },
-  "required": [
-   "after_id",
-   "text",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "list_comments": {
-  "properties": {},
-  "type": "object",
-  "additionalProperties": false
- },
- "list_paragraphs": {
-  "properties": {},
-  "type": "object",
-  "additionalProperties": false
- },
- "reinsert_deleted_text": {
-  "properties": {
-   "expected_fingerprint": {
-    "title": "Expected Fingerprint",
-    "type": "string"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "revision_key": {
-    "title": "Revision Key",
-    "type": "string"
-   },
-   "text": {
-    "anyOf": [
-     {
-      "type": "string"
-     },
-     {
-      "type": "null"
-     }
-    ],
-    "default": null,
-    "title": "Text"
-   }
-  },
-  "required": [
-   "revision_key",
-   "expected_fingerprint",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "reject_revision": {
-  "properties": {
-   "expected_fingerprint": {
-    "title": "Expected Fingerprint",
-    "type": "string"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "revision_key": {
-    "title": "Revision Key",
-    "type": "string"
-   }
-  },
-  "required": [
-   "revision_key",
-   "expected_fingerprint",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "replace_text": {
-  "properties": {
-   "new": {
-    "title": "New",
-    "type": "string"
-   },
-   "old": {
-    "title": "Old",
-    "type": "string"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "paragraph_id": {
-    "title": "Paragraph Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "paragraph_id",
-   "old",
-   "new",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "revert": {
-  "properties": {
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "review_ack": {
-  "properties": {
-   "event_ids": {
-    "items": {
-     "type": "string"
-    },
-    "title": "Event Ids",
-    "type": "array"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "event_ids",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "review_apply_batch": {
-  "properties": {
-   "batch_id": {
-    "title": "Batch Id",
-    "type": "string"
-   },
-   "operation_id": {
-    "anyOf": [
-     {
-      "type": "string"
-     },
-     {
-      "type": "null"
-     }
-    ],
-    "default": null,
-    "title": "Operation Id"
-   }
-  },
-  "required": [
-   "batch_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "review_apply_patch": {
-  "properties": {
-   "event_id": {
-    "title": "Event Id",
-    "type": "string"
-   },
-   "operation_id": {
-    "anyOf": [
-     {
-      "type": "string"
-     },
-     {
-      "type": "null"
-     }
-    ],
-    "default": null,
-    "title": "Operation Id"
-   }
-  },
-  "required": [
-   "event_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "review_external_preflight": {
-  "properties": {
-   "expected_parent_snapshot": {
-    "title": "Expected Parent Snapshot",
-    "type": "string"
-   },
-   "operation": {
-    "default": "import",
-    "title": "Operation",
-    "type": "string"
-   }
-  },
-  "required": [
-   "expected_parent_snapshot"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "review_inbox": {
-  "properties": {
-   "include_acknowledged": {
-    "default": false,
-    "title": "Include Acknowledged",
-    "type": "boolean"
-   }
-  },
-  "type": "object",
-  "additionalProperties": false
- },
- "review_preflight": {
-  "properties": {},
-  "type": "object",
-  "additionalProperties": false
- },
- "review_settle": {
-  "properties": {
-   "event_ids": {
-    "anyOf": [
-     {
-      "items": {
-       "type": "string"
+  "accept_revision": {
+    "properties": {
+      "expected_fingerprint": {
+        "title": "Expected Fingerprint",
+        "type": "string"
       },
-      "type": "array"
-     },
-     {
-      "type": "null"
-     }
-    ],
-    "default": null,
-    "title": "Event Ids"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "review_settlement_plan": {
-  "properties": {
-   "event_ids": {
-    "anyOf": [
-     {
-      "items": {
-       "type": "string"
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
       },
-      "type": "array"
-     },
-     {
-      "type": "null"
-     }
+      "revision_key": {
+        "title": "Revision Key",
+        "type": "string"
+      }
+    },
+    "required": [
+      "revision_key",
+      "expected_fingerprint",
+      "operation_id"
     ],
-    "default": null,
-    "title": "Event Ids"
-   }
+    "title": "accept_revisionArguments",
+    "type": "object",
+    "additionalProperties": false
   },
-  "type": "object",
-  "additionalProperties": false
- },
- "review_state": {
-  "properties": {},
-  "type": "object",
-  "additionalProperties": false
- },
- "table_delete_col": {
-  "properties": {
-   "col": {
-    "title": "Col",
-    "type": "integer"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "output": {
-    "title": "Output",
-    "type": "string"
-   },
-   "table_ref": {
-    "title": "Table Ref",
-    "type": "string"
-   },
-   "workdir_out": {
-    "title": "Workdir Out",
-    "type": "string"
-   }
-  },
-  "required": [
-   "table_ref",
-   "col",
-   "output",
-   "workdir_out",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "table_delete_row": {
-  "properties": {
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "output": {
-    "title": "Output",
-    "type": "string"
-   },
-   "row": {
-    "title": "Row",
-    "type": "integer"
-   },
-   "table_ref": {
-    "title": "Table Ref",
-    "type": "string"
-   },
-   "workdir_out": {
-    "title": "Workdir Out",
-    "type": "string"
-   }
-  },
-  "required": [
-   "table_ref",
-   "row",
-   "output",
-   "workdir_out",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "table_insert_col": {
-  "properties": {
-   "after": {
-    "title": "After",
-    "type": "integer"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "output": {
-    "title": "Output",
-    "type": "string"
-   },
-   "table_ref": {
-    "title": "Table Ref",
-    "type": "string"
-   },
-   "workdir_out": {
-    "title": "Workdir Out",
-    "type": "string"
-   }
-  },
-  "required": [
-   "table_ref",
-   "after",
-   "output",
-   "workdir_out",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "table_insert_row": {
-  "properties": {
-   "after": {
-    "title": "After",
-    "type": "integer"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "output": {
-    "title": "Output",
-    "type": "string"
-   },
-   "table_ref": {
-    "title": "Table Ref",
-    "type": "string"
-   },
-   "workdir_out": {
-    "title": "Workdir Out",
-    "type": "string"
-   }
-  },
-  "required": [
-   "table_ref",
-   "after",
-   "output",
-   "workdir_out",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "table_merge_cells": {
-  "properties": {
-   "col": {
-    "title": "Col",
-    "type": "integer"
-   },
-   "discard_content": {
-    "default": false,
-    "title": "Discard Content",
-    "type": "boolean"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "output": {
-    "title": "Output",
-    "type": "string"
-   },
-   "row": {
-    "title": "Row",
-    "type": "integer"
-   },
-   "span": {
-    "title": "Span",
-    "type": "integer"
-   },
-   "table_ref": {
-    "title": "Table Ref",
-    "type": "string"
-   },
-   "workdir_out": {
-    "title": "Workdir Out",
-    "type": "string"
-   }
-  },
-  "required": [
-   "table_ref",
-   "row",
-   "col",
-   "span",
-   "output",
-   "workdir_out",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "table_split_cells": {
-  "properties": {
-   "col": {
-    "title": "Col",
-    "type": "integer"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "output": {
-    "title": "Output",
-    "type": "string"
-   },
-   "row": {
-    "title": "Row",
-    "type": "integer"
-   },
-   "span": {
-    "title": "Span",
-    "type": "integer"
-   },
-   "table_ref": {
-    "title": "Table Ref",
-    "type": "string"
-   },
-   "workdir_out": {
-    "title": "Workdir Out",
-    "type": "string"
-   }
-  },
-  "required": [
-   "table_ref",
-   "row",
-   "col",
-   "span",
-   "output",
-   "workdir_out",
-   "operation_id"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "verify_output": {
-  "properties": {
-   "output": {
-    "title": "Output",
-    "type": "string"
-   }
-  },
-  "required": [
-   "output"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "workdir_open": {
-  "properties": {
-   "author": {
-    "anyOf": [
-     {
-      "type": "string"
-     },
-     {
-      "type": "null"
-     }
+  "batch_edit": {
+    "properties": {
+      "edits": {
+        "items": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "title": "Edits",
+        "type": "array"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "paragraph_id": {
+        "title": "Paragraph Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "paragraph_id",
+      "edits",
+      "operation_id"
     ],
-    "default": null,
-    "title": "Author"
-   },
-   "contract_ranges": {
-    "anyOf": [
-     {
-      "additionalProperties": {
-       "additionalProperties": {
+    "type": "object",
+    "additionalProperties": false
+  },
+  "build_docx": {
+    "properties": {
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "output": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Output"
+      }
+    },
+    "required": [
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "commit_sync": {
+    "properties": {
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "decide_all": {
+    "properties": {
+      "action": {
+        "title": "Action",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "output": {
+        "title": "Output",
+        "type": "string"
+      },
+      "workdir_out": {
+        "title": "Workdir Out",
+        "type": "string"
+      }
+    },
+    "required": [
+      "action",
+      "output",
+      "workdir_out",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "delete_comment": {
+    "properties": {
+      "comment_id": {
+        "title": "Comment Id",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "comment_id",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "delete_paragraph": {
+    "properties": {
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "paragraph_id": {
+        "title": "Paragraph Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "paragraph_id",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "diff_preview": {
+    "properties": {},
+    "type": "object",
+    "additionalProperties": false
+  },
+  "document_patch": {
+    "properties": {
+      "allow_comment_text": {
+        "default": false,
+        "title": "Allow Comment Text",
+        "type": "boolean"
+      },
+      "base_revision": {
+        "title": "Base Revision",
+        "type": "string"
+      },
+      "diff": {
+        "title": "Diff",
+        "type": "string"
+      },
+      "hunks": {
+        "items": {
+          "type": "object"
+        },
+        "title": "Hunks",
+        "type": "array"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "track": {
+        "title": "Track",
+        "type": "boolean"
+      }
+    },
+    "title": "document_patchArguments",
+    "type": "object",
+    "additionalProperties": false
+  },
+  "document_read": {
+    "properties": {
+      "after": {
+        "default": 8,
+        "title": "After",
         "type": "integer"
-       },
-       "type": "object"
       },
-      "type": "object"
-     },
-     {
-      "type": "null"
-     }
-    ],
-    "default": null,
-    "title": "Contract Ranges"
-   },
-   "required_features": {
-    "anyOf": [
-     {
-      "items": {
-       "type": "string"
+      "anchor": {
+        "title": "Anchor",
+        "type": "string"
       },
-      "type": "array"
-     },
-     {
-      "type": "null"
-     }
-    ],
-    "default": null,
-    "title": "Required Features"
-   },
-   "supported_features": {
-    "anyOf": [
-     {
-      "items": {
-       "type": "string"
+      "before": {
+        "default": 5,
+        "title": "Before",
+        "type": "integer"
       },
-      "type": "array"
-     },
-     {
-      "type": "null"
-     }
+      "view": {
+        "default": "auto",
+        "title": "View",
+        "type": "string"
+      }
+    },
+    "title": "document_readArguments",
+    "type": "object",
+    "additionalProperties": false
+  },
+  "document_replace": {
+    "additionalProperties": false,
+    "properties": {
+      "allow_comment_text": {
+        "default": false,
+        "title": "Allow Comment Text",
+        "type": "boolean"
+      },
+      "base_revision": {
+        "title": "Base Revision",
+        "type": "string"
+      },
+      "case_sensitive": {
+        "default": true,
+        "title": "Case Sensitive",
+        "type": "boolean"
+      },
+      "dry_run": {
+        "default": false,
+        "description": "Discover and classify every match, then stop without touching the draft (confirm a count / preview targets without mutating).",
+        "title": "Dry Run",
+        "type": "boolean"
+      },
+      "expected_matches": {
+        "title": "Expected Matches",
+        "type": "integer"
+      },
+      "find": {
+        "title": "Find",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "regex": {
+        "default": false,
+        "title": "Regex",
+        "type": "boolean"
+      },
+      "replace": {
+        "title": "Replace",
+        "type": "string"
+      },
+      "scope": {
+        "default": "body",
+        "title": "Scope",
+        "type": "string"
+      },
+      "track": {
+        "description": "Choose the edit mode in this call: true = tracked revisions, false = direct. Removes the edit-mode-ambiguous round trip.",
+        "title": "Track",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "find",
+      "replace"
     ],
-    "default": null,
-    "title": "Supported Features"
-   },
-   "track": {
-    "anyOf": [
-     {
-      "type": "boolean"
-     },
-     {
-      "type": "null"
-     }
-    ],
-    "default": null,
-    "title": "Track"
-   },
-   "workdir": {
-    "title": "Workdir",
-    "type": "string"
-   }
-  },
-  "required": [
-   "workdir"
-  ],
-  "type": "object",
-  "additionalProperties": false
- },
- "workdir_status": {
-  "properties": {},
-  "type": "object",
-  "additionalProperties": false
- },
- "history_list": {
-  "properties": {
-   "limit": {
-    "default": 20,
-    "title": "Limit",
-    "type": "integer"
-   },
-   "offset": {
-    "default": 0,
-    "title": "Offset",
-    "type": "integer"
-   }
-  },
-  "type": "object",
-  "additionalProperties": false
- },
- "document_search": {
-  "properties": {
-   "case_sensitive": {
-    "default": false,
-    "title": "Case Sensitive",
-    "type": "boolean"
-   },
-   "context_chars": {
-    "default": 3000,
-    "title": "Context Chars",
-    "type": "integer"
-   },
-   "limit": {
-    "default": 20,
-    "title": "Limit",
-    "type": "integer"
-   },
-   "offset": {
-    "default": 0,
-    "title": "Offset",
-    "type": "integer"
-   },
-   "query": {
-    "title": "Query",
-    "type": "string"
-   },
-   "scope": {
-    "default": "all",
-    "title": "Scope",
-    "type": "string"
-   }
-  },
-  "required": [
-   "query"
-  ],
-  "title": "document_searchArguments",
-  "type": "object",
-  "additionalProperties": false
- },
- "document_read": {
-  "properties": {
-   "after": {
-    "default": 8,
-    "title": "After",
-    "type": "integer"
-   },
-   "anchor": {
-    "title": "Anchor",
-    "type": "string"
-   },
-   "before": {
-    "default": 5,
-    "title": "Before",
-    "type": "integer"
-   },
-   "view": {
-    "default": "auto",
-    "title": "View",
-    "type": "string"
-   }
-  },
-  "title": "document_readArguments",
-  "type": "object",
-  "additionalProperties": false
- },
- "document_patch": {
-  "properties": {
-   "allow_comment_text": {
-    "default": false,
-    "title": "Allow Comment Text",
-    "type": "boolean"
-   },
-   "base_revision": {
-    "title": "Base Revision",
-    "type": "string"
-   },
-   "diff": {
-    "title": "Diff",
-    "type": "string"
-   },
-   "hunks": {
-    "items": {"type": "object"},
-    "title": "Hunks",
-    "type": "array"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "track": {
-    "title": "Track",
-    "type": "boolean"
-   }
-  },
-  "title": "document_patchArguments",
-  "type": "object",
-  "additionalProperties": false
- },
- "history_diff": {
-  "properties": {
-   "against": {
-    "title": "Against",
-    "type": "string"
-   },
-   "version": {
-    "title": "Version",
-    "type": "string"
-   }
-  },
-  "required": [
-   "version"
-  ],
-  "title": "history_diffArguments",
-  "type": "object",
-  "additionalProperties": false
- },
- "history_blame": {
-  "properties": {
-   "paragraph_id": {
-    "title": "Paragraph Id",
-    "type": "string"
-   }
-  },
-  "required": [
-   "paragraph_id"
-  ],
-  "title": "history_blameArguments",
-  "type": "object",
-  "additionalProperties": false
- },
- "history_verify": {
-  "properties": {
-  },
-  "title": "history_verifyArguments",
-  "type": "object",
-  "additionalProperties": false
- },
- "workspace_fork": {
-  "properties": {
-   "docx": {
-    "title": "Docx",
-    "type": "string"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "outdir": {
-    "title": "Outdir",
-    "type": "string"
-   }
-  },
-  "required": [
-   "docx",
-   "outdir"
-  ],
-  "title": "workspace_forkArguments",
-  "type": "object",
-  "additionalProperties": false
- },
- "format_span": {
-  "properties": {
-   "attributes": {
-    "title": "Attributes",
+    "title": "document_replaceArguments",
     "type": "object"
-   },
-   "old": {
-    "title": "Old",
-    "type": "string"
-   },
-   "operation_id": {
-    "title": "Operation Id",
-    "type": "string"
-   },
-   "paragraph_id": {
-    "title": "Paragraph Id",
-    "type": "string"
-   },
-   "style_id": {
-    "title": "Style Id",
-    "type": "string"
-   },
-   "track": {
-    "title": "Track",
-    "type": "boolean"
-   }
   },
-  "required": [
-   "paragraph_id",
-   "old",
-   "operation_id"
-  ],
-  "title": "format_spanArguments",
-  "type": "object",
-  "additionalProperties": false
- }
+  "document_search": {
+    "properties": {
+      "case_sensitive": {
+        "default": false,
+        "title": "Case Sensitive",
+        "type": "boolean"
+      },
+      "context_chars": {
+        "default": 3000,
+        "title": "Context Chars",
+        "type": "integer"
+      },
+      "limit": {
+        "default": 20,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "offset": {
+        "default": 0,
+        "title": "Offset",
+        "type": "integer"
+      },
+      "query": {
+        "title": "Query",
+        "type": "string"
+      },
+      "scope": {
+        "default": "all",
+        "title": "Scope",
+        "type": "string"
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "title": "document_searchArguments",
+    "type": "object",
+    "additionalProperties": false
+  },
+  "engine_info": {
+    "properties": {},
+    "type": "object",
+    "additionalProperties": false
+  },
+  "format_span": {
+    "properties": {
+      "attributes": {
+        "title": "Attributes",
+        "type": "object"
+      },
+      "old": {
+        "title": "Old",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "paragraph_id": {
+        "title": "Paragraph Id",
+        "type": "string"
+      },
+      "style_id": {
+        "title": "Style Id",
+        "type": "string"
+      },
+      "track": {
+        "title": "Track",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "paragraph_id",
+      "old",
+      "operation_id"
+    ],
+    "title": "format_spanArguments",
+    "type": "object",
+    "additionalProperties": false
+  },
+  "get_comment": {
+    "properties": {
+      "comment_id": {
+        "title": "Comment Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "comment_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "get_paragraph": {
+    "properties": {
+      "paragraph_id": {
+        "title": "Paragraph Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "paragraph_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "history_blame": {
+    "properties": {
+      "paragraph_id": {
+        "title": "Paragraph Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "paragraph_id"
+    ],
+    "title": "history_blameArguments",
+    "type": "object",
+    "additionalProperties": false
+  },
+  "history_diff": {
+    "properties": {
+      "against": {
+        "title": "Against",
+        "type": "string"
+      },
+      "version": {
+        "title": "Version",
+        "type": "string"
+      }
+    },
+    "required": [
+      "version"
+    ],
+    "title": "history_diffArguments",
+    "type": "object",
+    "additionalProperties": false
+  },
+  "history_list": {
+    "properties": {
+      "limit": {
+        "default": 20,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "offset": {
+        "default": 0,
+        "title": "Offset",
+        "type": "integer"
+      }
+    },
+    "type": "object",
+    "additionalProperties": false
+  },
+  "history_verify": {
+    "properties": {},
+    "title": "history_verifyArguments",
+    "type": "object",
+    "additionalProperties": false
+  },
+  "insert_paragraph": {
+    "properties": {
+      "after_id": {
+        "title": "After Id",
+        "type": "string"
+      },
+      "inherit": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Inherit"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "text": {
+        "title": "Text",
+        "type": "string"
+      }
+    },
+    "required": [
+      "after_id",
+      "text",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "list_comments": {
+    "properties": {},
+    "type": "object",
+    "additionalProperties": false
+  },
+  "list_paragraphs": {
+    "properties": {},
+    "type": "object",
+    "additionalProperties": false
+  },
+  "reinsert_deleted_text": {
+    "properties": {
+      "expected_fingerprint": {
+        "title": "Expected Fingerprint",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "revision_key": {
+        "title": "Revision Key",
+        "type": "string"
+      },
+      "text": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Text"
+      }
+    },
+    "required": [
+      "revision_key",
+      "expected_fingerprint",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "reject_revision": {
+    "properties": {
+      "expected_fingerprint": {
+        "title": "Expected Fingerprint",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "revision_key": {
+        "title": "Revision Key",
+        "type": "string"
+      }
+    },
+    "required": [
+      "revision_key",
+      "expected_fingerprint",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "replace_text": {
+    "properties": {
+      "new": {
+        "title": "New",
+        "type": "string"
+      },
+      "old": {
+        "title": "Old",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "paragraph_id": {
+        "title": "Paragraph Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "paragraph_id",
+      "old",
+      "new",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "revert": {
+    "properties": {
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "review_ack": {
+    "properties": {
+      "event_ids": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Event Ids",
+        "type": "array"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "event_ids",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "review_apply_batch": {
+    "properties": {
+      "batch_id": {
+        "title": "Batch Id",
+        "type": "string"
+      },
+      "operation_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Operation Id"
+      }
+    },
+    "required": [
+      "batch_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "review_apply_patch": {
+    "properties": {
+      "event_id": {
+        "title": "Event Id",
+        "type": "string"
+      },
+      "operation_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Operation Id"
+      }
+    },
+    "required": [
+      "event_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "review_external_preflight": {
+    "properties": {
+      "expected_parent_snapshot": {
+        "title": "Expected Parent Snapshot",
+        "type": "string"
+      },
+      "operation": {
+        "default": "import",
+        "title": "Operation",
+        "type": "string"
+      }
+    },
+    "required": [
+      "expected_parent_snapshot"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "review_inbox": {
+    "properties": {
+      "include_acknowledged": {
+        "default": false,
+        "title": "Include Acknowledged",
+        "type": "boolean"
+      }
+    },
+    "type": "object",
+    "additionalProperties": false
+  },
+  "review_preflight": {
+    "properties": {},
+    "type": "object",
+    "additionalProperties": false
+  },
+  "review_settle": {
+    "properties": {
+      "event_ids": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Event Ids"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "review_settlement_plan": {
+    "properties": {
+      "event_ids": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Event Ids"
+      }
+    },
+    "type": "object",
+    "additionalProperties": false
+  },
+  "review_state": {
+    "properties": {},
+    "type": "object",
+    "additionalProperties": false
+  },
+  "table_delete_col": {
+    "properties": {
+      "col": {
+        "title": "Col",
+        "type": "integer"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "output": {
+        "title": "Output",
+        "type": "string"
+      },
+      "table_ref": {
+        "title": "Table Ref",
+        "type": "string"
+      },
+      "workdir_out": {
+        "title": "Workdir Out",
+        "type": "string"
+      }
+    },
+    "required": [
+      "table_ref",
+      "col",
+      "output",
+      "workdir_out",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "table_delete_row": {
+    "properties": {
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "output": {
+        "title": "Output",
+        "type": "string"
+      },
+      "row": {
+        "title": "Row",
+        "type": "integer"
+      },
+      "table_ref": {
+        "title": "Table Ref",
+        "type": "string"
+      },
+      "workdir_out": {
+        "title": "Workdir Out",
+        "type": "string"
+      }
+    },
+    "required": [
+      "table_ref",
+      "row",
+      "output",
+      "workdir_out",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "table_insert_col": {
+    "properties": {
+      "after": {
+        "title": "After",
+        "type": "integer"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "output": {
+        "title": "Output",
+        "type": "string"
+      },
+      "table_ref": {
+        "title": "Table Ref",
+        "type": "string"
+      },
+      "workdir_out": {
+        "title": "Workdir Out",
+        "type": "string"
+      }
+    },
+    "required": [
+      "table_ref",
+      "after",
+      "output",
+      "workdir_out",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "table_insert_row": {
+    "properties": {
+      "after": {
+        "title": "After",
+        "type": "integer"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "output": {
+        "title": "Output",
+        "type": "string"
+      },
+      "table_ref": {
+        "title": "Table Ref",
+        "type": "string"
+      },
+      "workdir_out": {
+        "title": "Workdir Out",
+        "type": "string"
+      }
+    },
+    "required": [
+      "table_ref",
+      "after",
+      "output",
+      "workdir_out",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "table_merge_cells": {
+    "properties": {
+      "col": {
+        "title": "Col",
+        "type": "integer"
+      },
+      "discard_content": {
+        "default": false,
+        "title": "Discard Content",
+        "type": "boolean"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "output": {
+        "title": "Output",
+        "type": "string"
+      },
+      "row": {
+        "title": "Row",
+        "type": "integer"
+      },
+      "span": {
+        "title": "Span",
+        "type": "integer"
+      },
+      "table_ref": {
+        "title": "Table Ref",
+        "type": "string"
+      },
+      "workdir_out": {
+        "title": "Workdir Out",
+        "type": "string"
+      }
+    },
+    "required": [
+      "table_ref",
+      "row",
+      "col",
+      "span",
+      "output",
+      "workdir_out",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "table_split_cells": {
+    "properties": {
+      "col": {
+        "title": "Col",
+        "type": "integer"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "output": {
+        "title": "Output",
+        "type": "string"
+      },
+      "row": {
+        "title": "Row",
+        "type": "integer"
+      },
+      "span": {
+        "title": "Span",
+        "type": "integer"
+      },
+      "table_ref": {
+        "title": "Table Ref",
+        "type": "string"
+      },
+      "workdir_out": {
+        "title": "Workdir Out",
+        "type": "string"
+      }
+    },
+    "required": [
+      "table_ref",
+      "row",
+      "col",
+      "span",
+      "output",
+      "workdir_out",
+      "operation_id"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "verify_output": {
+    "properties": {
+      "output": {
+        "title": "Output",
+        "type": "string"
+      }
+    },
+    "required": [
+      "output"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "workdir_open": {
+    "properties": {
+      "author": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Author"
+      },
+      "contract_ranges": {
+        "anyOf": [
+          {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Contract Ranges"
+      },
+      "required_features": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Required Features"
+      },
+      "supported_features": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Supported Features"
+      },
+      "track": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Track"
+      },
+      "workdir": {
+        "title": "Workdir",
+        "type": "string"
+      }
+    },
+    "required": [
+      "workdir"
+    ],
+    "type": "object",
+    "additionalProperties": false
+  },
+  "workdir_status": {
+    "properties": {},
+    "type": "object",
+    "additionalProperties": false
+  },
+  "workspace_fork": {
+    "properties": {
+      "docx": {
+        "title": "Docx",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "outdir": {
+        "title": "Outdir",
+        "type": "string"
+      }
+    },
+    "required": [
+      "docx",
+      "outdir"
+    ],
+    "title": "workspace_forkArguments",
+    "type": "object",
+    "additionalProperties": false
+  }
 }

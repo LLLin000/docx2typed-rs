@@ -68,7 +68,7 @@ fn extract(fixture_path: &Path, outdir: &Path) {
 }
 
 /// The frozen MCP tool surface (mirror of `scripts/mcp_server.py`).
-const TOOL_NAMES: [&str; 45] = [
+const TOOL_NAMES: [&str; 46] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -109,6 +109,7 @@ const TOOL_NAMES: [&str; 45] = [
     "document_search",
     "document_read",
     "document_patch",
+    "document_replace",
     "history_diff",
     "history_blame",
     "history_verify",
@@ -1620,4 +1621,53 @@ fn format_span_restyles_a_span_and_the_build_applies_it() {
         xml.contains("Times New Roman"),
         "the built document must carry the restyled properties"
     );
+}
+#[test]
+fn document_replace_atomic_scope_and_dry_run() {
+    let workdir = scratch("replace-atomic");
+    extract(&fixture("plain"), &workdir);
+    let (results, _) = mcp(&[
+        (
+            "workdir_open",
+            json!({ "workdir": workdir.to_string_lossy() }),
+        ),
+        (
+            "document_replace",
+            json!({
+                "find": "段落",
+                "replace": "章节",
+                "dry_run": true,
+                "operation_id": "rep-dry",
+            }),
+        ),
+        (
+            "document_replace",
+            json!({
+                "find": "段落",
+                "replace": "章节",
+                "operation_id": "rep-apply",
+            }),
+        ),
+        (
+            "document_replace",
+            json!({
+                "find": "不存在的词",
+                "replace": "X",
+                "operation_id": "rep-none",
+            }),
+        ),
+    ]);
+    assert_eq!(envelope(&results[0])["outcome"], "success");
+    let dry = &envelope(&results[1])["data"];
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["changed"], 0);
+    assert!(dry["matches"].as_u64().unwrap() >= 1);
+
+    let applied = &envelope(&results[2])["data"];
+    assert_eq!(applied["changed"], applied["matches"]);
+
+    let none = &envelope(&results[3])["data"];
+    assert_eq!(none["matches"], 0);
+    assert_eq!(none["changed"], 0);
+    assert_eq!(none["noop_reason"], "no-match");
 }

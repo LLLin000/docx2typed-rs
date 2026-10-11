@@ -1877,6 +1877,341 @@ pub fn document_patch(
 /// `diff_preview` payload: the freshness state plus per-paragraph changed
 /// ids when dirty. Hunk/style-ownership reporting is a declared tracer
 /// deferral (the tracer draft model carries no style regions).
+fn replace_in_body_at_visible(
+    body: &str,
+    start_offset: usize,
+    old: &str,
+    new: &str,
+    paragraph_id: &str,
+) -> Result<String, CollaborationError> {
+    const TOKEN_START: char = '\u{27e6}';
+    const TOKEN_END: char = '\u{27e7}';
+
+    let chars: Vec<char> = body.chars().collect();
+    let old_chars: Vec<char> = old.chars().collect();
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    let mut visible_offset = 0usize;
+    let mut replaced = false;
+
+    while cursor < chars.len() {
+        if chars[cursor] == TOKEN_START {
+            let Some(end_rel) = chars[cursor..].iter().position(|c| *c == TOKEN_END) else {
+                return Err(CollaborationError::new(
+                    "edit-grammar-invalid",
+                    "unclosed placeholder in draft",
+                ));
+            };
+            out.extend(&chars[cursor..cursor + end_rel + 1]);
+            cursor += end_rel + 1;
+            continue;
+        }
+        let next_token = chars[cursor..]
+            .iter()
+            .position(|c| *c == TOKEN_START)
+            .unwrap_or(chars.len() - cursor);
+        let prose_chars = &chars[cursor..cursor + next_token];
+        let prose_len = prose_chars.len();
+        if !replaced
+            && visible_offset <= start_offset
+            && start_offset + old_chars.len() <= visible_offset + prose_len
+        {
+            let local_start = start_offset - visible_offset;
+            if prose_chars[local_start..local_start + old_chars.len()] == old_chars[..] {
+                out.extend(&prose_chars[..local_start]);
+                out.push_str(new);
+                out.extend(&prose_chars[local_start + old_chars.len()..]);
+                replaced = true;
+                cursor += next_token;
+                visible_offset += prose_len;
+                continue;
+            }
+        }
+        out.extend(prose_chars);
+        visible_offset += prose_len;
+        cursor += next_token;
+    }
+    if !replaced {
+        return Err(CollaborationError::new(
+            "text-not-found",
+            format!("{paragraph_id}: text {old:?} not found at visible offset {start_offset}"),
+        ));
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Debug)]
+pub struct DocumentReplaceArgs<'a> {
+    pub find: &'a str,
+    pub replace: &'a str,
+    pub scope: &'a str,
+    pub regex: bool,
+    pub case_sensitive: bool,
+    pub expected_matches: Option<usize>,
+    pub allow_comment_text: bool,
+    pub base_revision: Option<&'a str>,
+    pub dry_run: bool,
+}
+
+pub fn document_replace(
+    workdir: &Path,
+    args: DocumentReplaceArgs<'_>,
+    tracking: EditTracking<'_>,
+) -> Result<Value, CollaborationError> {
+    if args.find.is_empty() {
+        return Err(CollaborationError::new(
+            "replace-find-empty",
+            "find must not be empty",
+        ));
+    }
+    let original = read_draft(workdir)?;
+    let (header, mut blocks) = split_blocks(&original)?;
+    let revision_before = current_revision(workdir)?;
+    if let Some(base_rev) = args.base_revision {
+        if base_rev != revision_before {
+            return Err(CollaborationError::new(
+                "stale-document-view",
+                format!(
+                    "base_revision {base_rev:?} does not match the current draft ({revision_before:?})"
+                ),
+            ));
+        }
+    }
+    let allowed = docx2typed_core::document_search::scope_paragraph_ids(&blocks, args.scope)
+        .map_err(|e| CollaborationError::new("replace-scope-invalid", e.to_string()))?;
+    if (args.scope == "comments"
+        || args.scope == "/comments"
+        || allowed.iter().any(|id| id.starts_with("comments.")))
+        && !args.allow_comment_text
+    {
+        return Err(CollaborationError::new(
+            "comment-text-requires-opt-in",
+            "scope touches comment paragraphs; pass allow_comment_text=true only when the user explicitly asked to edit reviewer comment text",
+        ));
+    }
+
+    let mut plan: Vec<Value> = Vec::new();
+    let mut unsafe_matches: Vec<Value> = Vec::new();
+
+    let regex_pattern = if args.regex {
+        Some(
+            regex::RegexBuilder::new(args.find)
+                .case_insensitive(!args.case_sensitive)
+                .build()
+                .map_err(|e| {
+                    CollaborationError::new(
+                        "replace-regex-invalid",
+                        format!("invalid regular expression: {e}"),
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let needle = if args.case_sensitive {
+        args.find.to_string()
+    } else {
+        args.find.to_lowercase()
+    };
+
+    for block in &blocks {
+        let Some((kind, id, _)) = marker_of(block) else {
+            continue;
+        };
+        if kind != "p" || !allowed.contains(&id) {
+            continue;
+        }
+        let body = block_body(block);
+        let (flat, boundaries) = match docx2typed_core::document_search::body_boundaries(&body) {
+            Ok(res) => res,
+            Err(e) => {
+                return Err(CollaborationError::new(
+                    "edit-grammar-invalid",
+                    e.to_string(),
+                ))
+            }
+        };
+        if flat.is_empty() {
+            continue;
+        }
+
+        let flat_chars: Vec<char> = flat.chars().collect();
+        let mut matches: Vec<(usize, String)> = Vec::new();
+        if let Some(re) = &regex_pattern {
+            for m in re.find_iter(&flat) {
+                let char_offset = flat[..m.start()].chars().count();
+                matches.push((char_offset, m.as_str().to_string()));
+            }
+        } else {
+            let haystack: Vec<char> = if args.case_sensitive {
+                flat_chars.clone()
+            } else {
+                flat.to_lowercase().chars().collect()
+            };
+            let needle_chars: Vec<char> = needle.chars().collect();
+            let mut cursor = 0usize;
+            while cursor + needle_chars.len() <= haystack.len() {
+                if haystack[cursor..cursor + needle_chars.len()] == needle_chars[..] {
+                    let matched: String = flat_chars[cursor..cursor + needle_chars.len()]
+                        .iter()
+                        .collect();
+                    matches.push((cursor, matched));
+                    cursor += needle_chars.len();
+                } else {
+                    cursor += 1;
+                }
+            }
+        }
+
+        for (offset, matched_text) in matches {
+            let end = offset + matched_text.chars().count();
+            let crossed: Vec<String> = boundaries
+                .iter()
+                .filter(|(b_off, _)| *b_off > offset && *b_off < end)
+                .map(|(_, k)| k.clone())
+                .collect();
+            let region = if !crossed.is_empty() {
+                "mixed".to_string()
+            } else {
+                docx2typed_core::document_search::region_at(&boundaries, offset).to_string()
+            };
+            let match_ref = docx2typed_core::document_search::encode_match_ref(
+                &id,
+                offset,
+                end,
+                &matched_text,
+                &revision_before,
+            );
+            let entry = serde_json::json!({
+                "paragraph_id": id,
+                "offset": offset,
+                "matched_text": matched_text,
+                "region": region,
+                "patchable": crossed.is_empty(),
+                "normalized": false,
+                "match_ref": match_ref,
+            });
+            if !crossed.is_empty() {
+                let mut u = entry.clone();
+                u["reason"] = serde_json::json!("edit-span-crosses-revision-boundary");
+                u["boundary_crossings"] = serde_json::json!(crossed);
+                unsafe_matches.push(u);
+            } else if region == "insert" && !tracking.tracked {
+                let mut u = entry.clone();
+                u["reason"] = serde_json::json!("revision-text-mutated-in-direct-mode");
+                u["fix"] = serde_json::json!({ "track": true });
+                unsafe_matches.push(u);
+            } else {
+                plan.push(entry);
+            }
+        }
+    }
+
+    let total = plan.len() + unsafe_matches.len();
+    if !unsafe_matches.is_empty() {
+        let mode_fix = unsafe_matches.iter().any(|u| {
+            u.get("reason") == Some(&serde_json::json!("revision-text-mutated-in-direct-mode"))
+        });
+        if mode_fix {
+            return Err(CollaborationError::new(
+                "revision-text-mutated-in-direct-mode",
+                "matches sit inside existing tracked insertions and direct mode cannot change revision text; resend with track=true",
+            ));
+        }
+        return Err(CollaborationError::new(
+            "replace-unsafe-matches",
+            "matches sit across a revision boundary and cannot be rewritten in one pass",
+        ));
+    }
+
+    if let Some(expected) = args.expected_matches {
+        if total != expected {
+            return Err(CollaborationError::new(
+                "replace-expected-matches-mismatch",
+                format!("expected {expected} match(es) but found {total}; nothing was written"),
+            ));
+        }
+    }
+
+    if total == 0 {
+        return Ok(serde_json::json!({
+            "scope": args.scope,
+            "find": args.find,
+            "matches": 0,
+            "changed": 0,
+            "noop_reason": "no-match",
+            "match_plan": [],
+            "document_state": {
+                "revision_before": revision_before,
+                "revision_after": revision_before,
+                "draft": "clean",
+            },
+        }));
+    }
+
+    if args.dry_run {
+        return Ok(serde_json::json!({
+            "scope": args.scope,
+            "find": args.find,
+            "matches": total,
+            "changed": 0,
+            "dry_run": true,
+            "match_plan": plan,
+            "document_state": {
+                "revision_before": revision_before,
+                "revision_after": revision_before,
+                "draft": "clean",
+            },
+        }));
+    }
+
+    let mut by_p: std::collections::BTreeMap<String, Vec<(usize, String)>> =
+        std::collections::BTreeMap::new();
+    for entry in &plan {
+        let pid = entry["paragraph_id"].as_str().unwrap().to_string();
+        let off = entry["offset"].as_u64().unwrap() as usize;
+        let matched = entry["matched_text"].as_str().unwrap().to_string();
+        by_p.entry(pid).or_default().push((off, matched));
+    }
+
+    for block in &mut blocks {
+        let Some((kind, id, marker)) = marker_of(block) else {
+            continue;
+        };
+        if kind != "p" {
+            continue;
+        }
+        let Some(mut matches) = by_p.remove(&id) else {
+            continue;
+        };
+        matches.sort_by_key(|(off, _)| std::cmp::Reverse(*off));
+        let mut body = block_body(block);
+        for (off, matched) in matches {
+            body = replace_in_body_at_visible(&body, off, &matched, args.replace, &id)?;
+        }
+        *block = if body.is_empty() {
+            marker
+        } else {
+            format!("{marker}\n{body}")
+        };
+    }
+
+    write_draft(workdir, &header, &blocks)?;
+    let revision_after = current_revision(workdir)?;
+    Ok(serde_json::json!({
+        "scope": args.scope,
+        "find": args.find,
+        "matches": total,
+        "changed": total,
+        "match_plan": plan,
+        "document_state": {
+            "revision_before": revision_before,
+            "revision_after": revision_after,
+            "draft": "dirty",
+        },
+    }))
+}
 pub fn diff_preview(workdir: &Path) -> Result<Value, CollaborationError> {
     let state = if workdir.join(STATE_FILE).is_file() {
         classify_edit_state(workdir)

@@ -2182,7 +2182,7 @@ pub fn format_paragraphs(
             "insertion_style": insertion_style,
             "skeleton": crate::token_table::skeleton(&tree.nodes),
             "token_ids": crate::token_table::token_ids(&tree.nodes),
-            "section_bearing": false,
+            "section_bearing": tree.section_bearing,
             "editable": editable,
             "mark_revision": match &tree.mark {
                 Some((kind, token_id, attrs)) => serde_json::json!({
@@ -3221,13 +3221,23 @@ pub fn build_style_registry(package: &[u8]) -> Result<serde_json::Value, CoreErr
             continue;
         }
         let (label, features) = crate::document_projection::rpr_semantics_for(&rpr_xml)?;
+        let features_value: BTreeMap<String, serde_json::Value> = features
+            .into_iter()
+            .map(|(k, v)| {
+                if BOOLEAN_RPR.contains(&k.as_str()) {
+                    (k, serde_json::Value::Bool(v == "true"))
+                } else {
+                    (k, serde_json::Value::String(v))
+                }
+            })
+            .collect();
         entries.insert(
             style_id,
             serde_json::json!({
                 "rPr": strip_rpr_change(&rpr_xml),
                 "canonical": canonical,
                 "label": label,
-                "features": features,
+                "features": features_value,
             }),
         );
     }
