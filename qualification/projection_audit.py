@@ -243,6 +243,41 @@ def compare(src: Path, workdir: Path, json_out: Path | None) -> dict:
         "without_text": sum(1 for r in inv if not r["text"]),
     }
 
+    # ---- layer: the revision inventories, compared as SETS ---------------
+    # Counts are not fidelity. Two inventories can both hold 985 revisions with
+    # 250 of them different, and two revisions can swap identities while the
+    # count still balances. Everything below is set membership plus per-field
+    # agreement over the keys that DO overlap.
+    def load_revisions(path: Path) -> dict:
+        if not path.is_file():
+            return {}
+        blob = json.loads(path.read_text(encoding="utf-8"))
+        return {x["revision_key"]: x for x in (blob.get("revisions") or [])}
+
+    rrev = load_revisions(rust_wd / "revisions.json")
+    prev = load_revisions(py_wd / "revisions.json")
+    layer = {
+        "rust": len(rrev),
+        "python": len(prev),
+        "overlap": len(set(rrev) & set(prev)),
+        "rust_only": len(set(rrev) - set(prev)),
+        "python_only": len(set(prev) - set(rrev)),
+        "rust_only_sample": sorted(set(rrev) - set(prev))[:3],
+        "python_only_sample": sorted(set(prev) - set(rrev))[:3],
+    }
+    if rrev and prev:
+        shared = set(next(iter(rrev.values()))) & set(next(iter(prev.values())))
+        fields = Counter()
+        for key in set(rrev) & set(prev):
+            for name in shared:
+                if rrev[key].get(name) != prev[key].get(name):
+                    fields[name] += 1
+        layer["shared_fields_differing"] = dict(fields)
+        layer["rust_only_fields"] = sorted(set(next(iter(rrev.values()))) - shared)
+    report["layers"]["revisions.json"] = layer
+    if layer["rust_only"] or layer["python_only"]:
+        report["divergences"].append({"layer": "revisions.json/sets", **layer})
+
     if json_out:
         json_out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report

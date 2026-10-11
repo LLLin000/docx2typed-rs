@@ -328,6 +328,19 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
         text.into_bytes()
     };
 
+    // The revision inventory, written as a sidecar because a consumer has to be
+    // able to address a revision before touching it, and because the projection
+    // work needs a record taken before the change to be judged against
+    // afterwards. It is derived from the same walk the `revisions` operation
+    // serves, so the file and the operation can never disagree.
+    let revisions = crate::govern::scan_revisions_bytes(&package_bytes)?;
+    let revisions_bytes = {
+        let value = crate::govern::revisions_sidecar_value(&revisions);
+        let mut text = serde_json::to_string_pretty(&value).expect("revisions serialize");
+        text.push('\n');
+        text.into_bytes()
+    };
+
     Ok(ChangeSet {
         assets: vec![
             Asset::CopySource {
@@ -337,6 +350,11 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
             Asset::Bytes("format.json".to_string(), format_bytes),
             Asset::Bytes("styles.json".to_string(), styles_bytes),
             Asset::Bytes("typed.md".to_string(), typed_md.into_bytes()),
+            Asset::Bytes("revisions.json".to_string(), revisions_bytes),
+            Asset::Bytes(
+                "revisions.md".to_string(),
+                crate::govern::revisions_md(&revisions).into_bytes(),
+            ),
         ],
     })
 }

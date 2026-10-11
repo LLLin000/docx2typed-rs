@@ -94,6 +94,96 @@ impl RevisionEntry {
     }
 }
 
+/// The `revisions.md` sidecar: the same inventory, for a reader.
+///
+/// Pure derivation of `revisions_sidecar_value`'s input — no second walk, no
+/// second classifier. The reference regenerates this together with
+/// `revisions.json`, so a consumer may rely on the pair moving as one.
+pub fn revisions_md(entries: &[RevisionEntry]) -> String {
+    let mut lines: Vec<String> = vec![
+        "# Revisions".to_string(),
+        String::new(),
+        "Tracked changes in this document. editable=false entries live outside".to_string(),
+        "the editable surface (nested containers, other parts) and can only be".to_string(),
+        "viewed; direct-body revisions can be accepted/rejected in R3.".to_string(),
+        String::new(),
+    ];
+    for entry in entries {
+        let flag = if entry.editable {
+            "ok".to_string()
+        } else {
+            format!("locked ({})", entry.reason.clone().unwrap_or_default())
+        };
+        let place = entry
+            .paragraph_id
+            .clone()
+            .unwrap_or_else(|| entry.part.clone());
+        lines.push(format!(
+            "- {} w:id={} [{}] @{} {} {} \u{2014} {}",
+            entry.kind,
+            entry.w_id,
+            place,
+            entry.author,
+            entry.date,
+            python_repr_prefix(&entry.text, 40),
+            flag
+        ));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// `repr(text[:limit])` as the reference writes it: single quotes, backslashes
+/// and quotes escaped, everything else literal. Only the shapes the inventory
+/// actually carries are reproduced — this is a display line, not a parser.
+fn python_repr_prefix(text: &str, limit: usize) -> String {
+    let head: String = text.chars().take(limit).collect();
+    let mut out = String::from("'");
+    for ch in head.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// The `revisions.json` sidecar: the inventory as the reference writes it.
+///
+/// A DERIVED view, never a source. It exists so a consumer can address a
+/// revision (`revision_key`) and so a projection change can be judged against a
+/// record taken before it — not so anything can be read back out of it and
+/// treated as the document's state. Everything here comes from
+/// `scan_revisions_bytes`; nothing is parsed back out of Markdown.
+pub fn revisions_sidecar_value(entries: &[RevisionEntry]) -> serde_json::Value {
+    let revisions: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "paragraph_id": entry.paragraph_id,
+                "kind": entry.kind,
+                "w_id": entry.w_id,
+                "author": entry.author,
+                "date": entry.date,
+                "text": entry.text,
+                "editable": entry.editable,
+                "reason": entry.reason,
+                "part": entry.part,
+                "scope": entry.scope,
+                "fingerprint": revision_fingerprint(&entry.text),
+                "revision_key": entry.revision_key(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "schema": REVISIONS_SCHEMA, "revisions": revisions })
+}
+
 /// One per-paragraph view line (visible text under a settlement action).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParagraphView {
@@ -394,6 +484,30 @@ pub(crate) fn locate_revisions(
         revision.inside_opaque = revision.inside_opaque || in_opaque_paragraph;
         revision.text = revision_text(xml, &tags, revision.start, revision.end);
     }
+    // The reference's order, which is a walk of the tree and therefore a fact
+    // about the inventory, not a presentation choice:
+    //
+    //     for each paragraph, in document order:
+    //         its revisions, PARENT BEFORE CHILD
+    //         then its paragraph-mark revision
+    //
+    // Ours pushed on the CLOSING tag, so a nested pair came out inner-first,
+    // and a mark revision — which lives in the paragraph's `pPr`, early in its
+    // byte range — came out before the paragraph's own content. Same entries,
+    // a 436-line diff.
+    let ordinal: std::collections::BTreeMap<&str, usize> = paragraphs
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _, _))| (id.as_str(), index))
+        .collect();
+    found.sort_by_key(|revision| {
+        let paragraph = revision
+            .paragraph_id
+            .as_deref()
+            .and_then(|id| ordinal.get(id).copied())
+            .unwrap_or(usize::MAX);
+        (paragraph, u8::from(revision.mark), revision.start)
+    });
     Ok(found)
 }
 
