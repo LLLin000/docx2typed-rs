@@ -76,7 +76,16 @@ function Invoke-Oracle([string]$kind, [string]$path, [string]$extra = "") {
     $argsList = @($oracle, $kind, $path)
     if ($extra) { $argsList += $extra }
     $result = Invoke-Python $argsList
-    if ($result.rc -ne 0) { throw "oracle failed: $kind $path $($result.stderr)" }
+    if ($result.rc -ne 0) {
+        # Print the traceback line by line BEFORE throwing. A CI log wraps a
+        # single long message into an unreadable block, which is how a failing
+        # oracle becomes a mystery instead of a diagnosis.
+        Write-Host "oracle failed: $kind $path (exit $($result.rc))"
+        foreach ($line in ($result.stderr -split "`r?`n")) {
+            if ($line.Trim()) { Write-Host "  $line" }
+        }
+        throw "oracle failed: $kind $path"
+    }
     return ($result.stdout.Trim())
 }
 
