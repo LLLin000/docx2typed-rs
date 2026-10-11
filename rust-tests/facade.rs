@@ -407,3 +407,102 @@ fn every_located_occurrence_reaches_the_build() {
         "no stale occurrence may survive: {xml}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8. A session-inserted paragraph is part of the document the agent edits.
+// ---------------------------------------------------------------------------
+
+/// Insert a paragraph carrying the target phrase, then replace everywhere.
+///
+/// The inserted paragraph lives in a `<!--@new temp="N1"-->` block until a
+/// commit reallocates the id, and the body scope originally kept only `P<n>`
+/// ids — so it was invisible in exactly the window an agent works in. Measured
+/// on a real patent: 34 located while the document held 35, and the built DOCX
+/// kept one unreplaced occurrence.
+#[test]
+fn a_session_inserted_paragraph_is_located_and_edited() {
+    let dir = scratch("inserted-scope");
+    let workdir = dir.join("wd");
+    extract(&fixture("plain"), &workdir);
+    let out = dir.join("out.docx");
+
+    // plain.docx has no 段落; the only occurrence will be the inserted one.
+    let results = mcp(&[
+        ("workdir_open", open(&workdir)),
+        (
+            "insert_paragraph",
+            json!({
+                "after_id": "P0",
+                "text": "新增段落含独有标记词。",
+                "inherit": "P0",
+                "operation_id": "ins-1",
+            }),
+        ),
+        ("facade_locate", json!({ "query": "独有标记词" })),
+    ]);
+    assert_eq!(
+        envelope(&results[1])["outcome"],
+        "success",
+        "{}",
+        results[1]
+    );
+    let located = &envelope(&results[2])["data"];
+    assert_eq!(
+        located["matches"], 1,
+        "the inserted paragraph must be visible to locate: {located}"
+    );
+    assert_eq!(
+        located["targets"][0]["paragraph_id"], "N1",
+        "the target is the draft-local temp id: {}",
+        located["targets"][0]
+    );
+    assert_eq!(located["targets"][0]["capability"], "supported");
+
+    // And the whole path must apply it.
+    let results = mcp(&[
+        ("workdir_open", open(&workdir)),
+        (
+            "facade_resolve",
+            json!({ "find": "独有标记词", "replace_with": "统一术语" }),
+        ),
+        ("commit_sync", json!({ "operation_id": "ins-commit" })),
+        (
+            "build_docx",
+            json!({ "output": out.to_string_lossy(), "operation_id": "ins-build" }),
+        ),
+        (
+            "facade_verify",
+            json!({ "query": "统一术语", "output": out.to_string_lossy() }),
+        ),
+    ]);
+    assert_eq!(
+        envelope(&results[1])["data"]["located"],
+        1,
+        "{}",
+        results[1]
+    );
+    assert_eq!(
+        envelope(&results[1])["data"]["edit"]["outcome"],
+        "committed"
+    );
+    assert_eq!(
+        envelope(&results[2])["outcome"],
+        "success",
+        "{}",
+        results[2]
+    );
+    assert_eq!(
+        envelope(&results[3])["outcome"],
+        "success",
+        "{}",
+        results[3]
+    );
+
+    // The three counts must agree: nothing planned was left behind.
+    let counts = &envelope(&results[4])["data"]["counts"];
+    assert_eq!(counts["draft_matches"], 1, "{counts}");
+    assert_eq!(
+        counts["built_matches"], 1,
+        "the edit must reach the exported DOCX: {counts}"
+    );
+}

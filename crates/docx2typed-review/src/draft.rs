@@ -339,6 +339,21 @@ pub fn visible_text(body: &str) -> String {
     body.to_string()
 }
 
+/// Index of the block addressing a paragraph id, whichever marker carries it.
+///
+/// A baseline paragraph lives in `<!--@p id="P3"-->`; one inserted in this
+/// session lives in `<!--@new temp="N1"-->` until a commit reallocates the id.
+/// Addressing a paragraph by id must find both, or every edit aimed at a
+/// freshly inserted paragraph fails with `paragraph-not-found` in the window
+/// between the insert and the commit — the window an agent works in.
+pub(crate) fn find_paragraph_block(blocks: &[String], paragraph_id: &str) -> Option<usize> {
+    let p_marker = format!("<!--@p id=\"{paragraph_id}\"");
+    let new_marker = format!("<!--@new temp=\"{paragraph_id}\"");
+    blocks
+        .iter()
+        .position(|block| block.starts_with(&p_marker) || block.starts_with(&new_marker))
+}
+
 /// Parse one block marker line into (kind, id, extra attrs).
 pub(crate) fn marker_of(block: &str) -> Option<(String, String, String)> {
     let line = block.split('\n').next().unwrap_or("").trim();
@@ -576,7 +591,7 @@ pub fn get_paragraph(workdir: &Path, paragraph_id: &str) -> Result<Value, Collab
         }));
     }
     let (_, blocks) = read_blocks(workdir)?;
-    let index = find_block(&blocks, "p", paragraph_id).ok_or_else(|| {
+    let index = find_paragraph_block(&blocks, paragraph_id).ok_or_else(|| {
         CollaborationError::new(
             "paragraph-not-found",
             format!("paragraph {paragraph_id} not found in the draft"),
@@ -686,7 +701,7 @@ pub fn replace_text_with_options(
     crate::collab::ensure_agent_ready(workdir)?;
     let (header, mut blocks) = read_blocks(workdir)?;
     let paragraph_id = edit.paragraph_id;
-    let index = find_block(&blocks, "p", paragraph_id).ok_or_else(|| {
+    let index = find_paragraph_block(&blocks, paragraph_id).ok_or_else(|| {
         CollaborationError::new(
             "paragraph-not-found",
             format!("paragraph {paragraph_id} not found in the draft"),
@@ -878,6 +893,15 @@ fn island_leaf_for(
     old: &str,
     leaf_index: Option<usize>,
 ) -> Result<Option<(String, usize)>, CollaborationError> {
+    // A paragraph synthesised in this session has no baseline leaf to rewrite:
+    // it is rendered from the structure sidecar at build time. That is true the
+    // moment it is inserted, not only once `commit_sync` has written the
+    // sidecar — the draft carries the `@new` block and the temp id alone, so an
+    // edit aimed at it in that window must resolve to "no leaf", not to an
+    // `unknown paragraph part` refusal.
+    if paragraph_id.starts_with('N') {
+        return Ok(None);
+    }
     if docx2typed_core::prose::load_structure(workdir)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?
         .new_paragraphs
@@ -975,7 +999,7 @@ pub fn insert_paragraph(
     }
     crate::collab::ensure_agent_ready(workdir)?;
     let (header, mut blocks) = read_blocks(workdir)?;
-    let index = find_block(&blocks, "p", after_id).ok_or_else(|| {
+    let index = find_paragraph_block(&blocks, after_id).ok_or_else(|| {
         CollaborationError::new(
             "paragraph-not-found",
             format!("paragraph {after_id} not found in the draft"),
@@ -1018,7 +1042,7 @@ pub fn delete_paragraph(workdir: &Path, paragraph_id: &str) -> Result<Value, Col
     }
     crate::collab::ensure_agent_ready(workdir)?;
     let (header, mut blocks) = read_blocks(workdir)?;
-    let index = find_block(&blocks, "p", paragraph_id).ok_or_else(|| {
+    let index = find_paragraph_block(&blocks, paragraph_id).ok_or_else(|| {
         CollaborationError::new(
             "paragraph-not-found",
             format!("paragraph {paragraph_id} not found in the draft"),
@@ -1588,7 +1612,7 @@ fn plan_patch(
                 start: _,
                 leaf_index,
             } => {
-                let Some(block_index) = find_block(blocks, "p", paragraph_id) else {
+                let Some(block_index) = find_paragraph_block(blocks, paragraph_id) else {
                     hunk_problem(
                         &mut problems,
                         number,
@@ -1858,7 +1882,7 @@ fn plan_patch(
     let mut blocks = blocks.to_vec();
     // Deletes first (ids, never block indices), then inserts, then replaces.
     for paragraph_id in &delete_ids {
-        let Some(index) = find_block(&blocks, "p", paragraph_id) else {
+        let Some(index) = find_paragraph_block(&blocks, paragraph_id) else {
             return Err(CollaborationError::new(
                 "paragraph-not-found",
                 format!("paragraph {paragraph_id} not found in the draft"),
@@ -1870,7 +1894,7 @@ fn plan_patch(
     let mut insert_offsets: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for (after_id, text, inherit) in &insert_specs {
-        let Some(index) = find_block(&blocks, "p", after_id) else {
+        let Some(index) = find_paragraph_block(&blocks, after_id) else {
             return Err(CollaborationError::new(
                 "paragraph-not-found",
                 format!("paragraph {after_id} not found in the draft"),
@@ -1891,7 +1915,7 @@ fn plan_patch(
         }));
     }
     for (paragraph_id, spans) in &pending {
-        let Some(index) = find_block(&blocks, "p", paragraph_id) else {
+        let Some(index) = find_paragraph_block(&blocks, paragraph_id) else {
             return Err(CollaborationError::new(
                 "paragraph-not-found",
                 format!("paragraph {paragraph_id} not found in the draft"),
@@ -2038,7 +2062,7 @@ fn base_projection_sha256(workdir: &Path) -> String {
 /// paragraphs (mirror of `_hunks_still_applicable`).
 fn hunks_still_applicable(blocks: &[String], hunks: &[PatchHunk]) -> bool {
     for hunk in hunks {
-        let Some(index) = find_block(blocks, "p", hunk.paragraph_id()) else {
+        let Some(index) = find_paragraph_block(blocks, hunk.paragraph_id()) else {
             return false;
         };
         if let PatchHunk::Replace { old, .. } = hunk {

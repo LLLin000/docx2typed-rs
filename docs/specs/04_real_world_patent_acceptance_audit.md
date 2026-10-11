@@ -192,3 +192,66 @@ draft that had edits. `ensure_session` now runs first.
 | Corpus extraction parity | 17 / 17 byte-identical |
 | MCP schema gate | 49 tools, exact parity |
 | Real-patent oracle (`qualification/patent_acceptance_oracle.py`) | 100 % pass, stricter than the reference on inserted paragraphs |
+
+---
+
+## 9. Count Audit and Timing Coverage (follow-up)
+
+### 9.1 Three counts, kept separate
+
+A single "matches" number cannot distinguish a complete replacement from one
+that scanned a smaller document. `facade_verify` now reports, for a named
+query:
+
+| count | source |
+|---|---|
+| `baseline_matches` | the template (`_template.docx`), the pre-edit state |
+| `draft_matches` | the projection the agent edits (`edit.md`) |
+| `built_matches` | the exported DOCX, when one is named |
+
+Measured on the real patent **with a paragraph inserted mid-session**:
+
+```
+baseline 34 -> draft 35 -> built 35      residual bare occurrences: 0
+```
+
+The `+1` is the inserted paragraph. Before this audit the same flow reported
+**34/34** with one occurrence left unreplaced — four filters each hid the
+`<!--@new temp="N1"-->` block in the window between `insert_paragraph` and the
+`commit_sync` that reallocates the temp id.
+
+Rust now reports **35** where the Python reference reports **34**: the reference
+filters on `kind == "p"` too (`mcp_server.py:5024`) and misses the same
+paragraph. Rust is deliberately stricter.
+
+### 9.2 Timing coverage: the uncounted cost is Python's
+
+Summed medians never equal the total median. Recording every round exposes what
+the phase rows do not cover — process start, module import, orchestration:
+
+| engine | sum of phases (ms) | measured total (ms) | **unaccounted (ms)** |
+|---|---|---|---|
+| Python | 13 148 – 14 941 | 14 888 – 16 772 | **1 739 – 1 831** |
+| Rust | 6 154 – 6 700 | 6 167 – 6 712 | **12 – 15** |
+
+Python carries **~1.78 s per round** the phase rows never see (interpreter start
+plus `mcp_server` import); Rust carries **~13 ms**. Raw rows are written to
+`I:/docx2typed_patent_benchmark/timing_raw.csv`.
+
+### 9.3 Where Rust's remaining time goes
+
+| phase | Rust median (ms) | share of total |
+|---|---|---|
+| `insert_paragraph` | 2 378 | **36.9 %** |
+| `commit_sync` | 1 914 | 29.7 % |
+| `document_replace` | 1 497 | 23.2 % |
+| `build_docx` | 590 | 9.1 % |
+| `extract` | 79 | 1.2 % |
+| `verify_output` | 34 | 0.5 % |
+| `workdir_open` | 35 | 0.5 % |
+
+`insert_paragraph` is the largest single phase but is not obviously
+optimisable: it shares the session-initialisation and validation path with
+`commit_sync`. The remaining work is transaction-shaped, so a batch-edit entry
+point would help more than tuning any one function. At 6.45 s for a full real
+patent round-trip, this is not on the critical path for agent usability.
