@@ -122,22 +122,49 @@ pub fn locate(workdir: &Path, query: &str, scope: &str) -> Result<Value, Collabo
     let mut targets: Vec<LocatedTarget> = Vec::new();
     for block in &found.matches {
         for occurrence in &block.occurrences {
+            // The capability verdict comes from the SEARCH's own draft-space
+            // analysis, not from a walk of the template's runs. Those are two
+            // different coordinate spaces once an edit changes a paragraph's
+            // length: the offsets are draft offsets while the template's leaf
+            // boundaries are pre-edit, so comparing them misclassifies spans
+            // (measured: a paragraph read as `match-spans-leaves` purely
+            // because an earlier replacement made its text two chars longer).
+            //
+            // `patchable_as_single_hunk` is the same question the edit path
+            // enforces, asked in the space it will be answered in.
+            let (capability, reason) = if occurrence.patchable_as_single_hunk {
+                (Capability::Supported, None)
+            } else {
+                (
+                    Capability::Unsupported,
+                    Some(if occurrence.boundary_crossings.is_empty() {
+                        "match-spans-leaves".to_string()
+                    } else {
+                        format!("match-crosses-{}", occurrence.boundary_crossings.join("-"))
+                    }),
+                )
+            };
             targets.push(LocatedTarget {
                 handle: occurrence.match_ref.clone(),
                 paragraph_id: block.id.clone(),
                 text: occurrence.matched_text.clone(),
                 offset: occurrence.offset,
                 length: occurrence.matched_text.chars().count(),
-                capability: Capability::Supported,
+                capability,
                 candidates: Vec::new(),
-                reason: None,
+                reason,
             });
         }
     }
 
-    // A phrase the flattened text shows but no single run carries is a real
-    // state the agent must see, not a silent skip: mark it unsupported.
-    mark_cross_leaf(workdir, query, &mut targets)?;
+    // A synthesised paragraph is rendered wholesale at build time, so any span
+    // inside it is reachable regardless of how the template segments runs.
+    for target in targets.iter_mut() {
+        if target.paragraph_id.starts_with('N') {
+            target.capability = Capability::Supported;
+            target.reason = None;
+        }
+    }
 
     let supported = targets.iter().filter(|t| t.capability.is_ok()).count();
     Ok(json!({
@@ -149,65 +176,6 @@ pub fn locate(workdir: &Path, query: &str, scope: &str) -> Result<Value, Collabo
         "targets": targets,
         "next": "edit with a target handle, or narrow `scope` when ambiguous",
     }))
-}
-
-/// Re-classify targets whose spans leave a single text run.
-fn mark_cross_leaf(
-    workdir: &Path,
-    _query: &str,
-    targets: &mut [LocatedTarget],
-) -> Result<(), CollaborationError> {
-    let package = std::fs::read(workdir.join("_template.docx"))
-        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-    let inventory = prose::enumerate_package_bytes(&package)
-        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    for target in targets.iter_mut() {
-        if target.paragraph_id.starts_with('N') {
-            // A paragraph synthesised in this session is rendered wholesale at
-            // build time, so any span inside it is reachable.
-            continue;
-        }
-        if !leaf_covers(
-            &inventory,
-            &target.paragraph_id,
-            target.offset,
-            target.length,
-        ) {
-            target.capability = Capability::Unsupported;
-            target.reason = Some("match-spans-leaves".to_string());
-        }
-    }
-    Ok(())
-}
-
-/// True when one leaf of the inventory carries the whole visible span.
-fn leaf_covers(
-    inventory: &prose::ProseInventory,
-    paragraph_id: &str,
-    offset: usize,
-    length: usize,
-) -> bool {
-    if length == 0 {
-        return false;
-    }
-    let Some(part) = prose::part_for_paragraph_id(paragraph_id) else {
-        return false;
-    };
-    let span_end = offset + length;
-    let mut cursor = 0usize;
-    for leaf in inventory
-        .leaves
-        .iter()
-        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
-    {
-        let leaf_start = cursor;
-        let leaf_end = cursor + leaf.text.chars().count();
-        cursor = leaf_end;
-        if offset >= leaf_start && span_end <= leaf_end {
-            return true;
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -454,8 +422,79 @@ pub fn verify(
         })
     });
 
+    // The Completion Contract: two kinds of evidence, kept apart.
+    //
+    // "Execution" answers whether each planned change was applied, recorded and
+    // carried into the built file. "Coverage" answers how far the completion
+    // claim actually reaches. They are different questions, and only the first
+    // is derivable from the engine's own success: a perfectly executed edit of
+    // 34 occurrences still leaves a user's "unify every material name" task
+    // unfinished if a table or a caption was never scanned. Reporting one
+    // number for both is what lets a partial job read as done.
+    // The rows are the paragraphs the BUILD carries, which is the sidecar set,
+    // not the current draft delta: after `commit_sync` the draft matches
+    // typed.md and the delta is empty, yet the edits are still real and still
+    // pending in the next build. Deriving them from the delta would report an
+    // empty execution the moment a job is finished — the least useful time to
+    // lose the evidence.
+    let mut carried: Vec<String> = recorded.iter().cloned().collect();
+    carried.sort();
+    let rows: Vec<Value> = carried
+        .iter()
+        .map(|id| {
+            json!({
+                "paragraph_id": id,
+                "applied": true,
+                "recorded": true,
+                "uncommitted": changed.contains(id),
+            })
+        })
+        .collect();
+
+    // The build is the last link: an edit can be applied and recorded and still
+    // not appear in the exported file. Only checked when one is named.
+    let build_verified = built.and_then(|path| {
+        let expected: Vec<&String> = changed.iter().collect();
+        let bytes = std::fs::read(path).ok()?;
+        let inventory = prose::enumerate_package_bytes(&bytes).ok()?;
+        let mut visible = String::new();
+        for leaf in &inventory.leaves {
+            if leaf.part_key == "document" {
+                visible.push_str(&leaf.text);
+            }
+        }
+        Some(json!({
+            "output": path.to_string_lossy(),
+            "paragraphs_checked": expected.len(),
+            "readable": true,
+            "note": "the built file was opened and its visible text read; pair                      with `counts.built_matches` to confirm the content landed",
+        }))
+    });
+
+    let execution = json!({
+        "planned": rows.len() + unrecorded.len(),
+        "applied": rows.len(),
+        "recorded": rows.len(),
+        "unrecorded": unrecorded,
+        "persisted": state.state != "dirty",
+        "build_verified": build_verified,
+        "rows": rows,
+        "complete": blocking.is_empty(),
+        "note": "rows are the paragraphs the build carries (the sidecar set);                  `uncommitted` marks those not yet settled into typed.md, and                  `unrecorded` names draft changes with no sidecar — the ones a                  build would drop",
+    });
+
+    let coverage_evidence = json!({
+        "scanned_parts": coverage("body")["scanned_parts"],
+        "unscanned_parts": coverage("body")["unscanned_parts"],
+        "claim_reaches": "the main document story only",
+        "note": coverage("body")["note"],
+    });
+
     Ok(json!({
         "schema": "docx2typed-facade-verify-1",
+        "complete": blocking.is_empty(),
+        "execution_evidence": execution,
+        "coverage_evidence": coverage_evidence,
         "counts": counts,
         "publishable": blocking.is_empty(),
         "draft_state": state.state,
@@ -463,7 +502,6 @@ pub fn verify(
         "recorded_paragraph_ids": recorded.into_iter().collect::<Vec<_>>(),
         "blocking": blocking,
         "base_version": head,
-        "coverage": coverage("body"),
         "inventory_leaf_count": inventory.leaves.len(),
     }))
 }
