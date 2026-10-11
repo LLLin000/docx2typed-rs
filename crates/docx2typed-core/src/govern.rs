@@ -238,16 +238,32 @@ fn element_text(xml: &[u8], open_end: usize, close_start: usize) -> String {
 /// element (mirror of Python's `element.iter()` text join).
 fn revision_text(xml: &[u8], tags: &[Tag], start: usize, end: usize) -> String {
     let mut out = String::new();
-    let mut depth = 0usize;
+    // A revision's text is its OWN runs, not the runs of a revision nested in
+    // it. `w:ins` containing only a `w:del` is legitimate Word structure and its
+    // final-view text is empty — the insertion contributes nothing once the
+    // deletion inside it is rejected. Descending collected the nested
+    // `delText` as if the outer insertion had written it, so 125 revisions on a
+    // real patent carried a fingerprint the reference did not have (its own was
+    // the empty-string hash) and the two inventories could not be compared key
+    // for key at all.
+    let mut nested: Vec<String> = Vec::new();
     for tag in tags {
         if tag.start < start || tag.start >= end {
             continue;
         }
         if tag.closing {
-            depth = depth.saturating_sub(1);
+            if nested.last().map(String::as_str) == Some(tag.name.as_str()) {
+                nested.pop();
+            }
             continue;
         }
-        if tag.name == "t" || tag.name == "delText" {
+        // `tag.start == start` is the revision element ITSELF; only a
+        // strictly-inner one is nested.
+        if tag.start > start && revision_kind(&tag.name).is_some() && !tag.self_closing {
+            nested.push(tag.name.clone());
+            continue;
+        }
+        if nested.is_empty() && (tag.name == "t" || tag.name == "delText") {
             if !tag.self_closing {
                 let open_end = tag.end;
                 // find the matching close tag for this text element
@@ -264,9 +280,6 @@ fn revision_text(xml: &[u8], tags: &[Tag], start: usize, end: usize) -> String {
                 out.push_str(&element_text(xml, open_end, close_start));
             }
             continue;
-        }
-        if !tag.self_closing {
-            depth += 1;
         }
     }
     out
@@ -387,6 +400,16 @@ pub(crate) fn locate_revisions(
 /// Elements whose subtree is not AST-visible to the revision model: opaque
 /// containers, runs, and paragraph properties are all "interiors".
 fn is_interior_container(name: &str) -> bool {
+    // "Interior" means: a revision inside this element is not AST-visible.
+    // A run and `pPr` qualify — a revision cannot start inside one and still be
+    // a node of the paragraph. So do the genuinely opaque containers.
+    //
+    // A revision container does NOT qualify, and neither does a hyperlink:
+    // their children are ordinary AST nodes. `w:del` nested inside `w:ins` is
+    // legitimate Word structure, and the reference renders it as a nested
+    // revision and calls it editable. Listing them here made 125 revisions on a
+    // real patent read `nested-container-or-non-editable-part` when they were
+    // plain nested deletions.
     matches!(
         name,
         "r" | "pPr"
@@ -398,11 +421,6 @@ fn is_interior_container(name: &str) -> bool {
             | "object"
             | "sdt"
             | "smartTag"
-            | "ins"
-            | "del"
-            | "moveFrom"
-            | "moveTo"
-            | "hyperlink"
             | "proofErr"
     )
 }
@@ -429,6 +447,21 @@ fn opaque_blocks_in_range(xml: &[u8], start: usize, end: usize) -> Vec<(usize, u
     let mut opaques = Vec::new();
     // Track the run context of the current element.
     let mut run_depth = 0usize;
+    // And the paragraph-properties context. `pPr` has its own vocabulary
+    // (`spacing`, `jc`, `ind`, `rPr`, ...) which shares nothing with the
+    // paragraph CONTENT list below, so checking its children against that list
+    // marked every paragraph whose mark carried formatting as opaque — 79 of
+    // 79 on a real patent, because Word writes `<w:pPr><w:rPr>` on all of
+    // them. The reference parses `pPr` wholesale and never makes an opaque of
+    // any of it.
+    let mut ppr_depth = 0usize;
+    // And the run-properties context. `rPr`'s children are PROPERTIES
+    // (`rFonts`, `b`, `sz`, `vertAlign`, `rPrChange`, ...); the list below
+    // names run CONTENT (`t`, `tab`, `br`, ...). Sharing one list between the
+    // two marked every property opaque, which in turn marked the paragraph
+    // opaque. Measured: the detector's only output on a real patent was
+    // `<w:rFonts w:hint="eastAsia"/>`, repeated.
+    let mut rpr_depth = 0usize;
     // The first tag in the range is the paragraph element itself (its open
     // tag sits at `start`); it is the scan root, never classified.
     let mut first = true;
@@ -443,6 +476,12 @@ fn opaque_blocks_in_range(xml: &[u8], start: usize, end: usize) -> Vec<(usize, u
                     if name == "r" && run_depth > 0 {
                         run_depth -= 1;
                     }
+                    if name == "pPr" && ppr_depth > 0 {
+                        ppr_depth -= 1;
+                    }
+                    if name == "rPr" && rpr_depth > 0 {
+                        rpr_depth -= 1;
+                    }
                 }
             }
             continue;
@@ -455,8 +494,22 @@ fn opaque_blocks_in_range(xml: &[u8], start: usize, end: usize) -> Vec<(usize, u
             continue;
         }
         let name = tag.name.as_str();
-        let opaque = if run_depth > 0 {
-            name != "rPr" && !KNOWN_RUN_CHILDREN.contains(&name)
+        // Inside a run, "known" means what the run PARSER handles: `rPr`, and
+        // the children it turns into inline nodes. `rPrChange` lives inside
+        // `rPr`, so `run_depth > 0` when the walk reaches it, and it was in
+        // neither list — every run carrying format history therefore marked its
+        // whole paragraph opaque. On a real patent, where an advisor's edits
+        // left `rPrChange` throughout, that made 857 of 860 revisions
+        // `editable: false, reason: "paragraph-contains-unsupported-node"` while
+        // the reference marked them editable: it parses the same element as an
+        // inline (`rpr-change`), and only an OpaqueNode disqualifies a
+        // paragraph. Format history is not an unsupported node.
+        let known_run_child =
+            name == "rPr" || name == "rPrChange" || KNOWN_RUN_CHILDREN.contains(&name);
+        let opaque = if ppr_depth > 0 || rpr_depth > 0 {
+            false
+        } else if run_depth > 0 {
+            !known_run_child
         } else {
             name == "proofErr" || !KNOWN_CONTAINER_CHILDREN.contains(&name)
         };
@@ -465,6 +518,12 @@ fn opaque_blocks_in_range(xml: &[u8], start: usize, end: usize) -> Vec<(usize, u
         }
         if name == "r" {
             run_depth += 1;
+        }
+        if name == "pPr" {
+            ppr_depth += 1;
+        }
+        if name == "rPr" {
+            rpr_depth += 1;
         }
         if !tag.self_closing {
             stack.push((tag.name.clone(), tag.start, tag.end));
