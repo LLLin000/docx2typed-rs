@@ -138,3 +138,57 @@ Measured across 5 consecutive trials (Trial 1 = Cold Start, Trials 2–5 = Warme
 1. **Production Cutover**: `docx2typed-rust` is validated for primary production use. All 49 MCP tools and 8 CLI verbs operate with verified byte fidelity on real-world patent documents.
 2. **Oracle Retention**: The Python engine is frozen and retained in CI as an offline verification Oracle.
 3. **Roadmap Transition**: Foundation layer editing semantics are frozen. Future development transitions from Rust/Python parity to Agent operational ergonomics (semantic targeting, claim dependency verification, patent-drafting Skill integration).
+
+---
+
+## 8. Post-Audit Follow-Up: Three Semantics the Audit Settled
+
+The first audit proved byte fidelity for the paragraphs it touched. It could
+not prove the *reach* of a replace, and a deeper probe found three boundaries,
+all measured on real inputs.
+
+### 8.1 A replace did not reach paragraphs inserted in the session
+
+`document_replace`'s scope (`scope_paragraph_ids`) names only `<!--@p` blocks.
+A paragraph inserted earlier is a `<!--@new temp="N1"-->` block, so a
+document-wide replace reported `matches=0` on it and the build kept the
+original keyword. **The Python reference has the same gap**
+(`mcp_server.py:5024` filters `kind == "p"`), so this was a shared defect.
+Rust now unions the draft's own blocks: for the patent sample the inserted
+paragraph reads `…缓释长效润滑双重响应特性。` where the reference leaves
+`…缓释润滑双重响应特性。`.
+
+### 8.2 A keyword split across two runs
+
+Visible text is the concatenation of `<w:t>` leaves, so `("长效润", "滑材料")`
+presents a `润滑` that no leaf contains. On that input:
+
+| engine | outcome |
+|---|---|
+| Python | rewrites the paragraph; the build then fails with `built document XML is invalid: unbound prefix` |
+| Rust (before) | recorded an island for a leaf without the text; reported `changed=35` while 34 were real |
+
+Both are now refused with `replace-cross-leaf-matches` before any write,
+naming `word.text.replace.cross-leaf` as the unimplemented capability.
+
+### 8.3 A reported match must be recordable
+
+Each plan entry must resolve to a baseline leaf carrying it, a structure
+record, or a draft `@new` block the commit synthesises. Otherwise
+`replace-unrecorded-match` fails the call closed.
+
+### 8.4 The lost commit baseline
+
+`commit_sync` bootstrapped the review session lazily, after
+`apply_projection` rewrote `typed.md`, so the C0 baseline pinned the
+POST-commit hash and `publish_current` refused with `current-not-changed` on a
+draft that had edits. `ensure_session` now runs first.
+
+### 8.5 Verification status
+
+| check | result |
+|---|---|
+| `rust-tests/replace_semantics.rs` (7 boundary cases) | 7 / 7 pass |
+| Corpus extraction parity | 17 / 17 byte-identical |
+| MCP schema gate | 49 tools, exact parity |
+| Real-patent oracle (`qualification/patent_acceptance_oracle.py`) | 100 % pass, stricter than the reference on inserted paragraphs |
