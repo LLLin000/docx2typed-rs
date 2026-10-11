@@ -992,5 +992,41 @@
   "title": "workspace_forkArguments",
   "type": "object",
   "additionalProperties": false
+ },
+ "format_span": {
+  "properties": {
+   "attributes": {
+    "title": "Attributes",
+    "type": "object"
+   },
+   "old": {
+    "title": "Old",
+    "type": "string"
+   },
+   "operation_id": {
+    "title": "Operation Id",
+    "type": "string"
+   },
+   "paragraph_id": {
+    "title": "Paragraph Id",
+    "type": "string"
+   },
+   "style_id": {
+    "title": "Style Id",
+    "type": "string"
+   },
+   "track": {
+    "title": "Track",
+    "type": "boolean"
+   }
+  },
+  "required": [
+   "paragraph_id",
+   "old",
+   "operation_id"
+  ],
+  "title": "format_spanArguments",
+  "type": "object",
+  "additionalProperties": false
  }
 }

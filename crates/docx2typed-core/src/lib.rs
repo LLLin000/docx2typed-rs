@@ -61,6 +61,11 @@ pub struct BuildPlan {
     /// PR 3: structural edits (new / deleted paragraphs) applied after the
     /// island edits. Validated against the template during planning.
     pub structure: crate::prose::StructureEdits,
+    /// #33: character-formatting edits, applied last, after the paragraph set
+    /// is settled. Each names a style that `styles` holds.
+    pub rpr_edits: Vec<crate::prose::RprEdit>,
+    /// The `style_id -> w:rPr` map from `styles.json`.
+    pub styles: BTreeMap<String, String>,
 }
 
 /// Workdir metadata produced by validation, shared by build/verify/open.
@@ -355,6 +360,27 @@ pub fn validate_workdir(workdir: &Path) -> Result<WorkdirMeta, CoreError> {
 /// workdirs, which have no edit.md/edit.state.json) keep the #55
 /// pristine-replay behavior; Python refuses those with edit-state-missing,
 /// and the divergence is deliberate to preserve the frozen no-op contract.
+/// The `style_id -> w:rPr` map from `styles.json`. A workdir without the file
+/// has no styles, which is the pre-#48 state rather than an error.
+fn load_style_rprs(root: &Path) -> Result<BTreeMap<String, String>, CoreError> {
+    let path = root.join("styles.json");
+    if !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).map_err(CoreError::io)?)
+            .map_err(|error| CoreError::Domain(format!("invalid styles.json: {error}")))?;
+    let mut out = BTreeMap::new();
+    if let Some(styles) = value.get("styles").and_then(|v| v.as_object()) {
+        for (style_id, entry) in styles {
+            if let Some(rpr) = entry.get("rPr").and_then(|v| v.as_str()) {
+                out.insert(style_id.clone(), rpr.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn plan_build(workdir: &Path) -> Result<BuildPlan, CoreError> {
     let meta = validate_workdir(workdir)?;
     // Island edits (issue #58) are the one supported edited-build path: when
@@ -362,7 +388,9 @@ pub fn plan_build(workdir: &Path) -> Result<BuildPlan, CoreError> {
     // applies those edits to the template bytes instead of replaying them.
     let islands = crate::prose::load_islands(&meta.root)?;
     let structure = crate::prose::load_structure(&meta.root)?;
-    if !meta.pristine && islands.is_empty() && structure.is_empty() {
+    let rpr_edits = crate::prose::load_rpr_edits(&meta.root)?;
+    let styles = load_style_rprs(&meta.root)?;
+    if !meta.pristine && islands.is_empty() && structure.is_empty() && rpr_edits.is_empty() {
         return Err(CoreError::Domain(
             "workdir-invalid: typed edits are not implemented in the protocol-major-1 Rust slice (issue #55; edits land in #56+)".to_string(),
         ));
@@ -414,6 +442,8 @@ pub fn plan_build(workdir: &Path) -> Result<BuildPlan, CoreError> {
         replay: true,
         edits: islands,
         structure,
+        rpr_edits,
+        styles,
     })
 }
 

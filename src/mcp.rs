@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 44] = [
+pub const TOOL_NAMES: [&str; 45] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -85,6 +85,7 @@ pub const TOOL_NAMES: [&str; 44] = [
     "history_blame",
     "history_verify",
     "workspace_fork",
+    "format_span",
 ];
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
@@ -1709,6 +1710,106 @@ impl McpSession {
     }
 
     /// Apply a batch of edits to the draft in one atomic call.
+    /// Change the FORMATTING of existing text -- the lane text replacement
+    /// cannot express (#33).
+    ///
+    /// The draft must be clean: a restyle rewrites the COMMITTED state, so an
+    /// anchor resolved from a dirty draft would not exist in it. That is the
+    /// reference's rule (`format-requires-clean-draft`) and it is also what
+    /// removes the ordering question between a text edit and a property edit
+    /// on the same run -- both orders are defensible, which is why the choice
+    /// must not be implicit.
+    fn format_span(&self, args: &Value, build_commit: &str) -> Value {
+        let paragraph_id = args
+            .get("paragraph_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let old = args
+            .get("old")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let attributes = args
+            .get("attributes")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let style_id = args
+            .get("style_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let track = args.get("track").and_then(Value::as_bool).unwrap_or(false);
+        if track {
+            return self.failure(
+                "format_span",
+                "format-tracked-unsupported",
+                "tracked formatting is not implemented; the direct restyle ships first",
+                build_commit,
+            );
+        }
+        if attributes.is_empty() == style_id.is_none() {
+            return self.failure(
+                "format_span",
+                "format-invalid-attribute",
+                "pass exactly one of attributes (e.g. {\"vertAlign\": \"superscript\"}) or style_id",
+                build_commit,
+            );
+        }
+        if paragraph_id.is_empty() || old.is_empty() {
+            return self.failure(
+                "format_span",
+                "format-invalid-argument",
+                "paragraph_id and old are required (copy old verbatim from document_read)",
+                build_commit,
+            );
+        }
+        self.draft_tool("format_span", args, build_commit, move |target| {
+            if draft_dirty(target) {
+                return Err(MutationError::new(
+                    "format-requires-clean-draft",
+                    "format_span works on the committed document, but the draft has unapplied \
+                     changes -- run commit_sync (or revert) first, then format",
+                ));
+            }
+            // The core speaks frozen codes as the prefix of its message
+            // (`format-style-unavailable: ...`). Flattening them to one code
+            // would hide WHICH refusal fired -- the misdirection #41 was about.
+            let coded = |error: docx2typed_core::CoreError| {
+                let text = error.to_string();
+                let code = text
+                    .split_once(": ")
+                    .map(|(code, _)| code)
+                    .filter(|code| {
+                        !code.is_empty()
+                            && code.len() < 48
+                            && code.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                    })
+                    .unwrap_or("format-span-invalid")
+                    .to_string();
+                MutationError::new(code, text)
+            };
+            let edit = docx2typed_core::prose::plan_format_span(
+                target,
+                &paragraph_id,
+                &old,
+                &attributes,
+                style_id.as_deref(),
+            )
+            .map_err(coded)?;
+            let total =
+                docx2typed_core::prose::record_format_span(target, edit.clone()).map_err(coded)?;
+            Ok(json!({
+                "paragraph_id": edit.paragraph_id,
+                "text_start": edit.text_start,
+                "text_end": edit.text_end,
+                "style_id": edit.style_id,
+                "attributes": edit.attributes,
+                "recorded_edits": total,
+            }))
+        })
+    }
+
     fn document_patch(&self, args: &Value, build_commit: &str) -> Value {
         let hunks = args.get("hunks").cloned();
         let diff = args.get("diff").and_then(Value::as_str).map(str::to_string);
@@ -2289,6 +2390,12 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
         }
         "workspace_fork" => {
             let mut json = serde_json::to_string(&session.workspace_fork(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "format_span" => {
+            let mut json = serde_json::to_string(&session.format_span(&args, build_commit))
                 .expect("serializes");
             json.insert_str(0, "OK ");
             json
