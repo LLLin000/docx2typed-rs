@@ -133,7 +133,10 @@ jobs:
   #
   # windows-latest for the same reason tracer62-gate uses it: these gates shell
   # out to `python`, and the runner has it. They import the IN-REPO scripts/
-  # copy, not the pinned external reference, so no extra checkout is needed.
+  # copy, not the pinned external reference -- so the IN-REPO package is what
+  # must be installed. Without it the first gate dies with
+  # `ModuleNotFoundError: No module named 'mcp'`, which is how this job failed
+  # on its first run.
   qualification-gates:
     runs-on: windows-latest
     steps:
@@ -142,6 +145,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the in-repo Python package (pyproject dependencies)
+        run: python -m pip install -e .
       - name: Release build
         run: cargo build --release
       - name: Run every remaining qualification gate
