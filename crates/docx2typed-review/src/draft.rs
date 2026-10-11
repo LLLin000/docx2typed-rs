@@ -3115,6 +3115,17 @@ pub fn apply_projection_with_options(
     let typed_before = fs::read_to_string(workdir.join("typed.md"))
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     let mut before = parse_typed_paragraphs(&typed_before);
+    // The same read, kept in its written form: a paragraph the commit does not
+    // change must come out of it spelled exactly as it went in.
+    let committed_markup = parse_typed_markup(&typed_before);
+    // File order of the committed projection, so the blocks the draft does not
+    // cover can be carried over in place. The draft is the editable body
+    // story; typed.md is the whole document, and it also records the parts
+    // that are not editable here — the advisor's comments above all. Writing
+    // only the draft's blocks silently dropped them: measured on a real
+    // patent, 20 `comments.P*` paragraphs disappeared from the canonical
+    // projection on the first commit that carried an edit.
+    let committed_layout = parse_typed_layout(&typed_before);
     // Rust-extracted workdirs carry a header-only typed.md; the pre-commit
     // bodies live in the template inventory (same source compute_changed uses).
     for paragraph in inventory_paragraphs(workdir)? {
@@ -3152,16 +3163,30 @@ pub fn apply_projection_with_options(
         .into_iter()
         .map(|paragraph| paragraph.id)
         .collect();
+    // Which paragraphs this write covers. Anything else in the committed file
+    // belongs to a part the draft cannot address and must survive untouched.
+    let mut written_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for block in &blocks {
         let Some((kind, id, marker)) = marker_of(block) else {
             continue;
         };
+        written_ids.insert(id.clone());
         match kind.as_str() {
             "p" => {
-                // The draft speaks `⟦token …⟧`; typed.md speaks `<docx-opaque
-                // …/>`. Convert at the write, so the committed file is in the
-                // reference's dialect and a later commit does not diff the two.
-                let body = typed_markup_from_draft(&block_body(block));
+                // A paragraph this commit did NOT change keeps the projection it
+                // already had, byte for byte. Re-rendering it through the draft
+                // dialect is lossy by construction — the draft carries tokens where
+                // the typed view carries markup, so style spans, anchors and
+                // inlines do not survive the round trip — and rewriting every
+                // paragraph meant one edit in one paragraph destroyed the
+                // projection of all of them. Measured on a real patent: a single
+                // tracked edit to P41 took `data-s` spans 838 -> 0, anchors
+                // 28 -> 23 and inlines 100 -> 52 across the whole file, none of
+                // which the edit touched.
+                let body = match committed_markup.get(&id) {
+                    Some(previous) if !changed.contains(&id) => previous.clone(),
+                    _ => typed_markup_from_draft(&block_body(block)),
+                };
                 typed.push_str(&format!("{}\n{body}\n", committed_marker(&id, &marker)));
             }
             "new" => {
@@ -3180,6 +3205,32 @@ pub fn apply_projection_with_options(
             // A deleted non-baseline paragraph leaves no trace: it never
             // existed in the baseline, so there is nothing to record.
             _ => {}
+        }
+    }
+    // Carry over every committed block the draft does not cover, in its
+    // original order, with the `@part` line that introduces it. The draft is
+    // the editable body; typed.md is the whole document and also records the
+    // parts that are read-only here — the advisor's comments above all.
+    // Writing only the draft's blocks silently dropped them: measured on a
+    // real patent, 20 `comments.P*` paragraphs vanished from the canonical
+    // projection on the first commit that carried an edit.
+    let mut carried_part: Option<&str> = None;
+    for entry in &committed_layout {
+        match entry {
+            CommittedEntry::Part(line) => carried_part = Some(line.as_str()),
+            CommittedEntry::Paragraph { id, marker, body } => {
+                if written_ids.contains(id) {
+                    continue;
+                }
+                if let Some(line) = carried_part.take() {
+                    typed.push_str(line);
+                    typed.push('\n');
+                }
+                typed.push_str(marker);
+                typed.push('\n');
+                typed.push_str(body);
+                typed.push('\n');
+            }
         }
     }
     fs::write(&typed_path, typed)
@@ -3508,6 +3559,119 @@ fn typed_body_visible_text(body: &str) -> String {
     out.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")
+}
+
+/// The committed projection's bodies, RAW: markup preserved, not reduced to
+/// visible text.
+///
+/// `parse_typed_paragraphs` answers "what does this paragraph say"; this
+/// answers "how is this paragraph written". The commit needs the second one to
+/// leave a paragraph it did not touch exactly as it found it.
+fn parse_typed_markup(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut records: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut current: Option<String> = None;
+    let mut body_lines: Vec<String> = Vec::new();
+    let mut flush = |records: &mut std::collections::BTreeMap<String, String>,
+                     current: &mut Option<String>,
+                     body_lines: &mut Vec<String>| {
+        if let Some(id) = current.take() {
+            records.insert(id, body_lines.join("\n").trim_end_matches('\n').to_string());
+            body_lines.clear();
+        }
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<!--@p id=\"") {
+            flush(&mut records, &mut current, &mut body_lines);
+            let id = trimmed
+                .strip_prefix("<!--@p id=\"")
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or("")
+                .to_string();
+            current = Some(id);
+            continue;
+        }
+        // `<!--@mark …-->` is a line INSIDE a paragraph, not a new block:
+        // it records a revision boundary the paragraph carries. Treating it
+        // as a boundary dropped it, and a paragraph that lost its mark no
+        // longer matched the one it was supposed to be preserved as.
+        if trimmed.starts_with("<!--@p ")
+            || trimmed.starts_with("<!--@new ")
+            || trimmed.starts_with("<!--@delete ")
+            || trimmed.starts_with("<!--@part ")
+            || trimmed.starts_with("<!--@typed")
+        {
+            flush(&mut records, &mut current, &mut body_lines);
+            continue;
+        }
+        if current.is_some() {
+            body_lines.push(line.to_string());
+        }
+    }
+    flush(&mut records, &mut current, &mut body_lines);
+    records
+}
+
+/// One entry of the committed projection, in file order.
+enum CommittedEntry {
+    /// A `<!--@part key="…"-->` line introducing a part's paragraphs.
+    Part(String),
+    /// A paragraph block: its id, its marker line, and its body.
+    Paragraph {
+        id: String,
+        marker: String,
+        body: String,
+    },
+}
+
+/// The committed projection as an ordered list of parts and paragraphs.
+///
+/// A map answers "what is P41"; the commit also needs "what else is in this
+/// file", because a draft covers only the editable body and everything it does
+/// not cover still has to survive the write.
+fn parse_typed_layout(text: &str) -> Vec<CommittedEntry> {
+    let mut out: Vec<CommittedEntry> = Vec::new();
+    let mut marker: Option<String> = None;
+    let mut id: Option<String> = None;
+    let mut body_lines: Vec<String> = Vec::new();
+    let mut flush = |out: &mut Vec<CommittedEntry>,
+                     marker: &mut Option<String>,
+                     id: &mut Option<String>,
+                     body_lines: &mut Vec<String>| {
+        if let (Some(m), Some(i)) = (marker.take(), id.take()) {
+            out.push(CommittedEntry::Paragraph {
+                id: i,
+                marker: m,
+                body: body_lines.join("\n").trim_end_matches('\n').to_string(),
+            });
+        }
+        body_lines.clear();
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<!--@part ") {
+            flush(&mut out, &mut marker, &mut id, &mut body_lines);
+            out.push(CommittedEntry::Part(trimmed.to_string()));
+            continue;
+        }
+        if trimmed.starts_with("<!--@p ") {
+            flush(&mut out, &mut marker, &mut id, &mut body_lines);
+            let pid = trimmed
+                .split("id=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or("")
+                .to_string();
+            marker = Some(trimmed.to_string());
+            id = Some(pid);
+            continue;
+        }
+        if id.is_some() {
+            body_lines.push(line.to_string());
+        }
+    }
+    flush(&mut out, &mut marker, &mut id, &mut body_lines);
+    out
 }
 
 fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, String> {
