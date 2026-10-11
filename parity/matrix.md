@@ -32,7 +32,7 @@ Machine-readable: [`matrix.json`](matrix.json), [`python-lock.json`](python-lock
 >
 > **The oracle-bump policy is now on the critical path** — see
 > [`oracle-coverage-gap.md`](oracle-coverage-gap.md). Measured: the oracle
-> exposes 49 tools and lacks **exactly the 5 tools Rust still has to
+> exposes 49 tools and lacks **exactly the 4 tools Rust still has to
 > implement**, so the oracle-qualification job can never exercise the
 > migration target.
 
@@ -40,14 +40,14 @@ Machine-readable: [`matrix.json`](matrix.json), [`python-lock.json`](python-lock
 
 | Surface | Python | Rust | Gap |
 |---|---|---|---|
-| MCP tools | **49** | **44** | 5 missing, 0 extra |
+| MCP tools | **49** | **45** | 4 missing, 0 extra |
 | CLI commands | **8** | **8** | **at parity** |
 
 The CLI is already at parity: both declare exactly
 `build, decide, edit, extract, inspect, migrate, validate, verify`
 (Python `scripts/protocol.py`, Rust `crates/docx2typed-protocol/src/descriptor.rs`).
 
-## 2. The 5 missing MCP tools
+## 2. The 4 missing MCP tools
 
 Name equality is not functional equality; each row lists the Python definition
 site and the Rust crate that must own the capability. Status values:
@@ -57,10 +57,9 @@ site and the Rust crate that must own the capability. Status values:
 | # | Tool | Python site | Rust infrastructure | Status |
 |---|---|---|---|---|
 | 1 | `document_replace` | `mcp_server.py:4947` | — | `missing` |
-| 2 | `format_span` | `mcp_server.py:3783` | core/prose.rs (primitive landed #28; design #39) | `partial` |
-| 3 | `history_gc` | `mcp_server.py:5917` | `store/store.rs` | `missing` |
-| 4 | `history_restore` | `mcp_server.py:5951` | `store/store.rs` | `missing` |
-| 5 | `workspace_adopt` | `mcp_server.py:2935` | identity landed (#19); resolver + tool open | `partial` |
+| 2 | `history_gc` | `mcp_server.py:5917` | `store/store.rs` | `missing` |
+| 3 | `history_restore` | `mcp_server.py:5951` | `store/store.rs` | `missing` |
+| 4 | `workspace_adopt` | `mcp_server.py:2935` | identity landed (#19); resolver + tool open | `partial` |
 
 ### Landed since this matrix was first written
 
@@ -72,6 +71,7 @@ site and the Rust crate that must own the capability. Status values:
 | `document_patch` | #30 (core) / #32 (tool) |
 | `history_diff`, `history_blame`, `history_verify` | #25 (core) / #36 (tools) |
 | `workspace_fork` | #38 |
+| `format_span` | #28 (primitive) / #39 (design) / #53 (tool) |
 
 Plus `match_ref` addressing (#34), which is not a tool but closes the search →
 patch loop: a caller can hand a `document_search` reference straight to
@@ -97,7 +97,7 @@ with its adoption-token flow, `workspace_fork` with origin recording).
 Rust also has `review/history.rs` (`list`/`read`/`append`) and
 `store/versions.rs` (the read-only chain reader behind `history_list`).
 
-## 4. Known non-equivalences among the 44 shared tools
+## 4. Known non-equivalences among the 45 shared tools
 
 These must be checked per-tool, not assumed equal. Priority suspects named in
 the plan plus what was verified here:

@@ -10,12 +10,6 @@
       "status": "missing"
     },
     {
-      "tool": "format_span",
-      "python_site": "mcp_server.py:3783",
-      "rust_owner": "core/prose.rs (primitive landed #28; design #39)",
-      "status": "partial"
-    },
-    {
       "tool": "history_gc",
       "python_site": "mcp_server.py:5917",
       "rust_owner": "store/store.rs",

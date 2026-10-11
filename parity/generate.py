@@ -39,7 +39,6 @@ _CAPABILITY_OWNERS = {
     # `history_diff`, `history_blame`, `history_verify` and `workspace_fork` went
     # with the commits that wired them, which the both-directions check forces.
     "document_replace": ("mcp_server.py:4947", None, "missing"),
-    "format_span": ("mcp_server.py:3783", "core/prose.rs (primitive landed #28; design #39)", "partial"),
     "history_restore": ("mcp_server.py:5951", "store/store.rs", "missing"),
     "history_gc": ("mcp_server.py:5917", "store/store.rs", "missing"),
     "workspace_adopt": ("mcp_server.py:2935", "identity landed (#19); resolver + tool open", "partial"),
