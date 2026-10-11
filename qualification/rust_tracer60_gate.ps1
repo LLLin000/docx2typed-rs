@@ -10,7 +10,7 @@
 #        [-Bin ..\target\release\docx2typed.exe]
 
 param(
-    [string]$Bin = "..\target\release\docx2typed.exe"
+    [string]$Bin = "target\release\docx2typed.exe"
 )
 
 $ErrorActionPreference = "Stop"
