@@ -590,6 +590,13 @@ impl McpSession {
         let tracked = self.track;
         let author = self.author.clone();
         self.draft_tool_with_boundary("commit_sync", args, build_commit, true, move |target| {
+            // Bootstrap the review session BEFORE `apply_projection` rewrites
+            // typed.md. The bootstrap pins the current typed.md hash as the C0
+            // baseline; doing it after the rewrite would pin the POST-commit
+            // hash, and `publish_current` would then see `actual == pinned` and
+            // refuse with `current-not-changed` even though the draft had edits.
+            docx2typed_review::collab::ensure_session(target)
+                .map_err(|error| MutationError::new(error.code, error.detail))?;
             let changed =
                 draft::apply_projection_with_options(target, tracked, author.as_deref(), None)
                     .map_err(|error| MutationError::new(error.code, error.detail))?;

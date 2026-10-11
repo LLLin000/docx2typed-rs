@@ -2656,6 +2656,11 @@ fn is_registered_code(code: &str) -> bool {
             | "comment-not-found"
             | "decided-output-already-exists"
             | "decided-workdir-already-exists"
+            // Replace-lane diagnostics (document_replace): a cross-leaf span or
+            // a match with no sidecar record names a match the build cannot
+            // honour — refused loudly rather than dropped silently.
+            | "replace-cross-leaf-matches"
+            | "replace-unrecorded-match"
     )
 }
 
