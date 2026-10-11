@@ -248,7 +248,20 @@ fn typed_markup_from_draft(body: &str) -> String {
     let mut index = 0usize;
     while index < chars.len() {
         if chars[index] != '\u{27e6}' {
-            out.push(chars[index]);
+            // Literal text is DATA here, and `typed.md` spells data escaped.
+            // The draft carries a bare `<angle>`; the typed view carries
+            // `&lt;angle&gt;`. Copying the bare form through made the written
+            // file unescaped, and made every comparison against it reduce
+            // differently: `<angle>` parses as a tag, so the reduction dropped
+            // it and the paragraph read as changed with nothing changed.
+            // Measured on the `complex` fixture: P3 and T0.R2.C1.P0, both
+            // false positives, both then re-rendered and degraded.
+            match chars[index] {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                other => out.push(other),
+            }
             index += 1;
             continue;
         }
@@ -3571,9 +3584,9 @@ fn parse_typed_markup(text: &str) -> std::collections::BTreeMap<String, String> 
     let mut records: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut current: Option<String> = None;
     let mut body_lines: Vec<String> = Vec::new();
-    let mut flush = |records: &mut std::collections::BTreeMap<String, String>,
-                     current: &mut Option<String>,
-                     body_lines: &mut Vec<String>| {
+    let flush = |records: &mut std::collections::BTreeMap<String, String>,
+                 current: &mut Option<String>,
+                 body_lines: &mut Vec<String>| {
         if let Some(id) = current.take() {
             records.insert(id, body_lines.join("\n").trim_end_matches('\n').to_string());
             body_lines.clear();
@@ -3634,10 +3647,10 @@ fn parse_typed_layout(text: &str) -> Vec<CommittedEntry> {
     let mut marker: Option<String> = None;
     let mut id: Option<String> = None;
     let mut body_lines: Vec<String> = Vec::new();
-    let mut flush = |out: &mut Vec<CommittedEntry>,
-                     marker: &mut Option<String>,
-                     id: &mut Option<String>,
-                     body_lines: &mut Vec<String>| {
+    let flush = |out: &mut Vec<CommittedEntry>,
+                 marker: &mut Option<String>,
+                 id: &mut Option<String>,
+                 body_lines: &mut Vec<String>| {
         if let (Some(m), Some(i)) = (marker.take(), id.take()) {
             out.push(CommittedEntry::Paragraph {
                 id: i,

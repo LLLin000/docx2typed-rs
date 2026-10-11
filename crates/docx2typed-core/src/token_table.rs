@@ -1259,8 +1259,18 @@ impl<'a> Walker<'a> {
             }];
         }
         if let Some(change) = rpr_change {
-            let (_, attrs) = self.tag(&change);
-            let token_id = self.add("rpr-change", attrs.clone(), &change);
+            // The reference records the TAG NAME here, not the element's own
+            // OOXML attributes, and the style of the RUN the change sits in —
+            // the formatting in force at that point — not a style derived from
+            // the change element, which has none. `raw` still carries the full
+            // XML, so nothing is lost by not duplicating the attributes; the
+            // `style_id` is the part a consumer needs and Rust was recording
+            // as empty. Measured on a real patent: 84 `rpr-change` tokens
+            // whose `raw` matched the reference byte for byte while the model
+            // disagreed on both fields.
+            let attrs: BTreeMap<String, String> =
+                std::iter::once(("tag".to_string(), "w:rPrChange".to_string())).collect();
+            let token_id = self.add_styled("rpr-change", attrs.clone(), &change, &style_id);
             out.push(TypedNode::Inline {
                 token_id,
                 kind: "rpr-change".to_string(),
@@ -1340,12 +1350,16 @@ impl<'a> Walker<'a> {
             return;
         }
         if let Some(change) = rpr_change {
-            let (_, attrs) = self.tag(&change);
-            self.add("rpr-change", attrs, &change);
+            // Same model as the run walk: the tag name, and the style of the
+            // RUN the change sits in. Both walks reach `rpr-change`, and a
+            // paragraph-mark change must record what a run change records.
+            let attrs: BTreeMap<String, String> =
+                std::iter::once(("tag".to_string(), "w:rPrChange".to_string())).collect();
+            self.add_styled("rpr-change", attrs, &change, &style);
         }
         if !saw_content {
             let (_, attrs) = self.tag(run);
-            self.add("empty-run", attrs, run);
+            self.add_styled("empty-run", attrs, run, &style);
         }
     }
 }

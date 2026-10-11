@@ -2113,26 +2113,57 @@ fn promote_vertical_alignment(
 /// The TEXT nodes of a paragraph as canonical segments — what
 /// `choose_base_style` counts, and nothing else.
 fn text_segments(nodes: &[crate::token_table::TypedNode]) -> Vec<Segment> {
-    nodes
-        .iter()
-        .filter_map(|node| match node {
-            crate::token_table::TypedNode::Text { style_id, text, .. } => Some(Segment {
-                start: 0,
-                end: text.chars().count(),
-                text: text.clone(),
-                style_id: style_id.clone(),
-                revision: None,
-                comment_ids: Vec::new(),
-                editable: true,
-                visibility: crate::document_projection::Visibility {
-                    original: true,
-                    tracked: true,
-                    final_view: true,
-                },
-            }),
-            _ => None,
-        })
-        .collect()
+    // Recursive, and only over the text that reaches the FINAL view: the
+    // reference's `choose_base_style` visits a range's children, visits a
+    // revision's children only for insert/move_to, and skips deleted text
+    // because it is not in the final view. Collecting top-level text alone
+    // votes on a different set than the reference does, so the paragraph is
+    // assigned a different base style and every byte of its markup changes.
+    // Measured on a real patent: 13 paragraphs, all of them revision-heavy.
+    let mut out: Vec<Segment> = Vec::new();
+    collect_text_segments(nodes, &mut out);
+    out
+}
+
+fn collect_text_segments(nodes: &[crate::token_table::TypedNode], out: &mut Vec<Segment>) {
+    for node in nodes {
+        match node {
+            crate::token_table::TypedNode::Range { children, .. } => {
+                collect_text_segments(children, out);
+            }
+            crate::token_table::TypedNode::Revision { kind, children, .. } => {
+                if kind == "insert" || kind == "move_to" {
+                    collect_text_segments(children, out);
+                }
+            }
+            crate::token_table::TypedNode::Text { .. } => {
+                if let Some(segment) = text_segment(node) {
+                    out.push(segment);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn text_segment(node: &crate::token_table::TypedNode) -> Option<Segment> {
+    match node {
+        crate::token_table::TypedNode::Text { style_id, text, .. } => Some(Segment {
+            start: 0,
+            end: text.chars().count(),
+            text: text.clone(),
+            style_id: style_id.clone(),
+            revision: None,
+            comment_ids: Vec::new(),
+            editable: true,
+            visibility: crate::document_projection::Visibility {
+                original: true,
+                tracked: true,
+                final_view: true,
+            },
+        }),
+        _ => None,
+    }
 }
 
 /// typed.md lists paragraphs in DOCUMENT order — headers, body, footers, notes,
