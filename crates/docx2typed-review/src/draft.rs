@@ -226,6 +226,87 @@ pub fn write_draft(
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))
 }
 
+/// A draft body rendered as typed.md markup.
+///
+/// The two files speak DIFFERENT dialects and both match the reference:
+/// `edit.md` carries `⟦token id="N0" kind="unsupported-run" tag="…"⟧` and
+/// `typed.md` carries `<docx-opaque id="N0" kind="unsupported-run" tag="…"/>`.
+/// The commit writes typed.md from the draft's bodies, so without this the
+/// committed file would carry the draft's dialect -- and a later commit would
+/// compare the two and record a spurious edit for every token.
+///
+/// `tab`/`br`/`cr` render as their inline markers, everything else as its own
+/// element, which is what `_node_to_markup` does for each node kind.
+fn typed_markup_from_draft(body: &str) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] != '\u{27e6}' {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        let Some(close) = chars[index..].iter().position(|c| *c == '\u{27e7}') else {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        };
+        let token: String = chars[index + 1..index + close].iter().collect();
+        index += close + 1;
+        // `token id="…" kind="…" …` / `range-start …` / `range-end`
+        let (keyword, attrs) = match token.split_once(' ') {
+            Some((keyword, attrs)) => (keyword.to_string(), attrs.to_string()),
+            None => (token.clone(), String::new()),
+        };
+        let kind = attrs
+            .split("kind=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        match keyword.as_str() {
+            "range-end" => out.push_str("</docx-range>"),
+            "range-start" => {
+                let id = attrs
+                    .split("id=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                out.push_str(&format!("<docx-range id=\"{id}\" kind=\"{kind}\">"));
+            }
+            _ => match kind.as_str() {
+                "tab" | "br" | "cr" => {
+                    let id = attrs
+                        .split("id=\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("");
+                    out.push_str(&format!("<docx-inline id=\"{id}\" kind=\"{kind}\"/>"));
+                }
+                _ => {
+                    let id = attrs
+                        .split("id=\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("");
+                    out.push_str(&format!("<docx-opaque id=\"{id}\" kind=\"{kind}\""));
+                    for pair in attrs.split(' ') {
+                        if let Some((key, value)) = pair.split_once('=') {
+                            if key == "id" || key == "kind" {
+                                continue;
+                            }
+                            out.push_str(&format!(" {key}={value}"));
+                        }
+                    }
+                    out.push_str("/>");
+                }
+            },
+        }
+    }
+    out
+}
+
 /// Python `_visible_text` for a token-free draft body: the body itself
 /// (escaping is identity for plain text without `\`, `⟦`, `⟧`).
 pub fn visible_text(body: &str) -> String {
@@ -1937,7 +2018,10 @@ pub fn apply_projection_with_options(
         };
         match kind.as_str() {
             "p" => {
-                let body = block_body(block);
+                // The draft speaks `⟦token …⟧`; typed.md speaks `<docx-opaque
+                // …/>`. Convert at the write, so the committed file is in the
+                // reference's dialect and a later commit does not diff the two.
+                let body = typed_markup_from_draft(&block_body(block));
                 typed.push_str(&format!("{}\n{body}\n", committed_marker(&id, &marker)));
             }
             "new" => {
@@ -1945,7 +2029,7 @@ pub fn apply_projection_with_options(
                 // reallocates the temp id at commit), with its inherit anchor
                 // riding along so a later commit can re-synthesise the
                 // paragraph from the same baseline.
-                let body = block_body(block);
+                let body = typed_markup_from_draft(&block_body(block));
                 let formal = formal_ids.get(&id).map(String::as_str).unwrap_or(&id);
                 typed.push_str(&format!("{}\n{body}\n", committed_marker(formal, &marker)));
             }
@@ -2257,13 +2341,11 @@ fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, Stri
                  current: &mut Option<String>,
                  body_lines: &mut Vec<String>| {
         if let Some(id) = current.take() {
-            records.insert(
-                id,
-                typed_body_visible_text(&body_lines.join(
-                    "
-",
-                )),
-            );
+            // typed.md writes `marker\nbody\n`, so the trailing empty line is
+            // part of the FILE, not of the body -- joining it in added a
+            // newline the committed form does not have.
+            let body = body_lines.join("\n");
+            records.insert(id, typed_body_visible_text(body.trim_end_matches('\n')));
             body_lines.clear();
         }
     };
