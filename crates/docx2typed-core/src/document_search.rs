@@ -471,7 +471,7 @@ fn editable_spans(flat_chars: &[char], boundaries: &[(usize, String)]) -> Vec<Sp
 /// Flat visible text plus zero-width revision-control boundaries, mirroring
 /// Python `_body_boundaries`: every inline token is an atomic cut point at the
 /// visible offset where it sits, and contributes no visible width.
-fn body_boundaries(body: &str) -> Result<(String, Vec<(usize, String)>), CoreError> {
+pub fn body_boundaries(body: &str) -> Result<(String, Vec<(usize, String)>), CoreError> {
     let chars: Vec<char> = body.chars().collect();
     let mut flat = String::new();
     let mut boundaries: Vec<(usize, String)> = Vec::new();
@@ -526,7 +526,7 @@ fn token_boundary_kind(chunk: &str) -> String {
 }
 
 /// Python `_region_at`: `baseline` / `insert` for a visible offset.
-fn region_at(boundaries: &[(usize, String)], offset: usize) -> &'static str {
+pub fn region_at(boundaries: &[(usize, String)], offset: usize) -> &'static str {
     let mut depth = 0i64;
     for (boundary_offset, kind) in boundaries {
         if *boundary_offset > offset {
@@ -761,7 +761,7 @@ fn escape_prose(text: &str) -> String {
     out
 }
 
-fn escape_vertical_markers(text: &str) -> String {
+pub(crate) fn escape_vertical_markers(text: &str) -> String {
     if !text.contains(['^', '_', '\\']) {
         return text.to_string();
     }
@@ -781,7 +781,7 @@ fn escape_vertical_markers(text: &str) -> String {
     out
 }
 
-fn escape_vertical_tag_body(text: &str) -> String {
+pub(crate) fn escape_vertical_tag_body(text: &str) -> String {
     let mut out = String::new();
     for ch in text.chars() {
         if VERTICAL_ESCAPE_CHARS.contains(&ch) {
@@ -799,7 +799,7 @@ fn escape_vertical_tag_body(text: &str) -> String {
 /// Resolve a scope to the paragraph ids it allows, mirroring Python
 /// `_scope_paragraph_ids`: `body` (default), `all`, `comments`, a part prefix
 /// (`header1`, `T0`), or one paragraph id.
-fn scope_paragraph_ids(blocks: &[String], scope: &str) -> Result<Vec<String>, CoreError> {
+pub fn scope_paragraph_ids(blocks: &[String], scope: &str) -> Result<Vec<String>, CoreError> {
     let ids: Vec<String> = blocks
         .iter()
         .filter_map(|block| block_ident(block))
@@ -850,7 +850,7 @@ fn scope_paragraph_ids(blocks: &[String], scope: &str) -> Result<Vec<String>, Co
 
 /// Python `_encode_match_ref`: revision + paragraph + offsets + text hash,
 /// bound so a mutation is independent of copied text.
-fn encode_match_ref(
+pub fn encode_match_ref(
     paragraph_id: &str,
     start: usize,
     end: usize,

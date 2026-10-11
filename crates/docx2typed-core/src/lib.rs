@@ -270,13 +270,17 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
     let projection = crate::document_projection::project_document_bytes(&package_bytes)?;
     let trees = crate::token_table::paragraph_nodes(&package_bytes)?;
     let tokens = crate::token_table::token_table(&package_bytes)?;
-    let typed_md = crate::prose::serialize_typed(&source_name, &projection, &trees);
+    // The vertical-promotion predicate canonicalises a style's rPr minus one
+    // `w:vertAlign`, so it needs the same style table `styles.json` is built
+    // from.
+    let catalog = crate::prose::StyleCatalog::build(&package_bytes)?;
+    let (prepared, promoted) = crate::prose::prepare_paragraphs(&trees, &catalog);
+    let typed_md = crate::prose::serialize_typed(&source_name, &projection, &prepared);
 
     // The registry, built from the document's own runs. This was a hardcoded
     // empty object (#48), which made the format lane inert: a restyle is
     // refused unless the style it derives is already registered here.
-    let styles_value =
-        crate::prose::build_style_registry(&std::fs::read(&source_path).map_err(CoreError::io)?)?;
+    let styles_value = crate::prose::build_style_registry(&catalog)?;
     // The reference writes every canonical JSON asset as
     // `json.dumps(..., ensure_ascii=False, indent=2, sort_keys=True) + "\n"`
     // (typed_docx.json_bytes). These bytes are hashed into the tree digest, so
@@ -287,6 +291,8 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
         text.into_bytes()
     };
     let styles_sha256 = bytes_sha256(&styles_bytes);
+
+    let paragraphs = crate::prose::format_paragraphs(&projection, &prepared);
 
     let format = serde_json::json!({
         "schema": FORMAT_SCHEMA,
@@ -303,11 +309,11 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
         // Per-part digests, and the paragraph records (#52). Both were empty,
         // which is most of why format.json could not match the reference.
         "parts": part_digests(&package_bytes)?,
-        "paragraphs": crate::prose::format_paragraphs(&projection, &trees),
+        "paragraphs": paragraphs,
         "tokens": crate::token_table::tokens_map(&tokens),
         "source_track_enabled": crate::token_table::source_track_enabled(&package_bytes),
         "uses_date_utc": false,
-        "vertical_promotion": { "schema": "2", "promoted": 0 },
+        "vertical_promotion": { "schema": "2", "promoted": promoted },
         // `typed_sha256` is deliberately absent: the reference pins typed.md
         // through the edit-state sidecar instead, and `validate_workdir`
         // already treats an undeclared fingerprint as authoritative.
@@ -406,15 +412,18 @@ pub fn validate_workdir(workdir: &Path) -> Result<WorkdirMeta, CoreError> {
             if root.join("edit.state.json").is_file() {
                 true
             } else if let Ok(package_bytes) = std::fs::read(&template) {
-                if let (Ok(projection), Ok(trees)) = (
+                if let (Ok(projection), Ok(trees), Ok(catalog)) = (
                     crate::document_projection::project_document_bytes(&package_bytes),
                     crate::token_table::paragraph_nodes(&package_bytes),
+                    crate::prose::StyleCatalog::build(&package_bytes),
                 ) {
                     let source_name = format
                         .get("source")
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
-                    let expected = crate::prose::serialize_typed(source_name, &projection, &trees);
+                    let (prepared, _) = crate::prose::prepare_paragraphs(&trees, &catalog);
+                    let expected =
+                        crate::prose::serialize_typed(source_name, &projection, &prepared);
                     bytes_sha256(expected.as_bytes()) == typed_sha256
                 } else {
                     true

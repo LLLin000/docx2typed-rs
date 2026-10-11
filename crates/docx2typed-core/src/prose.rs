@@ -1914,8 +1914,25 @@ fn node_markup(node: &crate::token_table::TypedNode, base_style: &str) -> String
         attrs_text(&all, &["id", "kind"])
     };
     match node {
-        TypedNode::Text { style_id, text } => {
-            let escaped = xml_escape_text(text);
+        TypedNode::Text {
+            style_id,
+            text,
+            vertical,
+        } => {
+            let body = match vertical {
+                Some(vertical) => {
+                    let marker = if vertical == "superscript" { '^' } else { '_' };
+                    format!(
+                        "{marker}{{{}}}",
+                        crate::document_search::escape_vertical_tag_body(text)
+                    )
+                }
+                // The schema-2 grammar gives `^{` / `_{` meaning, so a literal
+                // one the document already carried is escaped -- otherwise it
+                // would be read as a vertical tag on the next load.
+                None => crate::document_search::escape_vertical_markers(text),
+            };
+            let escaped = xml_escape_text(&body);
             if style_id == base_style {
                 escaped
             } else {
@@ -1987,10 +2004,213 @@ fn paragraph_markup(nodes: &[crate::token_table::TypedNode], base_style: &str) -
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Vertical promotion (schema-2 `^{…}` / `_{…}`)
+// ---------------------------------------------------------------------------
+
+/// Python's `factor_vertical_style`: can this region's vertical alignment be
+/// factored out losslessly?
+///
+/// Eligible iff removing **exactly one** `w:vertAlign` from the region's run
+/// properties yields run properties canonically equal to the paragraph's base
+/// style. Canonical identity, not a feature subset: `rpr_features` enumerates
+/// only part of Word's `rPr` vocabulary, so a feature diff could ignore a
+/// property. Returns the alignment when eligible, else `None` (the region keeps
+/// its span).
+fn factor_vertical_style(
+    catalog: &StyleCatalog,
+    style_id: &str,
+    base_style_id: &str,
+) -> Option<String> {
+    if style_id.is_empty() || style_id == base_style_id {
+        return None;
+    }
+    let region_rpr = catalog.rpr(style_id)?;
+    // Cheap reject before parsing: almost every style carries no vertical
+    // alignment at all, and this runs once per text node.
+    if !region_rpr.contains("vertAlign") {
+        return None;
+    }
+    let base_canonical = catalog.canonical(base_style_id)?;
+    let fragment = RprFragment::parse(region_rpr).ok()?;
+    let alignments: Vec<&ElementNode> = fragment
+        .children
+        .iter()
+        .filter(|child| child.name == "vertAlign")
+        .collect();
+    let [alignment] = alignments.as_slice() else {
+        return None; // none, or more than one: not a single factorable element
+    };
+    let value = tag_attribute_pairs(&fragment.bytes[alignment.open_start..alignment.end])
+        .into_iter()
+        .find(|(key, _)| key == "val")
+        .map(|(_, value)| value)?;
+    if value != "superscript" && value != "subscript" {
+        return None;
+    }
+    let remainder = fragment.restyled("vertAlign", None);
+    if canonical_rpr_json(&remainder).ok()? != base_canonical {
+        return None; // something else differs too: keep the span
+    }
+    Some(value)
+}
+
+/// Python's `promote_vertical_alignment`: move eligible vertical alignment out
+/// of styles and into the text.
+///
+/// Every text region whose style factors into `(vertical, base)` becomes
+/// `(style=base, vertical)`, which the markup writes as `^{…}` / `_{…}`.
+/// Returns the number of regions promoted — the migration evidence
+/// `format.json` records. History inside a deletion (`w:del` / `w:moveFrom`) is
+/// never rewritten.
+fn promote_vertical_alignment(
+    nodes: &mut [crate::token_table::TypedNode],
+    base_style: &str,
+    catalog: &StyleCatalog,
+) -> usize {
+    fn walk(
+        nodes: &mut [crate::token_table::TypedNode],
+        base_style: &str,
+        catalog: &StyleCatalog,
+        in_history: bool,
+        promoted: &mut usize,
+    ) {
+        use crate::token_table::TypedNode;
+        for node in nodes.iter_mut() {
+            match node {
+                TypedNode::Text {
+                    style_id, vertical, ..
+                } => {
+                    if in_history {
+                        continue;
+                    }
+                    // The extractor never sets `vertical`, so the reference's
+                    // "already vertical" branch (re-factor an existing tag)
+                    // is unreachable here.
+                    if let Some(found) = factor_vertical_style(catalog, style_id, base_style) {
+                        *vertical = Some(found);
+                        *style_id = base_style.to_string();
+                        *promoted += 1;
+                    }
+                }
+                TypedNode::Range { children, .. } => {
+                    walk(children, base_style, catalog, in_history, promoted);
+                }
+                TypedNode::Revision { kind, children, .. } => {
+                    let history = in_history || kind == "delete" || kind == "move_from";
+                    walk(children, base_style, catalog, history, promoted);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut promoted = 0usize;
+    walk(nodes, base_style, catalog, false, &mut promoted);
+    promoted
+}
+
+/// The TEXT nodes of a paragraph as canonical segments — what
+/// `choose_base_style` counts, and nothing else.
+fn text_segments(nodes: &[crate::token_table::TypedNode]) -> Vec<Segment> {
+    nodes
+        .iter()
+        .filter_map(|node| match node {
+            crate::token_table::TypedNode::Text { style_id, text, .. } => Some(Segment {
+                start: 0,
+                end: text.chars().count(),
+                text: text.clone(),
+                style_id: style_id.clone(),
+                revision: None,
+                comment_ids: Vec::new(),
+                editable: true,
+                visibility: crate::document_projection::Visibility {
+                    original: true,
+                    tracked: true,
+                    final_view: true,
+                },
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// typed.md lists paragraphs in DOCUMENT order — headers, body, footers, notes,
+/// comments — while the trees are in TOKEN order, which is the parse order
+/// (body first). Part rank ONLY, then the part key: the within-part order is
+/// the document's and `sort_by_key` is stable, so it survives. Adding the
+/// paragraph id here sorted them LEXICOGRAPHICALLY — P10 before P2 — and broke
+/// three documents that had matched.
+fn paragraph_rank(tree: &crate::token_table::ParagraphNodes) -> (u8, String) {
+    let key = crate::token_table::typed_part_key(&tree.part);
+    let rank = if key.starts_with("header") {
+        0
+    } else if key.is_empty() {
+        1
+    } else if key.starts_with("footer") {
+        2
+    } else if key == "footnotes" || key == "endnotes" {
+        3
+    } else {
+        4
+    };
+    (rank, key)
+}
+
+/// One paragraph ready to render: its tree with vertical alignments promoted
+/// into the text, and the base style both the promotion and the markup measured
+/// it against.
+pub struct PreparedParagraph<'a> {
+    pub tree: &'a crate::token_table::ParagraphNodes,
+    pub base_style: String,
+    pub nodes: Vec<crate::token_table::TypedNode>,
+}
+
+/// Order the trees, assign each paragraph its base style, and promote vertical
+/// alignments — the one pass `serialize_typed` and `format_paragraphs` share.
+///
+/// The base style is computed from the UNPROMOTED styles (the reference assigns
+/// it during parsing, before `promote_vertical_alignment` runs), which is why
+/// promotion cannot move it.
+pub fn prepare_paragraphs<'a>(
+    trees: &'a [crate::token_table::ParagraphNodes],
+    catalog: &StyleCatalog,
+) -> (Vec<PreparedParagraph<'a>>, usize) {
+    let mut ordered: Vec<&crate::token_table::ParagraphNodes> = trees.iter().collect();
+    ordered.sort_by_key(|tree| paragraph_rank(tree));
+    // The body's first paragraph falls back to Normal; a PART paragraph falls
+    // back to "", which is what the reference records — measured on
+    // `comments.P0` and `header1.P0`, whose base is `""`.
+    let mut fallback = crate::document_projection::default_style_id();
+    let mut promoted = 0usize;
+    let mut out = Vec::with_capacity(ordered.len());
+    for tree in ordered {
+        // The reference assigns `base_style` ONLY in the body's walk
+        // (`parse_document_xml`); `parse_part_xml` calls `_parse_paragraph`
+        // without it, so a header/footer/note/comment paragraph keeps the
+        // dataclass default of "".
+        let base_style = if crate::token_table::typed_part_key(&tree.part).is_empty() {
+            let chosen = choose_base_style(&text_segments(&tree.nodes), &fallback);
+            fallback = chosen.clone();
+            chosen
+        } else {
+            String::new()
+        };
+        let mut nodes = tree.nodes.clone();
+        promoted += promote_vertical_alignment(&mut nodes, &base_style, catalog);
+        out.push(PreparedParagraph {
+            tree,
+            base_style,
+            nodes,
+        });
+    }
+    (out, promoted)
+}
+
 pub fn serialize_typed(
     source_name: &str,
     projection: &crate::document_projection::DocumentProjection,
-    trees: &[crate::token_table::ParagraphNodes],
+    prepared: &[PreparedParagraph],
 ) -> String {
     let header = format!(
         "<!--@typed schema=\"2\" format=\"format.json\" styles=\"styles.json\" template=\"_template.docx\" source={}-->",
@@ -1998,89 +2218,25 @@ pub fn serialize_typed(
     );
     let mut blocks = vec![header];
     let mut current_part = Some(String::new());
-    // The body's first paragraph falls back to Normal; a PART paragraph falls
-    // back to "", which is what the reference records -- measured on
-    // `comments.P0` and `header1.P0`, whose base is `""`.
-    let mut fallback = crate::document_projection::default_style_id();
     // The TREES are the typed document, not the projection's paragraphs: the
     // projection deliberately excludes the comments part, and the reference
     // lists it last. Walking the trees also keeps the markup and the token ids
     // on one traversal.
     let _ = projection;
-    // typed.md lists paragraphs in DOCUMENT order -- headers, body, footers,
-    // notes, comments -- while the trees are in TOKEN order, which is the
-    // parse order (body first, rule 1). Reordering here is what keeps the two
-    // orders straight: the ids stay the parse order's, the file follows the
-    // document's.
-    let mut ordered: Vec<&crate::token_table::ParagraphNodes> = trees.iter().collect();
-    ordered.sort_by_key(|tree| {
-        let key = crate::token_table::typed_part_key(&tree.part);
-        let rank = if key.starts_with("header") {
-            0
-        } else if key.is_empty() {
-            1
-        } else if key.starts_with("footer") {
-            2
-        } else if key == "footnotes" || key == "endnotes" {
-            3
-        } else {
-            4
-        };
-        // Part rank ONLY, then the part key. The within-part order is the
-        // document's and `sort_by_key` is stable, so it survives. Adding the
-        // paragraph id here sorted them LEXICOGRAPHICALLY -- P10 before P2,
-        // T0.R0.C0.P0 after P1 -- and broke three documents that had matched.
-        (rank, key.clone())
-    });
-    for tree in ordered {
-        let part = crate::token_table::typed_part_key(&tree.part);
+    for entry in prepared {
+        let part = crate::token_table::typed_part_key(&entry.tree.part);
         if current_part.as_deref() != Some(part.as_str()) {
             blocks.push(format!("<!--@part key={}-->", attr_value(&part)));
             current_part = Some(part);
         }
-        // The base style is the one covering the most characters in this
-        // paragraph's TEXT nodes; a paragraph with none keeps the fallback.
-        let segments: Vec<Segment> = tree
-            .nodes
-            .iter()
-            .filter_map(|node| match node {
-                crate::token_table::TypedNode::Text { style_id, text } => Some(Segment {
-                    start: 0,
-                    end: text.chars().count(),
-                    text: text.clone(),
-                    style_id: style_id.clone(),
-                    revision: None,
-                    comment_ids: Vec::new(),
-                    editable: true,
-                    visibility: crate::document_projection::Visibility {
-                        original: true,
-                        tracked: true,
-                        final_view: true,
-                    },
-                }),
-                _ => None,
-            })
-            .collect();
-        // The reference assigns `base_style` ONLY in the body's walk
-        // (`parse_document_xml`); `parse_part_xml` calls `_parse_paragraph`
-        // without it, so a header/footer/note/comment paragraph keeps the
-        // dataclass default of "". Measured on `header1.P0` and `comments.P0`,
-        // whose base is "" despite carrying text.
-        let is_body = crate::token_table::typed_part_key(&tree.part).is_empty();
-        let base_style = if is_body {
-            let chosen = choose_base_style(&segments, &fallback);
-            fallback = chosen.clone();
-            chosen
-        } else {
-            String::new()
-        };
-        let body = paragraph_markup(&tree.nodes, &base_style);
+        let body = paragraph_markup(&entry.nodes, &entry.base_style);
         let marker = format!(
             "<!--@p id={} base={}-->",
-            attr_value(&tree.paragraph_id),
-            attr_value(&base_style)
+            attr_value(&entry.tree.paragraph_id),
+            attr_value(&entry.base_style)
         );
-        let mark = tree
+        let mark = entry
+            .tree
             .mark
             .as_ref()
             .map(|(kind, token_id, attrs)| {
@@ -2104,74 +2260,27 @@ pub fn serialize_typed(
 /// The `format.json` paragraph records, one per paragraph in extract order.
 pub fn format_paragraphs(
     projection: &crate::document_projection::DocumentProjection,
-    trees: &[crate::token_table::ParagraphNodes],
+    prepared: &[PreparedParagraph],
 ) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    let mut fallback = crate::document_projection::default_style_id();
     // The trees are the typed document, so they carry the paragraph order and
     // the nodes; the projection supplies nothing here that the tree lacks.
     let _ = projection;
-    // The same document order typed.md uses -- headers, body, footers, notes,
-    // comments -- not the trees' token order.
-    let mut ordered: Vec<&crate::token_table::ParagraphNodes> = trees.iter().collect();
-    ordered.sort_by_key(|tree| {
-        let key = crate::token_table::typed_part_key(&tree.part);
-        let rank = if key.starts_with("header") {
-            0
-        } else if key.is_empty() {
-            1
-        } else if key.starts_with("footer") {
-            2
-        } else if key == "footnotes" || key == "endnotes" {
-            3
-        } else {
-            4
-        };
-        (rank, key)
-    });
-    for (index, tree) in ordered.into_iter().enumerate() {
-        let paragraph_id = tree.paragraph_id.clone();
-        let part_key = crate::token_table::typed_part_key(&tree.part);
-        let is_body = part_key.is_empty();
-        let segments: Vec<Segment> = tree
-            .nodes
-            .iter()
-            .filter_map(|node| match node {
-                crate::token_table::TypedNode::Text { style_id, text } => Some(Segment {
-                    start: 0,
-                    end: text.chars().count(),
-                    text: text.clone(),
-                    style_id: style_id.clone(),
-                    revision: None,
-                    comment_ids: Vec::new(),
-                    editable: true,
-                    visibility: crate::document_projection::Visibility {
-                        original: true,
-                        tracked: true,
-                        final_view: true,
-                    },
-                }),
-                _ => None,
-            })
-            .collect();
-        // Same rule as the serializer: only the BODY's walk assigns base_style.
-        let base_style = if is_body {
-            let chosen = choose_base_style(&segments, &fallback);
-            fallback = chosen.clone();
-            chosen
-        } else {
-            String::new()
-        };
+    let mut out = Vec::with_capacity(prepared.len());
+    for (index, entry) in prepared.iter().enumerate() {
+        let paragraph_id = entry.tree.paragraph_id.clone();
+        let part_key = crate::token_table::typed_part_key(&entry.tree.part);
+        let base_style = entry.base_style.clone();
         // `editable` is "the paragraph contains no opaque node" -- the
         // reference's `not contains_opaque(children)`.
-        let editable = tree
+        let editable = entry
+            .tree
             .nodes
             .iter()
             .all(|node| !matches!(node, crate::token_table::TypedNode::Opaque { .. }));
         // The reference: the paragraph mark's rPr, then the first text run,
         // then the base style. The projection does not surface the mark, so a
         // paragraph WITH text uses its first run, which is the same answer.
-        let insertion_style = segments
+        let insertion_style = text_segments(&entry.nodes)
             .iter()
             .find(|segment| !segment.text.is_empty())
             .map(|segment| segment.style_id.clone())
@@ -2180,11 +2289,11 @@ pub fn format_paragraphs(
             "id": paragraph_id,
             "base_style": base_style,
             "insertion_style": insertion_style,
-            "skeleton": crate::token_table::skeleton(&tree.nodes),
-            "token_ids": crate::token_table::token_ids(&tree.nodes),
-            "section_bearing": false,
+            "skeleton": crate::token_table::skeleton(&entry.nodes),
+            "token_ids": crate::token_table::token_ids(&entry.nodes),
+            "section_bearing": entry.tree.section_bearing,
             "editable": editable,
-            "mark_revision": match &tree.mark {
+            "mark_revision": match &entry.tree.mark {
                 Some((kind, token_id, attrs)) => serde_json::json!({
                     "kind": kind,
                     "token_id": token_id,
@@ -2195,7 +2304,7 @@ pub fn format_paragraphs(
             "original_index": index,
             "part_key": part_key,
             // The note a note paragraph belongs to; "" everywhere else.
-            "part_entry_id": tree.part_entry_id,
+            "part_entry_id": entry.tree.part_entry_id,
         }));
     }
     out
@@ -3202,9 +3311,48 @@ fn root_index(nodes: &[ElementNode]) -> Result<usize, CoreError> {
 /// Mirrors the reference's population exactly: `_parse_run` calls
 /// `registry.ensure` for every run's rPr (a run with none contributes the
 /// empty rPr), and the document seeds `Normal` before the paragraph walk.
-pub fn build_style_registry(package: &[u8]) -> Result<serde_json::Value, CoreError> {
-    let inventory = enumerate_package_bytes(package)?;
+pub fn build_style_registry(catalog: &StyleCatalog) -> Result<serde_json::Value, CoreError> {
     let mut entries: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (style_id, (rpr_xml, canonical)) in &catalog.entries {
+        let (label, features) = crate::document_projection::rpr_semantics_for(rpr_xml)?;
+        let features_value: BTreeMap<String, serde_json::Value> = features
+            .into_iter()
+            .map(|(k, v)| {
+                if BOOLEAN_RPR.contains(&k.as_str()) {
+                    (k, serde_json::Value::Bool(v == "true"))
+                } else {
+                    (k, serde_json::Value::String(v))
+                }
+            })
+            .collect();
+        entries.insert(
+            style_id.clone(),
+            serde_json::json!({
+                "rPr": strip_rpr_change(rpr_xml),
+                "canonical": canonical,
+                "label": label,
+                "features": features_value,
+            }),
+        );
+    }
+    Ok(serde_json::json!({
+        "schema": crate::STYLES_SCHEMA,
+        "canonicalizer_version": crate::CANONICALIZER_VERSION,
+        "styles": entries,
+    }))
+}
+
+/// One `(style_id, rPr, canonical)` per distinct run property set the document
+/// carries, the seeded `Normal` first.
+///
+/// The one enumeration both `styles.json` and the vertical-promotion predicate
+/// read: the predicate has to canonicalise a style's rPr minus one
+/// `w:vertAlign`, and doing that from a second, independently-built table is
+/// how the two would drift.
+fn style_fragments(package: &[u8]) -> Result<Vec<(String, String, String)>, CoreError> {
+    let inventory = enumerate_package_bytes(package)?;
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut seen: BTreeMap<String, ()> = BTreeMap::new();
     let mut fragments: Vec<String> = vec![String::new()]; // the seeded Normal
     for leaf in &inventory.leaves {
         fragments.push(leaf.rpr.clone());
@@ -3217,25 +3365,38 @@ pub fn build_style_registry(package: &[u8]) -> Result<serde_json::Value, CoreErr
         };
         let canonical = canonical_rpr_json(&rpr_xml)?;
         let style_id = format!("s_{}", &bytes_sha256(canonical.as_bytes())[..16]);
-        if entries.contains_key(&style_id) {
+        if seen.insert(style_id.clone(), ()).is_some() {
             continue;
         }
-        let (label, features) = crate::document_projection::rpr_semantics_for(&rpr_xml)?;
-        entries.insert(
-            style_id,
-            serde_json::json!({
-                "rPr": strip_rpr_change(&rpr_xml),
-                "canonical": canonical,
-                "label": label,
-                "features": features,
-            }),
-        );
+        out.push((style_id, rpr_xml, canonical));
     }
-    Ok(serde_json::json!({
-        "schema": crate::STYLES_SCHEMA,
-        "canonicalizer_version": crate::CANONICALIZER_VERSION,
-        "styles": entries,
-    }))
+    Ok(out)
+}
+
+/// The style facts the vertical-promotion predicate needs: each style's rPr
+/// and its canonical form, keyed by style id.
+pub struct StyleCatalog {
+    entries: BTreeMap<String, (String, String)>,
+}
+
+impl StyleCatalog {
+    pub fn build(package: &[u8]) -> Result<Self, CoreError> {
+        let mut entries = BTreeMap::new();
+        for (style_id, rpr, canonical) in style_fragments(package)? {
+            entries.insert(style_id, (rpr, canonical));
+        }
+        Ok(Self { entries })
+    }
+
+    fn rpr(&self, style_id: &str) -> Option<&str> {
+        self.entries.get(style_id).map(|(rpr, _)| rpr.as_str())
+    }
+
+    fn canonical(&self, style_id: &str) -> Option<&str> {
+        self.entries
+            .get(style_id)
+            .map(|(_, canonical)| canonical.as_str())
+    }
 }
 
 /// The original rPr with `w:rPrChange` children removed: format history is
@@ -4661,7 +4822,8 @@ mod tests {
         // `format-style-unavailable` on EVERY call, because `available_styles`
         // came from a styles.json written with an empty styles object.
         let package = std::fs::read(fixture("complex.docx")).expect("fixture");
-        let registry = build_style_registry(&package).expect("registry");
+        let registry = build_style_registry(&StyleCatalog::build(&package).expect("catalog"))
+            .expect("registry");
         let styles = registry["styles"].as_object().expect("styles");
         assert!(
             styles.len() > 1,
@@ -4715,7 +4877,8 @@ mod tests {
         // digest, so serialization is part of the contract. Captured from the
         // reference for corpus/release/styled.docx.
         let package = std::fs::read(fixture("styled.docx")).expect("fixture");
-        let registry = build_style_registry(&package).expect("registry");
+        let registry = build_style_registry(&StyleCatalog::build(&package).expect("catalog"))
+            .expect("registry");
         let mut text = serde_json::to_string_pretty(&registry).expect("serialize");
         text.push('\n');
         let expected = std::fs::read_to_string(
