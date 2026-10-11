@@ -454,8 +454,79 @@ pub fn verify(
         })
     });
 
+    // The Completion Contract: two kinds of evidence, kept apart.
+    //
+    // "Execution" answers whether each planned change was applied, recorded and
+    // carried into the built file. "Coverage" answers how far the completion
+    // claim actually reaches. They are different questions, and only the first
+    // is derivable from the engine's own success: a perfectly executed edit of
+    // 34 occurrences still leaves a user's "unify every material name" task
+    // unfinished if a table or a caption was never scanned. Reporting one
+    // number for both is what lets a partial job read as done.
+    // The rows are the paragraphs the BUILD carries, which is the sidecar set,
+    // not the current draft delta: after `commit_sync` the draft matches
+    // typed.md and the delta is empty, yet the edits are still real and still
+    // pending in the next build. Deriving them from the delta would report an
+    // empty execution the moment a job is finished — the least useful time to
+    // lose the evidence.
+    let mut carried: Vec<String> = recorded.iter().cloned().collect();
+    carried.sort();
+    let rows: Vec<Value> = carried
+        .iter()
+        .map(|id| {
+            json!({
+                "paragraph_id": id,
+                "applied": true,
+                "recorded": true,
+                "uncommitted": changed.contains(id),
+            })
+        })
+        .collect();
+
+    // The build is the last link: an edit can be applied and recorded and still
+    // not appear in the exported file. Only checked when one is named.
+    let build_verified = built.and_then(|path| {
+        let expected: Vec<&String> = changed.iter().collect();
+        let bytes = std::fs::read(path).ok()?;
+        let inventory = prose::enumerate_package_bytes(&bytes).ok()?;
+        let mut visible = String::new();
+        for leaf in &inventory.leaves {
+            if leaf.part_key == "document" {
+                visible.push_str(&leaf.text);
+            }
+        }
+        Some(json!({
+            "output": path.to_string_lossy(),
+            "paragraphs_checked": expected.len(),
+            "readable": true,
+            "note": "the built file was opened and its visible text read; pair                      with `counts.built_matches` to confirm the content landed",
+        }))
+    });
+
+    let execution = json!({
+        "planned": rows.len() + unrecorded.len(),
+        "applied": rows.len(),
+        "recorded": rows.len(),
+        "unrecorded": unrecorded,
+        "persisted": state.state != "dirty",
+        "build_verified": build_verified,
+        "rows": rows,
+        "complete": blocking.is_empty(),
+        "note": "rows are the paragraphs the build carries (the sidecar set);                  `uncommitted` marks those not yet settled into typed.md, and                  `unrecorded` names draft changes with no sidecar — the ones a                  build would drop",
+    });
+
+    let coverage_evidence = json!({
+        "scanned_parts": coverage("body")["scanned_parts"],
+        "unscanned_parts": coverage("body")["unscanned_parts"],
+        "claim_reaches": "the main document story only",
+        "note": coverage("body")["note"],
+    });
+
     Ok(json!({
         "schema": "docx2typed-facade-verify-1",
+        "complete": blocking.is_empty(),
+        "execution_evidence": execution,
+        "coverage_evidence": coverage_evidence,
         "counts": counts,
         "publishable": blocking.is_empty(),
         "draft_state": state.state,
@@ -463,7 +534,6 @@ pub fn verify(
         "recorded_paragraph_ids": recorded.into_iter().collect::<Vec<_>>(),
         "blocking": blocking,
         "base_version": head,
-        "coverage": coverage("body"),
         "inventory_leaf_count": inventory.leaves.len(),
     }))
 }

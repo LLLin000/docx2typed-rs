@@ -160,3 +160,80 @@ review → build → version restore) succeeds should the patent-domain rules
 logic) be layered on. Keeping these apart is the boundary worth holding:
 `docx2typed` decides *how a document changes safely*; the patent Skill decides
 *what the document should say*.
+
+---
+
+## 8. The Completion Contract (implemented)
+
+The Facade previously proved `reported == applied`. That is the engine's
+question. The agent's question is larger, and it has three layers:
+
+```
+operation complete   the engine performed the specified edit
+document complete    the exported DOCX contains the expected change
+task complete        the user's natural-language request was satisfied
+```
+
+The third does not follow from the second. An agent told to "unify every
+material name" may locate the 34 occurrences in the body and miss a table, a
+caption or a text box. Perfect execution of 34 edits proves nothing about the
+35th place it never looked.
+
+So `facade_verify` returns **two evidence blocks, kept apart**.
+
+### Execution Evidence — did each planned change land?
+
+```json
+"execution_evidence": {
+  "planned": 28, "applied": 28, "recorded": 28,
+  "unrecorded": [],
+  "persisted": true,
+  "build_verified": { "output": "…", "paragraphs_checked": 28, "readable": true },
+  "rows": [ { "paragraph_id": "P0", "applied": true, "recorded": true,
+              "uncommitted": false } ],
+  "complete": true
+}
+```
+
+Rows come from the **sidecar set** (what the build carries), not from the
+current draft delta: after `commit_sync` the delta is empty while the edits are
+still real, and deriving rows from it would report an empty execution at the
+least useful moment. `unrecorded` names draft changes with no sidecar — the
+ones a build would drop.
+
+### Coverage Evidence — how far does the claim reach?
+
+```json
+"coverage_evidence": {
+  "scanned_parts": ["document"],
+  "unscanned_parts": ["header1", "footer1", "footnotes", "endnotes", "comments"],
+  "claim_reaches": "the main document story only",
+  "note": "…a `0` count does not mean the phrase is absent from the file"
+}
+```
+
+### Three counts, never one
+
+| count | source |
+|---|---|
+| `baseline_matches` | the template — the pre-edit state |
+| `draft_matches` | the projection the agent edits |
+| `built_matches` | the exported DOCX, when one is named |
+
+Measured on the real patent with a paragraph inserted mid-session:
+
+```
+baseline 34 -> draft 35 -> built 35      residual bare occurrences: 0
+```
+
+A single number cannot distinguish a complete replacement from one that
+scanned a smaller document. Three side by side make "34 of 35" visible instead
+of "34, done".
+
+### The rule this encodes
+
+> An agent may claim a task complete only when the coverage evidence covers the
+> task's scope — not merely when the execution evidence is clean.
+
+`complete` is therefore about execution; the coverage block is what the agent
+must read before telling the user the job is done.
