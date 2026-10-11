@@ -42,6 +42,133 @@ pub struct TokenRecord {
     pub end: usize,
 }
 
+/// One node of a paragraph's typed tree.
+///
+/// The flat token list was not enough to render the markup: `_node_to_markup`
+/// walks a TREE, so a `<docx-range>` has to hold its children and has to sit
+/// where they sit. Measured against the reference, a flat list put the range
+/// AFTER its own text and left it empty:
+///
+///   py  : 超链接：<docx-range id="N0" kind="hyperlink" r:id="rId9">点击此处</docx-range>
+///   flat: 超链接：点击此处<docx-range id="N0" kind="hyperlink" r:id="rId9"></docx-range>
+///
+/// The ids still come from the one counter, allocated in the same order, so
+/// the flat table and this tree agree by construction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TypedNode {
+    Text {
+        style_id: String,
+        text: String,
+    },
+    /// bookmark/comment anchors: no children, no style.
+    Anchor {
+        token_id: String,
+        kind: String,
+        attrs: BTreeMap<String, String>,
+    },
+    /// tab/br/cr and friends: no children, carries the run's style.
+    Inline {
+        token_id: String,
+        kind: String,
+        style_id: String,
+        attrs: BTreeMap<String, String>,
+    },
+    /// An opaque interior (a drawing, a field, math).
+    Opaque {
+        token_id: String,
+        kind: String,
+        attrs: BTreeMap<String, String>,
+    },
+    /// A hyperlink or other range: carries its children.
+    Range {
+        token_id: String,
+        kind: String,
+        attrs: BTreeMap<String, String>,
+        children: Vec<TypedNode>,
+    },
+    /// A tracked revision: carries its children.
+    Revision {
+        token_id: String,
+        kind: String,
+        attrs: BTreeMap<String, String>,
+        children: Vec<TypedNode>,
+    },
+}
+
+impl TypedNode {
+    pub fn token_id(&self) -> Option<&str> {
+        match self {
+            TypedNode::Text { .. } => None,
+            TypedNode::Anchor { token_id, .. }
+            | TypedNode::Inline { token_id, .. }
+            | TypedNode::Opaque { token_id, .. }
+            | TypedNode::Range { token_id, .. }
+            | TypedNode::Revision { token_id, .. } => Some(token_id),
+        }
+    }
+
+    /// `_token_ids`: ranges and revisions first, then their children.
+    pub fn collect_token_ids(&self, out: &mut Vec<(String, String)>) {
+        match self {
+            TypedNode::Text { .. } => {}
+            TypedNode::Range {
+                token_id,
+                kind,
+                children,
+                ..
+            }
+            | TypedNode::Revision {
+                token_id,
+                kind,
+                children,
+                ..
+            } => {
+                out.push((token_id.clone(), kind.clone()));
+                for child in children {
+                    child.collect_token_ids(out);
+                }
+            }
+            TypedNode::Anchor { token_id, kind, .. }
+            | TypedNode::Inline { token_id, kind, .. }
+            | TypedNode::Opaque { token_id, kind, .. } => {
+                out.push((token_id.clone(), kind.clone()));
+            }
+        }
+    }
+}
+
+/// A paragraph's typed tree, plus the paragraph's own mark token.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParagraphNodes {
+    pub part: String,
+    pub paragraph_id: String,
+    pub nodes: Vec<TypedNode>,
+    /// `(kind, token_id, attrs)` when the paragraph mark carries a revision.
+    pub mark: Option<(String, String, BTreeMap<String, String>)>,
+}
+
+/// `merge_adjacent_text`: same style AND same vertical alignment merges, so a
+/// run the scanner split does not become two nodes.
+fn merge_adjacent_text(nodes: Vec<TypedNode>) -> Vec<TypedNode> {
+    let mut merged: Vec<TypedNode> = Vec::new();
+    for node in nodes {
+        if let TypedNode::Text { style_id, text } = &node {
+            if let Some(TypedNode::Text {
+                style_id: last_style,
+                text: last_text,
+            }) = merged.last_mut()
+            {
+                if last_style == style_id {
+                    last_text.push_str(text);
+                    continue;
+                }
+            }
+        }
+        merged.push(node);
+    }
+    merged
+}
+
 /// `known_inline`: run children that are inlines rather than opaque interiors.
 const KNOWN_INLINE: [&str; 14] = [
     "t",
@@ -176,6 +303,39 @@ impl<'a> Walker<'a> {
     /// `_parse_mark_revision`: a self-closing `w:ins`/`w:del` inside `pPr/rPr`
     /// is the paragraph mark's own revision, and it takes a token like any
     /// other -- allocated after the container has finished.
+    fn paragraph_mark_token(
+        &mut self,
+        children: &[usize],
+    ) -> Option<(String, String, BTreeMap<String, String>)> {
+        for &child in children {
+            let node = &self.nodes[child];
+            if node.name != "pPr" {
+                continue;
+            }
+            for &inner in &node.children.clone() {
+                let inner_node = &self.nodes[inner];
+                if inner_node.name != "rPr" {
+                    continue;
+                }
+                for &deepest in &inner_node.children.clone() {
+                    let mark = &self.nodes[deepest];
+                    if mark.name == "ins" || mark.name == "del" {
+                        let kind = if mark.name == "ins" {
+                            "insert"
+                        } else {
+                            "delete"
+                        };
+                        let (_, attrs) = self.tag(mark);
+                        let mark = mark.clone();
+                        let token_id = self.add("paragraph-mark", attrs.clone(), &mark);
+                        return Some((kind.to_string(), token_id, attrs));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn paragraph_mark(&mut self, children: &[usize]) {
         for &child in children {
             let node = &self.nodes[child];
@@ -197,6 +357,168 @@ impl<'a> Walker<'a> {
                 }
             }
         }
+    }
+
+    /// `_parse_container` as a TREE. Same allocation order as [`Walker::container`],
+    /// so the ids agree; the difference is that a range or revision keeps its
+    /// children instead of flattening them.
+    fn container_nodes(&mut self, children: &[usize]) -> Vec<TypedNode> {
+        let mut out: Vec<TypedNode> = Vec::new();
+        for &child in children {
+            let node = self.nodes[child].clone();
+            let name = node.name.clone();
+            if name == "pPr" {
+                continue;
+            }
+            if name == "proofErr" {
+                let (_, attrs) = self.tag(&node);
+                let token_id = self.add("opaque", attrs.clone(), &node);
+                out.push(TypedNode::Opaque {
+                    token_id,
+                    kind: "opaque".to_string(),
+                    attrs,
+                });
+                continue;
+            }
+            if name == "r" {
+                out.extend(self.run_nodes(&node));
+                continue;
+            }
+            if name == "hyperlink" {
+                let (_, attrs) = self.tag(&node);
+                let token_id = self.add("hyperlink", attrs.clone(), &node);
+                let inner = self.container_nodes(&node.children.clone());
+                out.push(TypedNode::Range {
+                    token_id,
+                    kind: "hyperlink".to_string(),
+                    attrs,
+                    children: inner,
+                });
+                continue;
+            }
+            if let Some(kind) = revision_kind(&name) {
+                let (_, attrs) = self.tag(&node);
+                let token_id = self.add("revision", attrs.clone(), &node);
+                let inner = self.container_nodes(&node.children.clone());
+                out.push(TypedNode::Revision {
+                    token_id,
+                    kind: kind.to_string(),
+                    attrs,
+                    children: inner,
+                });
+                continue;
+            }
+            if let Some(kind) = anchor_kind(&name) {
+                let (_, attrs) = self.tag(&node);
+                let token_id = self.add(kind, attrs.clone(), &node);
+                out.push(TypedNode::Anchor {
+                    token_id,
+                    kind: kind.to_string(),
+                    attrs,
+                });
+                continue;
+            }
+            let (tag_name, _) = self.tag(&node);
+            let mut attrs = BTreeMap::new();
+            attrs.insert("tag".to_string(), tag_name);
+            let token_id = self.add("opaque", attrs.clone(), &node);
+            out.push(TypedNode::Opaque {
+                token_id,
+                kind: "opaque".to_string(),
+                attrs,
+            });
+        }
+        merge_adjacent_text(out)
+    }
+
+    /// `_parse_run` as a TREE.
+    fn run_nodes(&mut self, run: &ElementNode) -> Vec<TypedNode> {
+        let mut out: Vec<TypedNode> = Vec::new();
+        let mut rpr_change: Option<ElementNode> = None;
+        let mut style_id = crate::document_projection::default_style_id();
+        for &child in &run.children {
+            let node = self.nodes[child].clone();
+            let name = node.name.clone();
+            if name == "rPr" {
+                style_id = self.style_of(&node);
+                for &inner in &node.children {
+                    if self.nodes[inner].name == "rPrChange" {
+                        rpr_change = Some(self.nodes[inner].clone());
+                    }
+                }
+                continue;
+            }
+            if name == "t" || name == "delText" {
+                let text = self.text_of(&node);
+                out.push(TypedNode::Text {
+                    style_id: style_id.clone(),
+                    text,
+                });
+                continue;
+            }
+            if KNOWN_INLINE.contains(&name.as_str()) {
+                let (_, attrs) = self.tag(&node);
+                let token_id = self.add(&name, attrs.clone(), &node);
+                out.push(TypedNode::Inline {
+                    token_id,
+                    kind: name.clone(),
+                    style_id: style_id.clone(),
+                    attrs,
+                });
+                continue;
+            }
+            // An unknown child makes the whole RUN opaque and stops the walk.
+            let (tag_name, _) = self.tag(&node);
+            let mut attrs = BTreeMap::new();
+            attrs.insert("tag".to_string(), tag_name);
+            let token_id = self.add("unsupported-run", attrs.clone(), run);
+            return vec![TypedNode::Opaque {
+                token_id,
+                kind: "unsupported-run".to_string(),
+                attrs,
+            }];
+        }
+        if let Some(change) = rpr_change {
+            let (_, attrs) = self.tag(&change);
+            let token_id = self.add("rpr-change", attrs.clone(), &change);
+            out.push(TypedNode::Inline {
+                token_id,
+                kind: "rpr-change".to_string(),
+                style_id: style_id.clone(),
+                attrs,
+            });
+        }
+        if out.is_empty() {
+            let (_, attrs) = self.tag(run);
+            let token_id = self.add("empty-run", attrs.clone(), run);
+            return vec![TypedNode::Inline {
+                token_id,
+                kind: "empty-run".to_string(),
+                style_id,
+                attrs,
+            }];
+        }
+        merge_adjacent_text(out)
+    }
+
+    /// The style of a run's `w:rPr`, by the same canonical id scheme.
+    fn style_of(&self, rpr: &ElementNode) -> String {
+        let fragment = String::from_utf8_lossy(&self.bytes[rpr.open_start..rpr.end]).into_owned();
+        crate::prose::style_id_for_rpr(&fragment)
+            .unwrap_or_else(|_| crate::document_projection::default_style_id())
+    }
+
+    /// A `w:t`'s decoded text.
+    fn text_of(&self, node: &ElementNode) -> String {
+        let start = node.open_end;
+        let end = if node.children.is_empty() {
+            node.close_start
+        } else {
+            node.open_end
+        };
+        crate::prose::decode_text_segments(&self.bytes[start..end])
+            .map(|(text, _)| text)
+            .unwrap_or_default()
     }
 
     /// `_parse_run`: the run's own children, then `rPrChange`, then `empty-run`.
@@ -306,6 +628,75 @@ pub fn token_table(package: &[u8]) -> Result<Vec<TokenRecord>, CoreError> {
         }
     }
     Ok(tokens)
+}
+
+/// Every paragraph's typed tree, in the SAME part and paragraph order the token
+/// table uses -- the body first (rule 1), then the header/footer/note parts.
+///
+/// The trees and the flat table are two views of one walk, so their ids agree
+/// by construction rather than by a second implementation.
+pub fn paragraph_nodes(package: &[u8]) -> Result<Vec<ParagraphNodes>, CoreError> {
+    let part_xml = crate::document_projection::part_xml_members(package)?;
+    let mut out: Vec<ParagraphNodes> = Vec::new();
+    let mut counter: Vec<TokenRecord> = Vec::new();
+
+    let mut order: Vec<String> = vec!["document".to_string()];
+    let mut others: Vec<String> = part_xml
+        .keys()
+        .filter(|key| key.as_str() != "document")
+        .cloned()
+        .collect();
+    others.sort_by_key(|key| {
+        let rank = if key.starts_with("header") {
+            0
+        } else if key.starts_with("footer") {
+            1
+        } else if key == "footnotes" || key == "endnotes" {
+            2
+        } else {
+            3
+        };
+        (rank, key.clone())
+    });
+    order.extend(others);
+
+    for part_key in order {
+        let Some(xml) = part_xml.get(&part_key) else {
+            continue;
+        };
+        let nodes = build_tree(&scan_tags(xml))?;
+        let located = if part_key == "document" {
+            scan_document(xml)?
+        } else {
+            scan_part(xml, &part_key)?
+        };
+        let mut walker = Walker {
+            bytes: xml,
+            nodes: &nodes,
+            part: part_key.clone(),
+            paragraph_id: String::new(),
+            tokens: &mut counter,
+        };
+        for (paragraph_id, start, end) in located {
+            let Some(root) = nodes.iter().find(|node| {
+                node.open_start == start
+                    && (node.end == end || (node.self_closing && node.open_start == end))
+            }) else {
+                continue;
+            };
+            walker.paragraph_id = paragraph_id.clone();
+            let children = walker.container_nodes(&root.children.clone());
+            // Rule 2: the mark is allocated after the container.
+            let mark = walker.paragraph_mark_token(&root.children.clone());
+            out.push(ParagraphNodes {
+                part: part_key.clone(),
+                paragraph_id,
+                nodes: children,
+                mark,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// `part_key` as `typed.md` spells it: the body is the empty string.
