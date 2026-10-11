@@ -283,12 +283,108 @@ def compare(src: Path, workdir: Path, json_out: Path | None) -> dict:
     return report
 
 
+# --------------------------------------------------------------------------
+# The baseline gate: freeze, then check for drift
+# --------------------------------------------------------------------------
+
+
+def semantic_fingerprint(wd: Path) -> dict:
+    """Everything that must not move: identities, not counts.
+
+    A count cannot tell a preserved revision from a replaced one, nor a span
+    that moved from one that stayed. Each entry is keyed by identity and
+    carries the value that identity is supposed to have.
+    """
+    fmt = json.loads((wd / "format.json").read_text(encoding="utf-8"))
+    rev = json.loads((wd / "revisions.json").read_text(encoding="utf-8"))
+    typed = (wd / "typed.md").read_text(encoding="utf-8")
+
+    def blocks(text: str) -> dict:
+        out: dict[str, str] = {}
+        current, body = None, []
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith('<!--@p id="'):
+                if current:
+                    out[current] = "\n".join(body).strip()
+                current = s.split('id="')[1].split('"')[0]
+                body = []
+                continue
+            if s.startswith("<!--@part ") or s.startswith("<!--@typed"):
+                if current:
+                    out[current] = "\n".join(body).strip()
+                current, body = None, []
+                continue
+            if current:
+                body.append(line)
+        if current:
+            out[current] = "\n".join(body).strip()
+        return out
+
+    return {
+        "tokens": {k: json.dumps(v, sort_keys=True) for k, v in fmt.get("tokens", {}).items()},
+        "paragraphs": {
+            p["id"]: json.dumps(p, sort_keys=True) for p in fmt.get("paragraphs", [])
+        },
+        "revisions": {r["revision_key"]: json.dumps(r, sort_keys=True) for r in rev["revisions"]},
+        "typed": blocks(typed),
+    }
+
+
+def compare_fingerprint(before: dict, after: dict) -> list[dict]:
+    """Set difference per family. Reports which identity moved, not how many."""
+    out: list[dict] = []
+    for family in sorted(set(before) | set(after)):
+        a, b = before.get(family, {}), after.get(family, {})
+        gone = sorted(set(a) - set(b))
+        added = sorted(set(b) - set(a))
+        moved = sorted(k for k in set(a) & set(b) if a[k] != b[k])
+        if gone or added or moved:
+            out.append(
+                {
+                    "family": family,
+                    "dropped": len(gone),
+                    "added": len(added),
+                    "changed": len(moved),
+                    "dropped_sample": gone[:3],
+                    "added_sample": added[:3],
+                    "changed_sample": moved[:3],
+                }
+            )
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("document")
     ap.add_argument("--json")
     ap.add_argument("--workdir")
+    ap.add_argument("--freeze", help="write a semantic fingerprint baseline here")
+    ap.add_argument("--check", help="compare the workdir against a frozen baseline")
     args = ap.parse_args()
+
+    if args.freeze:
+        wd = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="proj-freeze-"))
+        wd.mkdir(parents=True, exist_ok=True)
+        rust_extract(Path(args.document), wd)
+        fp = semantic_fingerprint(wd)
+        Path(args.freeze).write_text(json.dumps(fp, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"frozen: {args.freeze}")
+        for family, entries in fp.items():
+            print(f"  {family}: {len(entries)} identities")
+        return 0
+
+    if args.check:
+        wd = Path(args.workdir)
+        before = json.loads(Path(args.check).read_text(encoding="utf-8"))
+        drift = compare_fingerprint(before, semantic_fingerprint(wd))
+        if not drift:
+            print("no drift: every identity holds its value")
+            return 0
+        print("DRIFT:")
+        for entry in drift:
+            print(json.dumps(entry, ensure_ascii=False))
+        return 1
 
     src = Path(args.document)
     wd = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="proj-audit-"))
