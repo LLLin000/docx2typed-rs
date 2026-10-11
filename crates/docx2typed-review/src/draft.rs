@@ -2449,6 +2449,7 @@ pub fn apply_projection_with_options(
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let mut recorded = 0usize;
     let mut structured = false;
+    let inventory = docx2typed_core::prose::enumerate_package(&workdir.join("_template.docx")).ok();
     let committed = parse_typed_paragraphs(
         &fs::read_to_string(workdir.join("typed.md"))
             .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?,
@@ -2522,18 +2523,54 @@ pub fn apply_projection_with_options(
         if islands.iter().any(|edit| edit.paragraph_id == *id) {
             continue;
         }
-        islands.retain(|edit| edit.paragraph_id != *id);
-        islands.push(docx2typed_core::prose::IslandEdit {
-            part: "document".to_string(),
-            paragraph_id: id.clone(),
-            leaf_index: 0,
-            old: old_body.clone(),
-            new: new_body.clone(),
-            tracked,
-            author: author.unwrap_or("").to_string(),
-            date: date.unwrap_or("").to_string(),
+        let is_single_leaf = inventory.as_ref().map_or(false, |inv| {
+            let mut leaves = inv
+                .leaves
+                .iter()
+                .filter(|l| l.part_key == "document" && &l.paragraph_id == id);
+            let first = leaves.next();
+            let second = leaves.next();
+            second.is_none() && first.is_some_and(|l| &l.text == old_body)
         });
-        recorded += 1;
+        if is_single_leaf {
+            islands.retain(|edit| edit.paragraph_id != *id);
+            islands.push(docx2typed_core::prose::IslandEdit {
+                part: "document".to_string(),
+                paragraph_id: id.clone(),
+                leaf_index: 0,
+                old: old_body.clone(),
+                new: new_body.clone(),
+                tracked,
+                author: author.unwrap_or("").to_string(),
+                date: date.unwrap_or("").to_string(),
+            });
+            recorded += 1;
+        } else {
+            let next_anchor = next_live_paragraph(&blocks, id);
+            if !structure
+                .deleted_paragraphs
+                .iter()
+                .any(|p| p.paragraph_id == *id)
+            {
+                structure
+                    .deleted_paragraphs
+                    .push(docx2typed_core::prose::DeletedParagraph {
+                        part: "document".to_string(),
+                        paragraph_id: id.clone(),
+                    });
+            }
+            structure.new_paragraphs.retain(|p| p.paragraph_id != *id);
+            structure
+                .new_paragraphs
+                .push(docx2typed_core::prose::NewParagraph {
+                    part: "document".to_string(),
+                    paragraph_id: id.clone(),
+                    inherit: id.clone(),
+                    body: new_body.clone(),
+                    insert_before: next_anchor,
+                });
+            structured = true;
+        }
     }
     if recorded > 0 {
         docx2typed_core::prose::save_islands(workdir, &islands)
