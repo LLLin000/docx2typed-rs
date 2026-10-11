@@ -2194,7 +2194,8 @@ pub fn format_paragraphs(
             },
             "original_index": index,
             "part_key": part_key,
-            "part_entry_id": "",
+            // The note a note paragraph belongs to; "" everywhere else.
+            "part_entry_id": tree.part_entry_id,
         }));
     }
     out

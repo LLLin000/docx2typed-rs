@@ -266,6 +266,41 @@ fn with_namespace(tag: &str, namespaces: &BTreeMap<String, String>) -> String {
     out
 }
 
+/// The enclosing `w:footnote`/`w:endnote`'s `w:id`, for a paragraph inside one.
+///
+/// `locate_part_xml` records `current_entry or ""` per paragraph, so a note
+/// paragraph names the note it belongs to and every other paragraph names
+/// nothing. The values are the fixture's own note ids (-1, 0, 1), which is why
+/// they look like indices.
+pub fn part_entry_id(part: &str, paragraph_start: usize, xml: &[u8]) -> String {
+    let key = typed_part_key(part);
+    if key != "footnotes" && key != "endnotes" {
+        return String::new();
+    }
+    let head = String::from_utf8_lossy(&xml[..paragraph_start.min(xml.len())]);
+    // The LAST opening note tag before the paragraph is the one containing it.
+    let mut best: Option<(usize, String)> = None;
+    for marker in ["<w:footnote ", "<w:endnote "] {
+        let Some(at) = head.rfind(marker) else {
+            continue;
+        };
+        let rest = &head[at + marker.len()..];
+        let Some(id_at) = rest.find("w:id=\"") else {
+            continue;
+        };
+        let after = &rest[id_at + 6..];
+        let Some(end) = after.find('"') else { continue };
+        let better = match &best {
+            Some((best_at, _)) => at > *best_at,
+            None => true,
+        };
+        if better {
+            best = Some((at, after[..end].to_string()));
+        }
+    }
+    best.map(|(_, id)| id).unwrap_or_default()
+}
+
 /// The `tokens` map `format.json` publishes: id -> the record, sorted by id.
 ///
 /// The payload differs by kind, exactly as `_TokenTable.add` records it: a
@@ -403,6 +438,10 @@ pub fn token_ids(nodes: &[TypedNode]) -> Vec<serde_json::Value> {
 pub struct ParagraphNodes {
     pub part: String,
     pub paragraph_id: String,
+    /// Byte offset of the paragraph inside its part.
+    pub start: usize,
+    /// The enclosing note's `w:id` for a footnote/endnote paragraph; "" else.
+    pub part_entry_id: String,
     pub nodes: Vec<TypedNode>,
     /// `(kind, token_id, attrs)` when the paragraph mark carries a revision.
     pub mark: Option<(String, String, BTreeMap<String, String>)>,
@@ -849,7 +888,7 @@ impl<'a> Walker<'a> {
             let (tag_name, _) = self.tag(&node);
             let mut attrs = BTreeMap::new();
             attrs.insert("tag".to_string(), tag_name);
-            let token_id = self.add("unsupported-run", attrs.clone(), run);
+            let token_id = self.add_styled("unsupported-run", attrs.clone(), run, &style_id);
             return vec![TypedNode::Opaque {
                 token_id,
                 kind: "unsupported-run".to_string(),
@@ -868,7 +907,7 @@ impl<'a> Walker<'a> {
         }
         if out.is_empty() {
             let (_, attrs) = self.tag(run);
-            let token_id = self.add("empty-run", attrs.clone(), run);
+            let token_id = self.add_styled("empty-run", attrs.clone(), run, &style_id);
             return vec![TypedNode::Inline {
                 token_id,
                 kind: "empty-run".to_string(),
@@ -933,7 +972,8 @@ impl<'a> Walker<'a> {
             let (tag_name, _) = self.tag(&node);
             let mut attrs = BTreeMap::new();
             attrs.insert("tag".to_string(), tag_name);
-            self.add("unsupported-run", attrs, run);
+            // `unsupported-run` carries the style too: it IS a run.
+            self.add_styled("unsupported-run", attrs, run, &style);
             return;
         }
         if let Some(change) = rpr_change {
@@ -1077,6 +1117,8 @@ pub fn paragraph_nodes(package: &[u8]) -> Result<Vec<ParagraphNodes>, CoreError>
             out.push(ParagraphNodes {
                 part: part_key.clone(),
                 paragraph_id,
+                start,
+                part_entry_id: part_entry_id(&part_key, start, xml),
                 nodes: children,
                 mark,
             });
