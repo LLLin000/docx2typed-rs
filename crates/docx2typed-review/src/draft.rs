@@ -2523,7 +2523,7 @@ pub fn apply_projection_with_options(
         if islands.iter().any(|edit| edit.paragraph_id == *id) {
             continue;
         }
-        let is_single_leaf = inventory.as_ref().map_or(false, |inv| {
+        let is_single_leaf = inventory.as_ref().is_some_and(|inv| {
             let mut leaves = inv
                 .leaves
                 .iter()
