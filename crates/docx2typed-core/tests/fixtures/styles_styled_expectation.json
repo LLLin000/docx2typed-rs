@@ -1,0 +1,31 @@
+{
+  "canonicalizer_version": 1,
+  "schema": "typed-styles-1",
+  "styles": {
+    "s_22a1dd1510eee8bd": {
+      "canonical": "[\"w:rPr\",[],\"\",[[\"w:rFonts\",[[\"w:ascii\",\"宋体\"],[\"w:eastAsia\",\"宋体\"],[\"w:hAnsi\",\"宋体\"]],\"\",[]]]]",
+      "features": {
+        "font:ascii": "宋体",
+        "font:eastAsia": "宋体",
+        "font:hAnsi": "宋体"
+      },
+      "label": "宋体",
+      "rPr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:rFonts w:ascii=\"宋体\" w:hAnsi=\"宋体\" w:eastAsia=\"宋体\" /></w:rPr>"
+    },
+    "s_9f5c04f8681ebd4e": {
+      "canonical": "[\"w:rPr\",[],\"\",[]]",
+      "features": {},
+      "label": "normal",
+      "rPr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" />"
+    },
+    "s_adcd924781ac8b4e": {
+      "canonical": "[\"w:rPr\",[],\"\",[[\"w:rFonts\",[[\"w:ascii\",\"Times New Roman\"],[\"w:hAnsi\",\"Times New Roman\"]],\"\",[]]]]",
+      "features": {
+        "font:ascii": "Times New Roman",
+        "font:hAnsi": "Times New Roman"
+      },
+      "label": "Times New Roman",
+      "rPr": "<w:rPr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:rFonts w:ascii=\"Times New Roman\" w:hAnsi=\"Times New Roman\" /></w:rPr>"
+    }
+  }
+}

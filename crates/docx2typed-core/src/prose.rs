@@ -2473,6 +2473,100 @@ fn root_index(nodes: &[ElementNode]) -> Result<usize, CoreError> {
 
 /// The attribute pairs of one element's opening tag, as (local name, value)
 /// in document order.
+/// The `styles.json` payload for a document: one entry per distinct run
+/// property set it carries, plus the seeded `Normal`.
+///
+/// This is the registry the format lane reads, and its ABSENCE is why
+/// `format_span` was inert (#48): `restyle_run_properties` refuses
+/// `format-style-unavailable` unless the derived id is already here, and the
+/// extract path wrote this file empty on every document.
+///
+/// Mirrors the reference's population exactly: `_parse_run` calls
+/// `registry.ensure` for every run's rPr (a run with none contributes the
+/// empty rPr), and the document seeds `Normal` before the paragraph walk.
+pub fn build_style_registry(package: &[u8]) -> Result<serde_json::Value, CoreError> {
+    let inventory = enumerate_package_bytes(package)?;
+    let mut entries: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut fragments: Vec<String> = vec![String::new()]; // the seeded Normal
+    for leaf in &inventory.leaves {
+        fragments.push(leaf.rpr.clone());
+    }
+    for fragment in fragments {
+        let rpr_xml = if fragment.trim().is_empty() {
+            format!(r#"<w:rPr xmlns:w="{WORD_NAMESPACE}"/>"#)
+        } else {
+            fragment
+        };
+        let canonical = canonical_rpr_json(&rpr_xml)?;
+        let style_id = format!("s_{}", &bytes_sha256(canonical.as_bytes())[..16]);
+        if entries.contains_key(&style_id) {
+            continue;
+        }
+        let (label, features) = crate::document_projection::rpr_semantics_for(&rpr_xml)?;
+        entries.insert(
+            style_id,
+            serde_json::json!({
+                "rPr": strip_rpr_change(&rpr_xml),
+                "canonical": canonical,
+                "label": label,
+                "features": features,
+            }),
+        );
+    }
+    Ok(serde_json::json!({
+        "schema": crate::STYLES_SCHEMA,
+        "canonicalizer_version": crate::CANONICALIZER_VERSION,
+        "styles": entries,
+    }))
+}
+
+/// The original rPr with `w:rPrChange` children removed: format history is
+/// never duplicated into a style's rendered properties.
+pub fn strip_rpr_change(rpr_xml: &str) -> String {
+    let Ok(fragment) = RprFragment::parse(rpr_xml) else {
+        return rpr_xml.to_string();
+    };
+    let mut open =
+        String::from_utf8_lossy(&fragment.bytes[fragment.root.open_start..fragment.root.open_end])
+            .into_owned();
+    // The reference re-serialises through ElementTree, which emits the
+    // namespace declaration on the element and closes an empty element as
+    // ` />`. These bytes land in styles.json verbatim, so both matter.
+    if !open.contains("xmlns:w=") {
+        let declaration = format!(r#" xmlns:w="{WORD_NAMESPACE}""#);
+        open = match open.find('>') {
+            Some(at) => {
+                let (head, tail) = open.split_at(at);
+                let head = head.trim_end_matches('/');
+                format!("{head}{declaration}/{tail}")
+            }
+            None => open,
+        };
+    }
+    let mut out = String::new();
+    out.push_str(open.trim_end_matches('>').trim_end_matches('/'));
+    if fragment
+        .children
+        .iter()
+        .all(|child| child.name == "rPrChange")
+    {
+        out.push_str(" />");
+        return out;
+    }
+    out.push('>');
+    for child in &fragment.children {
+        if child.name == "rPrChange" {
+            continue;
+        }
+        let rendered = String::from_utf8_lossy(&fragment.bytes[child.open_start..child.end]);
+        // ElementTree closes an empty element as ` />`; the source document
+        // may write `/>`. These bytes land in styles.json verbatim.
+        out.push_str(&rendered.replace("/>", " />"));
+    }
+    out.push_str("</w:rPr>");
+    out
+}
+
 fn tag_attribute_pairs(tag: &[u8]) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut index = 1; // past '<'
@@ -3836,6 +3930,82 @@ mod tests {
         assert_eq!(
             remove_rpr_child(&base, "vertAlign").expect("remove"),
             (base, false)
+        );
+    }
+
+    #[test]
+    fn the_registry_unblocks_a_restyle_on_a_real_document() {
+        // The end-to-end shape of #48: build the registry from a document,
+        // then restyle one of its runs to a style the document already
+        // carries. Before the registry existed this failed
+        // `format-style-unavailable` on EVERY call, because `available_styles`
+        // came from a styles.json written with an empty styles object.
+        let package = std::fs::read(fixture("complex.docx")).expect("fixture");
+        let registry = build_style_registry(&package).expect("registry");
+        let styles = registry["styles"].as_object().expect("styles");
+        assert!(
+            styles.len() > 1,
+            "a real document carries several run properties, got {}",
+            styles.len()
+        );
+        let available: BTreeSet<String> = styles.keys().cloned().collect();
+
+        let inventory = enumerate_package_bytes(&package).expect("inventory");
+        let leaf = inventory
+            .leaves
+            .iter()
+            .find(|leaf| !leaf.rpr.is_empty() && leaf.editable)
+            .expect("a formatted editable run");
+        // Derive the id of an EXISTING style, then ask the lane to produce it
+        // from a different base: the lane must find it in the registry.
+        let base = if leaf.rpr.is_empty() {
+            format!(r#"<w:rPr xmlns:w="{WORD_NAMESPACE}"/>"#)
+        } else {
+            leaf.rpr.clone()
+        };
+        let base_id = style_id_for_rpr(&base).expect("base id");
+        assert!(
+            available.contains(&base_id),
+            "the document's own run must be in the registry it produced"
+        );
+        let target =
+            restyle_run_properties(&base, &attributes(&[("italic", json!(true))]), &available);
+        match target {
+            Ok(restyle) => {
+                assert!(
+                    available.contains(&restyle.style_id),
+                    "a derived style must be one the registry holds"
+                );
+            }
+            Err(error) => {
+                // Refusing is correct when the document genuinely has no such
+                // variant -- but it must be THAT refusal, not a registry miss.
+                let text = error.to_string();
+                assert!(
+                    text.starts_with("format-noop") || text.starts_with("format-style-unavailable"),
+                    "unexpected failure: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_registry_matches_the_reference_byte_for_byte() {
+        // styles.json is a canonical asset: its bytes are hashed into the tree
+        // digest, so serialization is part of the contract. Captured from the
+        // reference for corpus/release/styled.docx.
+        let package = std::fs::read(fixture("styled.docx")).expect("fixture");
+        let registry = build_style_registry(&package).expect("registry");
+        let mut text = serde_json::to_string_pretty(&registry).expect("serialize");
+        text.push('\n');
+        let expected = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/styles_styled_expectation.json"),
+        )
+        .expect("expectation");
+        assert_eq!(
+            text, expected,
+            "styles.json must match the reference byte for byte"
         );
     }
 }

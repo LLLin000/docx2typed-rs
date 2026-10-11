@@ -711,7 +711,28 @@ impl StyleRegistry {
 
 /// Extract the semantic allowlist of one `w:rPr` element (mirror of
 /// Python `rpr_features`; `dstrike` added to the boolean set).
-fn rpr_semantics(
+/// Label + features for one rPr FRAGMENT (the text form the registry and the
+/// format lane speak). Wraps [`rpr_semantics`] so there is one implementation
+/// of the semantics rather than two that can drift.
+pub(crate) fn rpr_semantics_for(
+    rpr_xml: &str,
+) -> Result<(String, BTreeMap<String, String>), CoreError> {
+    let text = if rpr_xml.trim().is_empty() {
+        format!(r#"<w:rPr xmlns:w="{}"/>"#, crate::prose::WORD_NAMESPACE)
+    } else {
+        rpr_xml.to_string()
+    };
+    let bytes = text.into_bytes();
+    let nodes = crate::xml_walker::build_tree(&crate::xml_walker::scan_tags(&bytes))?;
+    let root = nodes
+        .iter()
+        .find(|node| node.parent.is_none())
+        .cloned()
+        .ok_or_else(|| CoreError::Domain("invalid-rpr: no root element".to_string()))?;
+    Ok(rpr_semantics(&root, &nodes, &bytes))
+}
+
+pub(crate) fn rpr_semantics(
     node: &ElementNode,
     nodes: &[ElementNode],
     xml: &[u8],
@@ -725,16 +746,14 @@ fn rpr_semantics(
         }
         let attrs = open_tag_attrs(xml, child_node.open_start, child_node.open_end);
         if BOOLEAN_RPR.contains(&name) {
+            // Python's `rpr_features` records a boolean only when it is ON:
+            // an explicitly false property is absent from the feature map, and
+            // the map goes into styles.json, so recording "false" here would
+            // move the file's bytes and with them the tree digest.
             let value = attr_val(&attrs);
-            let enabled = !FALSE_VALUES.contains(&value.to_lowercase().as_str());
-            features.insert(
-                name.to_string(),
-                if enabled {
-                    "true".to_string()
-                } else {
-                    "false".to_string()
-                },
-            );
+            if !FALSE_VALUES.contains(&value.to_lowercase().as_str()) {
+                features.insert(name.to_string(), "true".to_string());
+            }
         } else if name == "rFonts" {
             for (key, value) in attrs {
                 features.insert(format!("font:{key}"), value);
@@ -748,7 +767,7 @@ fn rpr_semantics(
 
 /// Human-readable style label from the allowlist (mirror of Python
 /// `style_label`).
-fn style_label(features: &BTreeMap<String, String>) -> String {
+pub(crate) fn style_label(features: &BTreeMap<String, String>) -> String {
     let mut labels: Vec<String> = Vec::new();
     for (name, word) in [
         ("b", "bold"),

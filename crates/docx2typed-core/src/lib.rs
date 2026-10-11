@@ -216,12 +216,20 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
     );
     let typed_sha256 = bytes_sha256(typed_md.as_bytes());
 
-    let styles_bytes = serde_json::to_vec(&serde_json::json!({
-        "schema": STYLES_SCHEMA,
-        "canonicalizer_version": CANONICALIZER_VERSION,
-        "styles": {},
-    }))
-    .expect("styles serialize");
+    // The registry, built from the document's own runs. This was a hardcoded
+    // empty object (#48), which made the format lane inert: a restyle is
+    // refused unless the style it derives is already registered here.
+    let styles_value =
+        crate::prose::build_style_registry(&std::fs::read(&source_path).map_err(CoreError::io)?)?;
+    // The reference writes every canonical JSON asset as
+    // `json.dumps(..., ensure_ascii=False, indent=2, sort_keys=True) + "\n"`
+    // (typed_docx.json_bytes). These bytes are hashed into the tree digest, so
+    // the serialization is part of the contract, not a formatting preference.
+    let styles_bytes = {
+        let mut text = serde_json::to_string_pretty(&styles_value).expect("styles serialize");
+        text.push('\n');
+        text.into_bytes()
+    };
     let styles_sha256 = bytes_sha256(&styles_bytes);
 
     let document_xml_text = String::from_utf8_lossy(&document_xml);
