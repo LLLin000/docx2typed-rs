@@ -77,12 +77,17 @@ pub const POSITION_CONTRACT: &str = "unicode-scalar-1";
 pub const STYLE_ID_PREFIX: &str = "s_";
 
 /// Boolean run properties of the semantic allowlist (mirror of Python
-/// `_BOOLEAN_RPR`, plus `dstrike` which Python's label table already maps).
-const BOOLEAN_RPR: [&str; 10] = [
+/// `_BOOLEAN_RPR`).
+///
+/// `dstrike` is deliberately NOT here even though `style_label` maps it: the
+/// reference's `_BOOLEAN_RPR` omits it, so a `w:dstrike`-only run has NO
+/// features and labels as "normal". Adding it here moved `styles.json` bytes
+/// on `complex.docx` (features `{"dstrike": "true"}` where the reference has
+/// `{}`), and with them the tree digest.
+const BOOLEAN_RPR: [&str; 9] = [
     "b",
     "i",
     "strike",
-    "dstrike",
     "outline",
     "shadow",
     "smallCaps",
@@ -713,8 +718,6 @@ impl StyleRegistry {
     }
 }
 
-/// Extract the semantic allowlist of one `w:rPr` element (mirror of
-/// Python `rpr_features`; `dstrike` added to the boolean set).
 /// Label + features for one rPr FRAGMENT (the text form the registry and the
 /// format lane speak). Wraps [`rpr_semantics`] so there is one implementation
 /// of the semantics rather than two that can drift.

@@ -2,24 +2,5 @@
   "schema": "docx2typed-parity-matrix-1",
   "reference_commit": "1adcc9403cc830e899efe74c5ec41b11973b8c7c",
   "target_commit": "324cd055096e841fd5c97757def982b91ed93e15",
-  "missing_tools": [
-    {
-      "tool": "history_gc",
-      "python_site": "mcp_server.py:5917",
-      "rust_owner": "store/store.rs",
-      "status": "missing"
-    },
-    {
-      "tool": "history_restore",
-      "python_site": "mcp_server.py:5951",
-      "rust_owner": "store/store.rs",
-      "status": "missing"
-    },
-    {
-      "tool": "workspace_adopt",
-      "python_site": "mcp_server.py:2935",
-      "rust_owner": "identity landed (#19); resolver + tool open",
-      "status": "partial"
-    }
-  ]
+  "missing_tools": []
 }

@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 46] = [
+pub const TOOL_NAMES: [&str; 49] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -78,6 +78,8 @@ pub const TOOL_NAMES: [&str; 46] = [
     "build_docx",
     "verify_output",
     "history_list",
+    "history_gc",
+    "history_restore",
     "document_search",
     "document_read",
     "document_patch",
@@ -87,6 +89,7 @@ pub const TOOL_NAMES: [&str; 46] = [
     "history_verify",
     "workspace_fork",
     "format_span",
+    "workspace_adopt",
 ];
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
@@ -1438,6 +1441,52 @@ impl McpSession {
             }
         }
     }
+    fn history_gc(&self, args: &Value, build_commit: &str) -> Value {
+        let Some(workdir) = self.workdir.as_deref() else {
+            return self.failure(
+                "history_gc",
+                "workdir-not-open",
+                "no workdir open; call workdir_open first",
+                build_commit,
+            );
+        };
+        let keep_last = args.get("keep_last").and_then(Value::as_i64).unwrap_or(50);
+        let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+        let path = Path::new(workdir);
+        match docx2typed_store::versions::history_gc(path, keep_last, dry_run) {
+            Ok(data) => self.success("history_gc", data, build_commit),
+            Err(error) => {
+                let code = error.code().unwrap_or("store-invalid").to_string();
+                self.failure("history_gc", &code, &error.message(), build_commit)
+            }
+        }
+    }
+
+    fn history_restore(&self, args: &Value, build_commit: &str) -> Value {
+        let Some(workdir) = self.workdir.as_deref() else {
+            return self.failure(
+                "history_restore",
+                "workdir-not-open",
+                "no workdir open; call workdir_open first",
+                build_commit,
+            );
+        };
+        let version = args.get("version").and_then(Value::as_str).unwrap_or("");
+        let paragraphs = args.get("paragraphs").and_then(Value::as_array).map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        });
+        let path = Path::new(workdir);
+        match docx2typed_store::versions::history_restore(path, version, paragraphs.as_deref()) {
+            Ok(data) => self.success("history_restore", data, build_commit),
+            Err(error) => {
+                let code = error.code().unwrap_or("store-invalid").to_string();
+                self.failure("history_restore", &code, &error.message(), build_commit)
+            }
+        }
+    }
 
     /// Full-text search over the token-free edit projection. Each match is
     /// the enclosing paragraph block plus its `match_ref`, so the caller can
@@ -1708,6 +1757,31 @@ impl McpSession {
             }),
             build_commit,
         )
+    }
+    fn workspace_adopt(&self, args: &Value, build_commit: &str) -> Value {
+        let Some(workdir) = self.workdir.as_deref() else {
+            return self.failure(
+                "workspace_adopt",
+                "workdir-not-open",
+                "no workdir open; call workdir_open first",
+                build_commit,
+            );
+        };
+        let family_id = args.get("family_id").and_then(Value::as_str).unwrap_or("");
+        let token = args.get("token").and_then(Value::as_str).unwrap_or("");
+        let path = Path::new(workdir);
+        match docx2typed_core::workspace_identity::workspace_adopt(path, family_id, token) {
+            Ok(data) => self.success("workspace_adopt", data, build_commit),
+            Err(error) => {
+                let message = error.to_string();
+                let code = message
+                    .split(':')
+                    .next()
+                    .unwrap_or("workspace-invalid")
+                    .trim();
+                self.failure("workspace_adopt", code, &message, build_commit)
+            }
+        }
     }
 
     /// Apply a batch of edits to the draft in one atomic call.
@@ -2418,6 +2492,18 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
             json.insert_str(0, "OK ");
             json
         }
+        "history_gc" => {
+            let mut json = serde_json::to_string(&session.history_gc(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "history_restore" => {
+            let mut json = serde_json::to_string(&session.history_restore(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
         "document_search" => {
             let mut json = serde_json::to_string(&session.document_search(&args, build_commit))
                 .expect("serializes");
@@ -2462,6 +2548,12 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
         }
         "workspace_fork" => {
             let mut json = serde_json::to_string(&session.workspace_fork(&args, build_commit))
+                .expect("serializes");
+            json.insert_str(0, "OK ");
+            json
+        }
+        "workspace_adopt" => {
+            let mut json = serde_json::to_string(&session.workspace_adopt(&args, build_commit))
                 .expect("serializes");
             json.insert_str(0, "OK ");
             json

@@ -418,6 +418,23 @@
     "type": "object",
     "additionalProperties": false
   },
+  "history_gc": {
+    "additionalProperties": false,
+    "properties": {
+      "dry_run": {
+        "default": true,
+        "title": "Dry Run",
+        "type": "boolean"
+      },
+      "keep_last": {
+        "default": 50,
+        "title": "Keep Last",
+        "type": "integer"
+      }
+    },
+    "title": "history_gcArguments",
+    "type": "object"
+  },
   "history_list": {
     "properties": {
       "limit": {
@@ -433,6 +450,31 @@
     },
     "type": "object",
     "additionalProperties": false
+  },
+  "history_restore": {
+    "additionalProperties": false,
+    "properties": {
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "paragraphs": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Paragraphs",
+        "type": "array"
+      },
+      "version": {
+        "title": "Version",
+        "type": "string"
+      }
+    },
+    "required": [
+      "version"
+    ],
+    "title": "history_restoreArguments",
+    "type": "object"
   },
   "history_verify": {
     "properties": {},
@@ -1068,6 +1110,29 @@
     "properties": {},
     "type": "object",
     "additionalProperties": false
+  },
+  "workspace_adopt": {
+    "additionalProperties": false,
+    "properties": {
+      "family_id": {
+        "title": "Family Id",
+        "type": "string"
+      },
+      "operation_id": {
+        "title": "Operation Id",
+        "type": "string"
+      },
+      "token": {
+        "title": "Token",
+        "type": "string"
+      }
+    },
+    "required": [
+      "family_id",
+      "token"
+    ],
+    "title": "workspace_adoptArguments",
+    "type": "object"
   },
   "workspace_fork": {
     "properties": {

@@ -66,6 +66,12 @@ pub enum TypedNode {
     Text {
         style_id: String,
         text: String,
+        /// Vertical alignment as a dimension of its own, not part of the style
+        /// (`^{…}` / `_{…}` in a schema-2 typed source). `None` means none.
+        ///
+        /// The extractor leaves this `None`; `promote_vertical_alignment` is
+        /// what factors an eligible (vertical, base) style pair into it.
+        vertical: Option<String>,
     },
     /// bookmark/comment anchors: no children, no style.
     Anchor {
@@ -144,10 +150,63 @@ impl TypedNode {
     }
 }
 
+/// Remove every `xmlns:PREFIX="URI"` / `xmlns="URI"` attribute from a fragment.
+///
+/// ElementTree consumes namespace declarations at parse time, so they never
+/// reach the serialised output; `with_namespace` re-emits the ones the subtree
+/// actually uses, hoisted onto the root. Without this, a declaration the source
+/// wrote on a NESTED element stayed put and was duplicated by the hoist.
+fn strip_xmlns_declarations(fragment: &str) -> String {
+    let mut out = String::with_capacity(fragment.len());
+    let mut cursor = 0usize;
+    while let Some(at) = fragment[cursor..].find("xmlns") {
+        let start = cursor + at;
+        // Only an attribute NAME start counts: whitespace before, `:`/`=`
+        // after (so `<w:t>xmlns:x` in text is left alone).
+        let before = fragment[..start].chars().next_back();
+        if !matches!(before, Some(c) if c.is_whitespace()) {
+            out.push_str(&fragment[cursor..start + "xmlns".len()]);
+            cursor = start + "xmlns".len();
+            continue;
+        }
+        let after = &fragment[start + "xmlns".len()..];
+        let Some(eq) = after.find('=') else {
+            out.push_str(&fragment[cursor..]);
+            return out;
+        };
+        if !(after.starts_with(':') || after.starts_with('='))
+            || after[..eq].contains(|c: char| c.is_whitespace())
+        {
+            out.push_str(&fragment[cursor..start + "xmlns".len()]);
+            cursor = start + "xmlns".len();
+            continue;
+        }
+        let rest = &after[eq + 1..];
+        let quote = rest.chars().next().unwrap_or(' ');
+        if quote != '"' && quote != '\'' {
+            out.push_str(&fragment[cursor..start + "xmlns".len()]);
+            cursor = start + "xmlns".len();
+            continue;
+        }
+        let Some(end) = rest[1..].find(quote) else {
+            out.push_str(&fragment[cursor..]);
+            return out;
+        };
+        // Drop the declaration together with the whitespace that separated it.
+        out.push_str(&fragment[cursor..start]);
+        if out.ends_with(char::is_whitespace) {
+            out.pop();
+        }
+        cursor = start + "xmlns".len() + eq + 1 + 1 + end + 1;
+    }
+    out.push_str(&fragment[cursor..]);
+    out
+}
+
 /// The element's opening tag with the namespaces ElementTree would emit.
 ///
-/// `etree_xml` re-serialises through ElementTree, which writes the namespace
-/// declaration onto the element when the fragment is standalone -- measured on
+/// `etree_xml` re-serialises through ElementTree, which writes every namespace
+/// declaration the subtree uses onto the ROOT of the fragment -- measured on
 /// `w:fldSimple`, whose reference `raw` is
 /// `<w:fldSimple xmlns:w="..." w:instr=" PAGE ">`. The source bytes carry the
 /// declaration on the document root instead, so it has to be re-added.
@@ -156,9 +215,18 @@ fn with_namespace(
     namespaces: &BTreeMap<String, String>,
     unknown: &mut BTreeMap<String, String>,
 ) -> String {
-    if tag.contains("xmlns") || !tag.starts_with('<') || tag.starts_with("</") {
+    if !tag.starts_with('<') || tag.starts_with("</") {
         return tag.to_string();
     }
+    // ElementTree consumes namespace declarations at PARSE time, so they never
+    // reach the serialised fragment -- including one the source wrote on a
+    // NESTED element (complex.docx's `<wp:inline xmlns:a=...>`). Leaving them
+    // in place both kept the source prefixes and duplicated the declarations
+    // the hoist below re-emits; the whole-subtree `contains("xmlns")` bail-out
+    // this replaces skipped the hoist entirely, which is why the drawing token
+    // came out as raw source bytes.
+    let stripped = strip_xmlns_declarations(tag);
+    let tag = stripped.as_str();
     let Some(name_end) = tag.find(|c: char| c.is_whitespace() || c == '>' || c == '/') else {
         return tag.to_string();
     };
@@ -185,31 +253,57 @@ fn with_namespace(
             "http://schemas.microsoft.com/office/word/2023/wordml/word16du",
         ),
     ];
-    // Every prefix used ANYWHERE in the subtree, which is what ElementTree
-    // declares and renames -- not just the element's own.
+    // Every prefix used ANYWHERE in the subtree, in ElementTree's order: per
+    // element in document order, its TAG then its ATTRIBUTES. Reading the
+    // attributes of the root alone missed `r:embed` on a nested `<a:blip>`,
+    // and `r` never made it into the declaration list.
     let mut used: Vec<String> = Vec::new();
+    let push = |prefix: &str, used: &mut Vec<String>| {
+        if !used.iter().any(|entry| entry == prefix) {
+            used.push(prefix.to_string());
+        }
+    };
+    let bytes = tag.as_bytes();
     let mut cursor = 0usize;
     while let Some(at) = tag[cursor..].find('<') {
-        let start = cursor + at + 1;
-        let rest = &tag[start..];
-        let skip = usize::from(rest.starts_with('/'));
-        let name: String = rest[skip..]
+        let open = cursor + at;
+        // The end of this tag, skipping quoted attribute values.
+        let mut index = open + 1;
+        let mut quote: Option<u8> = None;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            match quote {
+                Some(open_quote) => {
+                    if byte == open_quote {
+                        quote = None;
+                    }
+                }
+                None => {
+                    if byte == b'"' || byte == b'\'' {
+                        quote = Some(byte);
+                    } else if byte == b'>' {
+                        break;
+                    }
+                }
+            }
+            index += 1;
+        }
+        let end = index.min(bytes.len());
+        let raw = &bytes[open..end];
+        let skip = usize::from(raw.get(1) == Some(&b'/'));
+        let name: String = String::from_utf8_lossy(&raw[1 + skip..])
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == ':' || *c == '_' || *c == '-')
             .collect();
         if let Some((found, _)) = name.split_once(':') {
-            if !used.iter().any(|entry| entry == found) {
-                used.push(found.to_string());
+            push(found, &mut used);
+        }
+        for (key, _) in crate::prose::canonical_attribute_pairs(raw) {
+            if let Some((attribute_prefix, _)) = key.split_once(':') {
+                push(attribute_prefix, &mut used);
             }
         }
-        cursor = start;
-    }
-    for (key, _) in crate::prose::canonical_attribute_pairs(tag.as_bytes()) {
-        if let Some((attribute_prefix, _)) = key.split_once(':') {
-            if !used.iter().any(|entry| entry == attribute_prefix) {
-                used.push(attribute_prefix.to_string());
-            }
-        }
+        cursor = end.max(open + 1);
     }
 
     // Rename every unregistered prefix, in the order ElementTree met them.
@@ -256,10 +350,16 @@ fn with_namespace(
             .map(|(_, l)| l)
             .unwrap_or("")
     );
-    // The renamed namespaces first (ElementTree writes the element's own
-    // first), then the registered ones the subtree uses.
+    // ElementTree writes every declaration on the serialised ROOT, SORTED BY
+    // PREFIX (`_serialize_xml`: `sorted(namespaces.items(), key=lambda x:
+    // x[1])`). Emitting "renames then registered" happened to match the
+    // fixtures whose only registered prefix was `w`; complex.docx needs
+    // ns1/ns2/ns3 before r before w.
+    let mut declarations: Vec<(String, String)> = Vec::new();
     for (_, assigned, uri) in &renames {
-        out.push_str(&format!(" xmlns:{assigned}=\"{uri}\""));
+        if !declarations.iter().any(|(prefix, _)| prefix == assigned) {
+            declarations.push((assigned.clone(), uri.clone()));
+        }
     }
     for (prefix, known_uri) in REGISTERED {
         if !used.iter().any(|entry| entry == prefix) {
@@ -268,11 +368,16 @@ fn with_namespace(
         if let Some(found) = namespaces
             .iter()
             .find(|(_, value)| value.as_str() == known_uri)
-            .map(|(key, _)| key)
+            .map(|(key, _)| key.clone())
         {
-            let _ = prefix;
-            out.push_str(&format!(" xmlns:{found}=\"{known_uri}\""));
+            if !declarations.iter().any(|(prefix, _)| *prefix == found) {
+                declarations.push((found, known_uri.to_string()));
+            }
         }
+    }
+    declarations.sort();
+    for (prefix, uri) in &declarations {
+        out.push_str(&format!(" xmlns:{prefix}=\"{uri}\""));
     }
     // ElementTree closes an empty element as ` />`.
     out.push_str(&body.replace("/>", " />"));
@@ -662,13 +767,19 @@ pub struct ParagraphNodes {
 fn merge_adjacent_text(nodes: Vec<TypedNode>) -> Vec<TypedNode> {
     let mut merged: Vec<TypedNode> = Vec::new();
     for node in nodes {
-        if let TypedNode::Text { style_id, text } = &node {
+        if let TypedNode::Text {
+            style_id,
+            text,
+            vertical,
+        } = &node
+        {
             if let Some(TypedNode::Text {
                 style_id: last_style,
                 text: last_text,
+                vertical: last_vertical,
             }) = merged.last_mut()
             {
-                if last_style == style_id {
+                if last_style == style_id && last_vertical == vertical {
                     last_text.push_str(text);
                     continue;
                 }
@@ -1087,6 +1198,7 @@ impl<'a> Walker<'a> {
                 out.push(TypedNode::Text {
                     style_id: style_id.clone(),
                     text,
+                    vertical: None,
                 });
                 continue;
             }

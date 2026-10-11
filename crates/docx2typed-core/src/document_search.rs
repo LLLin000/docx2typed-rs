@@ -761,7 +761,7 @@ fn escape_prose(text: &str) -> String {
     out
 }
 
-fn escape_vertical_markers(text: &str) -> String {
+pub(crate) fn escape_vertical_markers(text: &str) -> String {
     if !text.contains(['^', '_', '\\']) {
         return text.to_string();
     }
@@ -781,7 +781,7 @@ fn escape_vertical_markers(text: &str) -> String {
     out
 }
 
-fn escape_vertical_tag_body(text: &str) -> String {
+pub(crate) fn escape_vertical_tag_body(text: &str) -> String {
     let mut out = String::new();
     for ch in text.chars() {
         if VERTICAL_ESCAPE_CHARS.contains(&ch) {

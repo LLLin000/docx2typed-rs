@@ -21,7 +21,7 @@
   "surfaces": {
     "mcp_tools": {
       "python": 49,
-      "rust": 46
+      "rust": 49
     },
     "cli_commands": {
       "python": 8,
@@ -29,11 +29,7 @@
     }
   },
   "mcp_gap": {
-    "missing_in_rust": [
-      "history_gc",
-      "history_restore",
-      "workspace_adopt"
-    ],
+    "missing_in_rust": [],
     "only_in_rust": []
   },
   "cli_gap": {
@@ -41,7 +37,7 @@
     "only_in_rust": []
   },
   "evidence_hashes": {
-    "rust_mcp_schemas": "ced9b6880c2e841d0c70a35ab88295562fd246d83d1d326293ea8b3fba93cf74",
-    "rust_core_prose": "6935d660f629e8218e9bfa991e4f68619e7a61541b189d9282119f48ee540a22"
+    "rust_mcp_schemas": "547f983daee48f17eaa2e6a3e72ad509eef65b5e14837063a7d1ca0eb8d44284",
+    "rust_core_prose": "e91fd0287b8741e860553a2b128cf929e242e81e11ee41eac5430ce29875b9d8"
   }
 }

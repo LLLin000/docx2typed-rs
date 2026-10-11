@@ -35,7 +35,38 @@ pub struct Identity {
     pub origin_family: Option<String>,
     #[serde(default)]
     pub origin_version: Option<String>,
+    /// DOCX file instances a human bound to this family. Python records the
+    /// same fact as an `adopted` observation in its resolver cache; Rust has
+    /// no registry, so the evidence lives in the engine-owned file — the
+    /// remaining resolver reads it, and an empty list serializes nothing (a
+    /// Python-written `workspace.json` stays byte-identical on rewrite).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adopted: Vec<Adoption>,
 }
+
+/// One verified adoption: the evidence a lineage question was answered about.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Adoption {
+    /// The opaque proof handle the question was asked with. Redundant with
+    /// the fields below, kept so a caller can quote the exact evidence.
+    #[serde(default)]
+    pub lineage_token: String,
+    pub sha256: String,
+    /// Python's `f"{stat.st_dev:#x}"` (Windows: volume serial number).
+    pub volume: String,
+    /// Python's `f"{stat.st_ino:#x}"` (Windows: file index).
+    pub file_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub adopted_at: String,
+}
+
+/// An unreadable adoption token: not base64url, not JSON, or no `sha256`.
+pub const ADOPTION_TOKEN_INVALID: &str = "adoption-token-invalid";
+/// The file changed while the lineage question was open.
+pub const ADOPTION_TOKEN_STALE: &str = "adoption-token-stale";
+/// The answer names a family this workspace is not.
+pub const ADOPTION_REFUSED: &str = "adoption-refused";
 
 /// Audit-only provenance of a forked workspace (`origin_family` + the
 /// version name it was forked from); never used for resolution.
@@ -143,9 +174,262 @@ pub fn ensure_identity(
         created_at: docx2typed_protocol::utc_now_iso(),
         origin_family: origin.family_id,
         origin_version: origin.version,
+        adopted: Vec::new(),
     };
     write_identity(workdir, &identity)?;
     Ok((read_identity(workdir).unwrap_or(identity), true))
+}
+
+/// The evidence one open lineage question is about: a content hash plus the
+/// local file object, mirroring Python's `adoption_token` payload. Opaque to
+/// the caller — it is minted by the refusal that asked the question and handed
+/// straight back to [`workspace_adopt`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AdoptionToken {
+    pub sha256: String,
+    #[serde(default)]
+    pub volume: Option<String>,
+    #[serde(default)]
+    pub file_id: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Mint the evidence handle for one file instance: content hash + volume/file
+/// id + path, base64url (padded, as `base64.urlsafe_b64encode` writes it).
+pub fn adoption_token(docx: &Path) -> Result<String, CoreError> {
+    let (volume, file_id) = file_identity(docx);
+    let token = AdoptionToken {
+        sha256: docx2typed_protocol::file_sha256(docx).map_err(CoreError::io)?,
+        volume: Some(volume),
+        file_id: Some(file_id),
+        path: Some(docx.to_string_lossy().into_owned()),
+    };
+    let payload =
+        serde_json::to_string(&token).map_err(|error| CoreError::message(error.to_string()))?;
+    Ok(base64url_encode(payload.as_bytes()))
+}
+
+/// Decode an adoption token. Anything unreadable, and anything without a
+/// usable `sha256`, is [`ADOPTION_TOKEN_INVALID`]: a guess here would bind the
+/// wrong document to a family.
+pub fn decode_adoption_token(token: &str) -> Result<AdoptionToken, CoreError> {
+    let invalid = || {
+        CoreError::Domain(format!(
+            "{ADOPTION_TOKEN_INVALID}: the adoption token is not readable"
+        ))
+    };
+    let raw = base64url_decode(token).ok_or_else(invalid)?;
+    let text = String::from_utf8(raw).map_err(|_| invalid())?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| invalid())?;
+    if !value.is_object() {
+        return Err(invalid());
+    }
+    let token: AdoptionToken = serde_json::from_value(value).map_err(|_| invalid())?;
+    if token.sha256.is_empty() {
+        return Err(invalid());
+    }
+    Ok(token)
+}
+
+/// `(volume, file_id)` for one file — stable across rename and in-place saves
+/// on the same volume, and *only* that (a copy is a new object). The same two
+/// figures Python's `file_identity` reports, so a token minted by either
+/// engine verifies in the other; an unreadable path yields `("", "")`.
+pub fn file_identity(path: &Path) -> (String, String) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(metadata) => (
+                format!("{:#x}", metadata.dev()),
+                format!("{:#x}", metadata.ino()),
+            ),
+            Err(_) => (String::new(), String::new()),
+        }
+    }
+    #[cfg(windows)]
+    {
+        windows_file_identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        (String::new(), String::new())
+    }
+}
+
+/// CPython reads the pair from `GetFileInformationByHandleEx(FileIdInfo)`:
+/// `st_dev` is `VolumeSerialNumber` and `st_ino` the low half of `FileId`.
+/// `std`'s `volume_serial_number`/`file_index` are still unstable, so the one
+/// call is made here; a filesystem without file ids yields `("", "")`, the
+/// same shape Python's `OSError` path produces.
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> (String, String) {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileIdInfo {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    }
+    const FILE_ID_INFO_CLASS: i32 = 0x12;
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut core::ffi::c_void,
+            class: i32,
+            info: *mut core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return (String::new(), String::new());
+    };
+    let mut info = MaybeUninit::<FileIdInfo>::uninit();
+    // SAFETY: a live handle borrowed from `file`, and an out buffer of the
+    // size and layout the class requires; the call either fills it or fails.
+    let filled = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_ID_INFO_CLASS,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of::<FileIdInfo>() as u32,
+        )
+    };
+    if filled == 0 {
+        return (String::new(), String::new());
+    }
+    // SAFETY: success means the call initialized the whole buffer.
+    let info = unsafe { info.assume_init() };
+    let index = u64::from_le_bytes(info.file_id[..8].try_into().expect("8 bytes"));
+    (
+        format!("{:#x}", info.volume_serial_number),
+        format!("{index:#x}"),
+    )
+}
+
+/// Bind one DOCX to a family once a human answered the lineage question.
+///
+/// `root` is that family's workdir — the workspace the refusal listed as a
+/// candidate — because the family's own `workspace.json` is the only family
+/// proof this engine owns (Python's resolver cache is the equivalent, and the
+/// remaining Rust resolver reads the `adopted` records written here).
+///
+/// The token pins both the content hash and the local file object, so a file
+/// edited while the question was on screen is refused
+/// ([`ADOPTION_TOKEN_STALE`]) instead of adopted by accident. Repeating the
+/// same confirmation is a no-op: the record is keyed by hash + path.
+pub fn workspace_adopt(
+    root: &Path,
+    family_id: &str,
+    adoption_token: &str,
+) -> Result<serde_json::Value, CoreError> {
+    let token = decode_adoption_token(adoption_token)?;
+    let text = token.path.unwrap_or_default();
+    let path = Path::new(&text);
+    if !path.is_file() {
+        return Err(CoreError::Domain(format!(
+            "{ADOPTION_REFUSED}: file not found: {}",
+            path.display()
+        )));
+    }
+    let sha256 = docx2typed_protocol::file_sha256(path).map_err(CoreError::io)?;
+    let (volume, file_id) = file_identity(path);
+    if token.sha256 != sha256
+        || token.volume.as_deref() != Some(volume.as_str())
+        || token.file_id.as_deref() != Some(file_id.as_str())
+    {
+        return Err(CoreError::Domain(format!(
+            "{ADOPTION_TOKEN_STALE}: the file changed while the question was open; re-run workdir_open on it"
+        )));
+    }
+    let Some(mut identity) = read_identity(root) else {
+        return Err(CoreError::Domain(format!(
+            "{ADOPTION_REFUSED}: no workspace identity at {}; the family's workspace is missing",
+            root.display()
+        )));
+    };
+    if identity.family_id != family_id {
+        return Err(CoreError::Domain(format!(
+            "{ADOPTION_REFUSED}: {} holds family {}, not {family_id}",
+            root.display(),
+            identity.family_id
+        )));
+    }
+    if !identity
+        .adopted
+        .iter()
+        .any(|record| record.sha256 == sha256 && record.path == text)
+    {
+        identity.adopted.push(Adoption {
+            lineage_token: adoption_token.to_string(),
+            sha256: sha256.clone(),
+            volume,
+            file_id,
+            path: text,
+            adopted_at: docx2typed_protocol::utc_now_iso(),
+        });
+        write_identity(root, &identity)?;
+    }
+    Ok(serde_json::json!({
+        "status": "resolved",
+        "reason": "adopted",
+        "family_id": family_id,
+        "workspace_id": identity.workspace_id,
+        "workspace": root.to_string_lossy(),
+        "next": "call workdir_open on that workspace",
+    }))
+}
+
+/// URL-safe base64 with padding (`base64.urlsafe_b64encode`).
+fn base64url_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        let packed = (u32::from(chunk[0]) << 16) | (u32::from(second) << 8) | u32::from(third);
+        for (slot, shift) in [(0usize, 18u32), (1, 12), (2, 6), (3, 0)] {
+            if slot <= chunk.len() {
+                out.push(ALPHABET[((packed >> shift) & 63) as usize] as char);
+            }
+        }
+    }
+    for _ in 0..(3 - bytes.len() % 3) % 3 {
+        out.push('=');
+    }
+    out
+}
+
+/// Inverse of [`base64url_encode`]; padding is optional, as Python re-pads
+/// before decoding.
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut lookup = [255u8; 256];
+    for (index, byte) in ALPHABET.iter().enumerate() {
+        lookup[*byte as usize] = index as u8;
+    }
+    let mut out = Vec::with_capacity(text.len() * 3 / 4 + 3);
+    let mut packed: u32 = 0;
+    let mut bits = 0u32;
+    for byte in text.bytes() {
+        if byte == b'=' {
+            continue;
+        }
+        let value = lookup[byte as usize];
+        if value == 255 {
+            return None;
+        }
+        packed = (packed << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((packed >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -246,6 +530,7 @@ mod tests {
             created_at: docx2typed_protocol::utc_now_iso(),
             origin_family: Some("f_0123456789abcdef0123456789abcdef".to_string()),
             origin_version: Some("V3".to_string()),
+            adopted: Vec::new(),
         };
         let target = write_identity(&scratch.0, &identity).expect("write");
         assert_eq!(target, scratch.0.join(IDENTITY_FILE));
@@ -376,5 +661,163 @@ mod tests {
         write_identity(workdir, &identity).expect("rewrite");
         let text = std::fs::read_to_string(workdir.join(IDENTITY_FILE)).expect("read");
         assert_eq!(text, reference);
+    }
+
+    /// A DOCX stand-in: adoption only ever hashes bytes and stats the file.
+    fn source_file(scratch: &Scratch, name: &str, body: &str) -> PathBuf {
+        let path = scratch.0.join(name);
+        std::fs::write(&path, body).expect("source file");
+        path
+    }
+
+    /// A minted token carries the three facts `workspace_adopt` re-checks, in
+    /// the base64url form Python's `urlsafe_b64decode` accepts.
+    #[test]
+    fn adoption_token_roundtrips_the_evidence() {
+        let scratch = Scratch::new("token");
+        let docx = source_file(&scratch, "a.docx", "bytes");
+        let token = adoption_token(&docx).expect("mint");
+        let (volume, file_id) = file_identity(&docx);
+        #[cfg(unix)]
+        assert!(
+            !volume.is_empty() && !file_id.is_empty(),
+            "{volume} {file_id}"
+        );
+        let decoded = decode_adoption_token(&token).expect("decode");
+        assert_eq!(
+            decoded.sha256,
+            docx2typed_protocol::file_sha256(&docx).unwrap()
+        );
+        assert_eq!(decoded.volume.as_deref(), Some(volume.as_str()));
+        assert_eq!(decoded.file_id.as_deref(), Some(file_id.as_str()));
+        assert_eq!(
+            decoded.path.as_deref(),
+            Some(docx.to_string_lossy().as_ref())
+        );
+        // Padded, URL-safe alphabet: the reference's decoder needs the padding.
+        assert!(token.contains('=') || token.len().is_multiple_of(4), "{token}");
+        assert!(!token.contains('+') && !token.contains('/'), "{token}");
+        // The reference emits its payload base64url-encoded too, so a token
+        // built the Python way decodes here.
+        let python_style = base64url_encode(
+            format!(
+                "{{\"sha256\": {:?}, \"volume\": {:?}, \"file_id\": {:?}, \"path\": {:?}}}",
+                decoded.sha256,
+                decoded.volume.clone().unwrap_or_default(),
+                decoded.file_id.clone().unwrap_or_default(),
+                decoded.path.clone().unwrap_or_default()
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            decode_adoption_token(&python_style).expect("python token"),
+            decoded
+        );
+    }
+
+    #[test]
+    fn adoption_token_rejects_unreadable_payloads() {
+        for token in ["", "!!!!", "bm90IGpzb24=", "eyJ2b2x1bWUiOiIifQ=="] {
+            let error = decode_adoption_token(token).expect_err(token);
+            assert!(
+                matches!(&error, CoreError::Domain(message) if message.starts_with(ADOPTION_TOKEN_INVALID)),
+                "{token}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adopt_binds_the_source_to_the_family() {
+        let scratch = Scratch::new("adopt");
+        let workdir = scratch.typed();
+        let (identity, _) = ensure_identity(workdir, None).expect("ensure");
+        let docx = source_file(&scratch, "a.docx", "the document");
+        let token = adoption_token(&docx).expect("mint");
+
+        let result = workspace_adopt(workdir, &identity.family_id, &token).expect("adopt");
+        assert_eq!(result["status"], "resolved");
+        assert_eq!(result["reason"], "adopted");
+        assert_eq!(result["family_id"], identity.family_id);
+        assert_eq!(result["workspace_id"], identity.workspace_id);
+        assert_eq!(result["workspace"], workdir.to_string_lossy().as_ref());
+
+        // The evidence is durable, and a repeated confirmation does not
+        // duplicate it (`workspace_adopt` is idempotent).
+        let recorded = read_identity(workdir).expect("identity").adopted;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].lineage_token, token);
+        assert_eq!(recorded[0].path, docx.to_string_lossy());
+        assert_eq!(
+            recorded[0].sha256,
+            docx2typed_protocol::file_sha256(&docx).unwrap()
+        );
+        assert_eq!(recorded[0].adopted_at.len(), 25);
+        workspace_adopt(workdir, &identity.family_id, &token).expect("repeat");
+        assert_eq!(read_identity(workdir).expect("identity").adopted.len(), 1);
+    }
+
+    #[test]
+    fn adopt_refuses_a_stale_token_or_a_foreign_family() {
+        let scratch = Scratch::new("stale");
+        let workdir = scratch.typed();
+        let (identity, _) = ensure_identity(workdir, None).expect("ensure");
+        let docx = source_file(&scratch, "a.docx", "the document");
+        let token = adoption_token(&docx).expect("mint");
+
+        // A file rewritten while the question was on screen is refused rather
+        // than adopted by accident, and nothing is recorded.
+        std::fs::write(&docx, "another document entirely").expect("rewrite");
+        let error = workspace_adopt(workdir, &identity.family_id, &token).expect_err("stale");
+        assert!(
+            matches!(&error, CoreError::Domain(message) if message.starts_with(ADOPTION_TOKEN_STALE)),
+            "{error:?}"
+        );
+        assert!(read_identity(workdir).expect("identity").adopted.is_empty());
+
+        // An answer that names a family this workspace is not.
+        let token = adoption_token(&docx).expect("re-mint");
+        let error = workspace_adopt(workdir, "f_0123456789abcdef0123456789abcdef", &token)
+            .expect_err("foreign family");
+        assert!(
+            matches!(&error, CoreError::Domain(message) if message.starts_with(ADOPTION_REFUSED)),
+            "{error:?}"
+        );
+        // A workdir with no identity is not a family at all.
+        let untyped = Scratch::new("adopt-untyped");
+        let error = workspace_adopt(&untyped.0, &identity.family_id, &token).expect_err("untyped");
+        assert!(
+            matches!(&error, CoreError::Domain(message) if message.starts_with(ADOPTION_REFUSED)),
+            "{error:?}"
+        );
+        // An invalid token never reaches the filesystem.
+        let error = workspace_adopt(workdir, &identity.family_id, "nonsense").expect_err("invalid");
+        assert!(
+            matches!(&error, CoreError::Domain(message) if message.starts_with(ADOPTION_TOKEN_INVALID)),
+            "{error:?}"
+        );
+    }
+
+    /// The adoption record survives a rewrite by the Python Reference: its
+    /// readers only require `schema`/`family_id`/`workspace_id`, so an engine
+    /// that never heard of `adopted` still round-trips the file.
+    #[test]
+    fn adopted_records_survive_a_reference_rewrite() {
+        let scratch = Scratch::new("adopted-parity");
+        let workdir = scratch.typed();
+        let (identity, _) = ensure_identity(workdir, None).expect("ensure");
+        let docx = source_file(&scratch, "a.docx", "the document");
+        let token = adoption_token(&docx).expect("mint");
+        workspace_adopt(workdir, &identity.family_id, &token).expect("adopt");
+
+        let text = std::fs::read_to_string(workdir.join(IDENTITY_FILE)).expect("read");
+        assert!(text.contains("\"adopted\": ["), "{text}");
+        assert!(text.contains("\"lineage_token\""), "{text}");
+        // Python's `read_identity` returns the decoded dict and requires only
+        // the three fields, so this file is still an identity to it.
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["schema"], IDENTITY_SCHEMA);
+        assert_eq!(value["family_id"], identity.family_id);
+        assert_eq!(value["workspace_id"], identity.workspace_id);
+        assert_eq!(read_identity(workdir).expect("read-back").adopted.len(), 1);
     }
 }

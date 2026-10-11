@@ -28,7 +28,9 @@ pub mod objects;
 pub mod versions;
 
 pub use objects::{build_tree, canonical_tree_digest, materialize, write_commit};
-pub use versions::{history_blame, history_diff, history_list, history_verify};
+pub use versions::{
+    history_blame, history_diff, history_gc, history_list, history_restore, history_verify,
+};
 
 pub use store::{
     has_store, pending_recovery, read_root, state, MutateRun, PinnedGeneration, RecoverySummary,

@@ -236,7 +236,7 @@ fn temp_path(parent: &Path, name: &str) -> PathBuf {
 
 /// UTC ISO-8601 with seconds precision, mirroring Python
 /// `datetime.now(timezone.utc).isoformat(timespec="seconds")`.
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -660,6 +660,10 @@ pub struct SaveBoundary {
     pub label: Option<String>,
     pub pin: bool,
     pub baseline_epoch: Option<i64>,
+    /// The version this save restored its content from (ADR 0039): history
+    /// never rewinds, so a restore is a NEW version that records where its
+    /// content came from. Only `history_restore` sets it.
+    pub restored_from: Option<String>,
 }
 
 /// Record a Version at a save boundary: objects first, then the pointer.
@@ -718,7 +722,7 @@ pub fn record_version(
             "origin": boundary.origin,
             "label": boundary.label,
             "pin": boundary.pin,
-            "restored_from": Value::Null,
+            "restored_from": boundary.restored_from,
             "created_at": now_iso(),
         }),
     )?;
@@ -1783,6 +1787,7 @@ impl Store {
     ///
     /// `origin` names the operation, which is what the reference records too
     /// (`commit_sync`, `accept all revisions`, a restore).
+    #[allow(clippy::too_many_arguments)]
     fn commit_pointer(
         &self,
         generation: &str,
@@ -1791,14 +1796,21 @@ impl Store {
         gen_dir: Option<&Path>,
         origin: &str,
         save_boundary: bool,
+        boundary: Option<&SaveBoundary>,
     ) -> Result<Option<Value>, StoreError> {
         let version = match gen_dir.filter(|_| save_boundary) {
             Some(gen_dir) => record_version(
                 &self.root,
                 gen_dir,
-                &SaveBoundary {
-                    origin: origin.to_string(),
-                    ..SaveBoundary::default()
+                // An explicit boundary (history_restore) replaces the
+                // operation-derived default, so `restored_from` / `label` /
+                // `baseline_epoch` land in the commit.
+                &match boundary {
+                    Some(boundary) => boundary.clone(),
+                    None => SaveBoundary {
+                        origin: origin.to_string(),
+                        ..SaveBoundary::default()
+                    },
                 },
             )?,
             None => None,
@@ -2514,7 +2526,19 @@ impl Store {
     /// external-published -> pointer CAS -> ledger -> materialize ->
     /// completed journal. Every cut point yields only old/new/needs-recovery.
     /// Returns the committed Result envelope (journal + ledger durable).
-    pub fn mutate(&self, mut request: StoreMutateRequest) -> Result<Value, StoreError> {
+    pub fn mutate(&self, request: StoreMutateRequest) -> Result<Value, StoreError> {
+        self.mutate_with_boundary(request, None)
+    }
+
+    /// Like [`Store::mutate`], but with an explicit save-boundary (origin,
+    /// label, pin, baseline epoch, `restored_from`) instead of the
+    /// operation-derived default. `history_restore` needs it: its version
+    /// records where the content came from (ADR 0039).
+    pub fn mutate_with_boundary(
+        &self,
+        mut request: StoreMutateRequest,
+        boundary: Option<SaveBoundary>,
+    ) -> Result<Value, StoreError> {
         let _guard = self.writer(request.lock_timeout_ms)?;
         self.require_reserve()?;
         let has_pending = self.transactions_dir.is_dir()
@@ -2742,6 +2766,7 @@ impl Store {
                     Some(&gen_dir),
                     &request.operation,
                     request.save_boundary,
+                    boundary.as_ref(),
                 )?;
             }
             pointer_committed.set(request.generation);
@@ -2910,7 +2935,15 @@ impl Store {
                 };
                 // A rollback republishes an existing generation; it is not a
                 // save, so it records no version.
-                let _ = self.commit_pointer(parent, "", &parent_manifest, None, "recovery", false);
+                let _ = self.commit_pointer(
+                    parent,
+                    "",
+                    &parent_manifest,
+                    None,
+                    "recovery",
+                    false,
+                    None,
+                );
             }
         }
         let _ = fs::remove_dir_all(self.generations_dir.join(generation));
