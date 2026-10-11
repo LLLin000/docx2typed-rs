@@ -788,29 +788,48 @@ impl Engine {
             // with verified backup; recovery rolls forward/back).
             return self.build_store_backed(context, &workdir, &plan, &output, &manifest_before);
         }
-        let published = if plan.edits.is_empty() && plan.structure.is_empty() {
-            match self.store.publish_build(&plan.template, &output) {
-                Ok(path) => path,
-                Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
-            }
-        } else {
-            // Issue #58 / PR 3: edited build — apply the recorded leaf
-            // surgery and structural synthesis to the template bytes
-            // (revalidated here; plan_build already gated the whole build)
-            // and publish the result.
-            let bytes = match docx2typed_core::prose::apply_build(
-                &plan.template,
-                &plan.edits,
-                &plan.structure,
-            ) {
-                Ok(bytes) => bytes,
-                Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
+        // A restyle-only build must still go through apply_build: the pristine
+        // copy path would silently drop the formatting. Caught by the build
+        // integration check, not by the unit tests, because the unit tests
+        // call apply_build directly.
+        let published =
+            if plan.edits.is_empty() && plan.structure.is_empty() && plan.rpr_edits.is_empty() {
+                match self.store.publish_build(&plan.template, &output) {
+                    Ok(path) => path,
+                    Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
+                }
+            } else {
+                // Issue #58 / PR 3: edited build — apply the recorded leaf
+                // surgery and structural synthesis to the template bytes
+                // (revalidated here; plan_build already gated the whole build)
+                // and publish the result.
+                let (bytes, stale_restyles) = match docx2typed_core::prose::apply_build(
+                    &plan.template,
+                    &plan.edits,
+                    &plan.structure,
+                    &plan.rpr_edits,
+                    &plan.styles,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
+                };
+                // A restyle whose paragraph a structure edit removed is reported,
+                // never dropped silently (#26's class).
+                if !stale_restyles.is_empty() {
+                    return Ok(OperationOutcome::failure(vec![Diagnostic::new(
+                        "rpr-edit-stale",
+                        format!(
+                            "these paragraphs carry a formatting edit but no longer exist in the \
+                         build: {}; the formatting was NOT applied",
+                            stale_restyles.join(", ")
+                        ),
+                    )]));
+                }
+                match self.store.publish_bytes(&bytes, &output) {
+                    Ok(path) => path,
+                    Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
+                }
             };
-            match self.store.publish_bytes(&bytes, &output) {
-                Ok(path) => path,
-                Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
-            }
-        };
         let output_sha256 = match file_sha256(&published) {
             Ok(hash) => hash,
             Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
@@ -1978,18 +1997,32 @@ impl Engine {
         let template = plan.template.clone();
         let edits = plan.edits.clone();
         let structure = plan.structure.clone();
+        let rpr_edits = plan.rpr_edits.clone();
+        let styles = plan.styles.clone();
         let out = output.to_path_buf();
         let manifest_before = manifest_before.to_string();
         let run = Box::new(move |_target: &Path, tx: &mut Transaction| {
             let staged = tx.staging("out.docx");
-            if edits.is_empty() && structure.is_empty() {
+            if edits.is_empty() && structure.is_empty() && rpr_edits.is_empty() {
                 fs::copy(&template, &staged).map_err(StoreError::Io)?;
             } else {
                 // Issue #58 / PR 3: edited build through the store: apply
                 // the recorded leaf surgery and structural synthesis to the
                 // template bytes (revalidated) and stage the result.
-                let bytes = docx2typed_core::prose::apply_build(&template, &edits, &structure)
-                    .map_err(|error| StoreError::store("workdir-invalid", error.to_string()))?;
+                let (bytes, stale) = docx2typed_core::prose::apply_build(
+                    &template, &edits, &structure, &rpr_edits, &styles,
+                )
+                .map_err(|error| StoreError::store("workdir-invalid", error.to_string()))?;
+                if !stale.is_empty() {
+                    return Err(StoreError::store(
+                        "rpr-edit-stale",
+                        format!(
+                            "these paragraphs carry a formatting edit but no longer exist in the \
+                             build: {}; the formatting was NOT applied",
+                            stale.join(", ")
+                        ),
+                    ));
+                }
                 fs::write(&staged, bytes).map_err(StoreError::Io)?;
             }
             // Flush the staged bytes before publication: the atomic rename

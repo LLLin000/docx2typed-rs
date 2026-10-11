@@ -14,6 +14,7 @@
 //! capability while the store state survives, and redacted logs.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -67,7 +68,7 @@ fn extract(fixture_path: &Path, outdir: &Path) {
 }
 
 /// The frozen MCP tool surface (mirror of `scripts/mcp_server.py`).
-const TOOL_NAMES: [&str; 44] = [
+const TOOL_NAMES: [&str; 45] = [
     "engine_info",
     "workdir_open",
     "workdir_status",
@@ -112,6 +113,7 @@ const TOOL_NAMES: [&str; 44] = [
     "history_blame",
     "history_verify",
     "workspace_fork",
+    "format_span",
 ];
 
 /// Drive one MCP(stdout) session: each stdin line is
@@ -1478,4 +1480,144 @@ fn declared_arguments_still_dispatch() {
             "declared-only call #{index} must not be rejected: {envelope}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// format_span: the run-property lane (#33)
+// ---------------------------------------------------------------------------
+
+/// The tool's refusals, each with the code that names WHICH refusal fired.
+/// Flattening them into one code would hide the difference between "the
+/// document cannot express that" and "you addressed text that is not there".
+#[test]
+fn format_span_refusals_name_themselves() {
+    let workdir = scratch("format-refusals");
+    extract(&fixture("styled"), &workdir);
+    let wd = workdir.to_string_lossy().into_owned();
+    let open = ("workdir_open", json!({ "workdir": wd }));
+
+    let cases: [(&str, Value, &str); 4] = [
+        (
+            "unknown paragraph",
+            json!({"paragraph_id": "P99", "old": "x", "attributes": {"bold": true}, "operation_id": "1"}),
+            "paragraph-not-found",
+        ),
+        (
+            "text not found",
+            json!({"paragraph_id": "P0", "old": "not-in-this-document", "attributes": {"bold": true}, "operation_id": "2"}),
+            "text-not-found",
+        ),
+        (
+            "style the document lacks",
+            json!({"paragraph_id": "P0", "old": "前缀", "attributes": {"italic": true}, "operation_id": "3"}),
+            "format-style-unavailable",
+        ),
+        (
+            "both attributes and style_id",
+            json!({"paragraph_id": "P0", "old": "前缀", "attributes": {"italic": true}, "style_id": "s_x", "operation_id": "4"}),
+            "format-invalid-attribute",
+        ),
+    ];
+    for (label, args, expected) in cases {
+        let (results, _) = mcp(&[open.clone(), ("format_span", args)]);
+        let envelope = envelope(&results[1]);
+        assert_eq!(
+            envelope["outcome"], "failure",
+            "{label} must refuse: {envelope}"
+        );
+        assert_eq!(
+            envelope["diagnostics"][0]["code"], expected,
+            "{label}: wrong code; got {envelope}"
+        );
+    }
+}
+
+/// Tracked formatting is refused loudly rather than silently restyling in
+/// place -- a `track: true` call that produced an invisible change would be
+/// the worst outcome for a reviewer.
+#[test]
+fn format_span_refuses_tracked_mode_loudly() {
+    let workdir = scratch("format-track");
+    extract(&fixture("styled"), &workdir);
+    let wd = workdir.to_string_lossy().into_owned();
+    let (results, _) = mcp(&[
+        ("workdir_open", json!({ "workdir": wd })),
+        (
+            "format_span",
+            json!({"paragraph_id": "P0", "old": "前缀", "attributes": {"bold": true}, "track": true, "operation_id": "1"}),
+        ),
+    ]);
+    let envelope = envelope(&results[1]);
+    assert_eq!(envelope["outcome"], "failure");
+    assert_eq!(
+        envelope["diagnostics"][0]["code"],
+        "format-tracked-unsupported"
+    );
+}
+
+/// The lane works end to end on a real document: address text, restyle it to a
+/// style the document carries, build, and see the properties in the output.
+#[test]
+fn format_span_restyles_a_span_and_the_build_applies_it() {
+    let workdir = scratch("format-happy");
+    extract(&fixture("styled"), &workdir);
+    let wd = workdir.to_string_lossy().into_owned();
+
+    // The document carries a Times New Roman style; restyle P0 to it.
+    let styles: Value = serde_json::from_str(
+        &fs::read_to_string(workdir.join("styles.json")).expect("styles.json"),
+    )
+    .expect("styles json");
+    let target = styles["styles"]
+        .as_object()
+        .expect("styles")
+        .iter()
+        .find(|(_, entry)| entry["label"] == "Times New Roman")
+        .map(|(id, _)| id.clone())
+        .expect("a Times New Roman style");
+
+    let (results, _) = mcp(&[
+        ("workdir_open", json!({ "workdir": wd })),
+        (
+            "format_span",
+            json!({"paragraph_id": "P0", "old": "前缀", "style_id": target, "operation_id": "1"}),
+        ),
+        (
+            "build_docx",
+            json!({ "output": workdir.join("out.docx").to_string_lossy(), "operation_id": "2" }),
+        ),
+    ]);
+    assert_eq!(
+        envelope(&results[1])["outcome"],
+        "success",
+        "{}",
+        results[1]
+    );
+    assert_eq!(
+        envelope(&results[2])["outcome"],
+        "success",
+        "{}",
+        results[2]
+    );
+
+    // The record is on disk and the built document carries the properties.
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(workdir.join("rpr_edits.json")).expect("rpr_edits.json"),
+    )
+    .expect("record json");
+    assert_eq!(record["edits"][0]["paragraph_id"], "P0");
+    assert_eq!(record["edits"][0]["style_id"], target);
+
+    let bytes = fs::read(workdir.join("out.docx")).expect("built docx");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+    let mut xml = String::new();
+    std::io::Read::read_to_string(
+        &mut archive.by_name("word/document.xml").expect("document.xml"),
+        &mut xml,
+    )
+    .expect("read");
+    assert!(
+        xml.contains("Times New Roman"),
+        "the built document must carry the restyled properties"
+    );
 }
