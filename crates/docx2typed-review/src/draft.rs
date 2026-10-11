@@ -2421,3 +2421,49 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod visible_text_tests {
+    use super::typed_body_visible_text;
+
+    #[test]
+    fn the_vertical_markers_are_markup_and_their_text_is_text() {
+        // The shape typed.md actually writes, measured on complex.docx's P3.
+        assert_eq!(
+            typed_body_visible_text("highlight^{ superscript²}_{ subscript₂} code"),
+            "highlight superscript² subscript₂ code"
+        );
+    }
+
+    #[test]
+    fn spans_and_anchors_reduce_the_way_visible_text_does() {
+        assert_eq!(
+            typed_body_visible_text("<span data-s=\"s_x\">bold</span> plain"),
+            "bold plain"
+        );
+        assert_eq!(
+            typed_body_visible_text("<docx-anchor id=\"N0\" kind=\"bookmark-start\"/>x"),
+            "x"
+        );
+        assert_eq!(
+            typed_body_visible_text(
+                "<docx-opaque id=\"N1\" kind=\"unsupported-run\" tag=\"w:drawing\"/>y"
+            ),
+            "[opaque:unsupported-run]y"
+        );
+    }
+
+    #[test]
+    fn a_deletion_revision_hides_its_text_and_an_insertion_shows_it() {
+        assert_eq!(
+            typed_body_visible_text(
+                "<docx-revision id=\"N0\" kind=\"delete\">gone</docx-revision>kept"
+            ),
+            "kept"
+        );
+        assert_eq!(
+            typed_body_visible_text("<docx-revision id=\"N1\" kind=\"insert\">new</docx-revision>"),
+            "new"
+        );
+    }
+}
