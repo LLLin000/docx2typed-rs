@@ -151,25 +151,23 @@ impl TypedNode {
 /// `w:fldSimple`, whose reference `raw` is
 /// `<w:fldSimple xmlns:w="..." w:instr=" PAGE ">`. The source bytes carry the
 /// declaration on the document root instead, so it has to be re-added.
-fn with_namespace(tag: &str, namespaces: &BTreeMap<String, String>) -> String {
+fn with_namespace(
+    tag: &str,
+    namespaces: &BTreeMap<String, String>,
+    unknown: &mut BTreeMap<String, String>,
+) -> String {
     if tag.contains("xmlns") || !tag.starts_with('<') || tag.starts_with("</") {
         return tag.to_string();
     }
     let Some(name_end) = tag.find(|c: char| c.is_whitespace() || c == '>' || c == '/') else {
         return tag.to_string();
     };
-    let name = &tag[1..name_end];
-    let Some((prefix, local)) = name.split_once(':') else {
+    let Some((own_prefix, _)) = tag[1..name_end].split_once(':') else {
         return tag.to_string();
     };
-    let Some(uri) = namespaces.get(prefix) else {
-        return tag.to_string();
-    };
-    // ElementTree keeps the five REGISTERED prefixes and renames anything else
-    // to `ns0`, `ns1`, ... in order of use -- measured on `m:oMath`, whose
-    // reference raw is `<ns0:oMath xmlns:ns0=".../math" xmlns:w="...">`. It
-    // also emits every declaration in scope, not just the one it renamed.
-    let registered = [
+
+    // Which prefix maps to which URI, and which of those ElementTree knows.
+    const REGISTERED: [(&str, &str); 4] = [
         (
             "w",
             "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
@@ -187,30 +185,9 @@ fn with_namespace(tag: &str, namespaces: &BTreeMap<String, String>) -> String {
             "http://schemas.microsoft.com/office/word/2023/wordml/word16du",
         ),
     ];
-    let known = registered
-        .iter()
-        .any(|(_, known_uri)| *known_uri == uri.as_str());
-    let mut out = String::new();
-    if known {
-        out.push_str(&format!("<{name}"));
-    } else {
-        out.push_str(&format!("<ns0:{local}"));
-    }
-    // Only the namespaces this element actually USES: ElementTree emits a
-    // declaration per prefix that appears in the serialised subtree, so a
-    // `w:fldSimple` gets `xmlns:w` alone even though the document also
-    // declares `r`. Measured: emitting every in-scope declaration added an
-    // `xmlns:r` the reference does not have.
-    // When the prefix is unregistered it is RENAMED to ns0, so its original
-    // declaration must not appear -- the reference declares ns0 and w only.
-    // Every prefix used ANYWHERE in the element, children included: ElementTree
-    // declares per prefix that appears in the serialised subtree, and a
-    // `ns0:oMath` holding `<w:ins>` needs both.
-    let mut used: Vec<String> = if known {
-        vec![prefix.to_string()]
-    } else {
-        Vec::new()
-    };
+    // Every prefix used ANYWHERE in the subtree, which is what ElementTree
+    // declares and renames -- not just the element's own.
+    let mut used: Vec<String> = Vec::new();
     let mut cursor = 0usize;
     while let Some(at) = tag[cursor..].find('<') {
         let start = cursor + at + 1;
@@ -221,11 +198,7 @@ fn with_namespace(tag: &str, namespaces: &BTreeMap<String, String>) -> String {
             .take_while(|c| c.is_alphanumeric() || *c == ':' || *c == '_' || *c == '-')
             .collect();
         if let Some((found, _)) = name.split_once(':') {
-            // The element's OWN prefix is skipped when it is being renamed:
-            // the output says `ns0:oMath`, so declaring `xmlns:m` as well
-            // would be a declaration the reference does not have.
-            let is_own_prefix = found == prefix && !known;
-            if !is_own_prefix && !used.iter().any(|entry| entry == found) {
+            if !used.iter().any(|entry| entry == found) {
                 used.push(found.to_string());
             }
         }
@@ -238,30 +211,68 @@ fn with_namespace(tag: &str, namespaces: &BTreeMap<String, String>) -> String {
             }
         }
     }
-    // The RENAMED namespace is declared FIRST -- ElementTree writes the
-    // element's own namespace before the others it finds in use.
-    if !known {
-        out.push_str(&format!(" xmlns:ns0=\"{uri}\""));
-    }
-    let mut declared: Vec<String> = Vec::new();
-    for used_prefix in used {
-        if declared.iter().any(|entry| entry == &used_prefix) || used_prefix == "ns0" {
-            continue;
-        }
-        let Some(used_uri) = namespaces.get(&used_prefix) else {
+
+    // Rename every unregistered prefix, in the order ElementTree met them.
+    let mut renames: Vec<(String, String, String)> = Vec::new();
+    for prefix in &used {
+        let Some(uri) = namespaces.get(prefix) else {
             continue;
         };
-        declared.push(used_prefix.clone());
-        out.push_str(&format!(" xmlns:{used_prefix}=\"{used_uri}\""));
+        if REGISTERED.iter().any(|(_, known_uri)| known_uri == uri) {
+            continue;
+        }
+        let assigned = match unknown.get(uri) {
+            Some(existing) => existing.clone(),
+            None => {
+                let next = format!("ns{}", unknown.len());
+                unknown.insert(uri.clone(), next.clone());
+                next
+            }
+        };
+        renames.push((prefix.clone(), assigned, uri.clone()));
     }
-    // ElementTree closes an empty element as ` />`; the source writes `/>`.
-    let mut tail = tag[name_end..].to_string();
-    tail = tail.replace("/>", " />");
-    out.push_str(&tail);
-    // The CLOSING tag is renamed too: a raw of `<ns0:oMath>...</m:oMath>` is
-    // not well-formed, and ElementTree renames both ends.
-    if !known {
-        out = out.replace(&format!("</{prefix}:{local}>"), &format!("</ns0:{local}>"));
+
+    let mut body = tag[name_end..].to_string();
+    for (prefix, assigned, _) in &renames {
+        body = body.replace(&format!("{prefix}:"), &format!("{assigned}:"));
+    }
+    let renamed_own = renames
+        .iter()
+        .find(|(prefix, _, _)| prefix == own_prefix)
+        .map(|(_, assigned, _)| assigned.clone())
+        .unwrap_or_else(|| own_prefix.to_string());
+
+    let mut out = format!(
+        "<{renamed_own}:{local}",
+        local = tag[1..name_end]
+            .split_once(':')
+            .map(|(_, l)| l)
+            .unwrap_or("")
+    );
+    // The renamed namespaces first (ElementTree writes the element's own
+    // first), then the registered ones the subtree uses.
+    for (_, assigned, uri) in &renames {
+        out.push_str(&format!(" xmlns:{assigned}=\"{uri}\""));
+    }
+    for (prefix, known_uri) in REGISTERED {
+        if !used.iter().any(|entry| entry == prefix) {
+            continue;
+        }
+        if let Some(found) = namespaces
+            .iter()
+            .find(|(_, value)| value.as_str() == known_uri)
+            .map(|(key, _)| key)
+        {
+            let _ = prefix;
+            out.push_str(&format!(" xmlns:{found}=\"{known_uri}\""));
+        }
+    }
+    // ElementTree closes an empty element as ` />`.
+    out.push_str(&body.replace("/>", " />"));
+    if !body.ends_with("/>") {
+        for (prefix, assigned, _) in &renames {
+            out = out.replace(&format!("</{prefix}:"), &format!("</{assigned}:"));
+        }
     }
     out
 }
@@ -274,13 +285,15 @@ fn with_namespace(tag: &str, namespaces: &BTreeMap<String, String>) -> String {
 /// they look like indices.
 pub fn part_entry_id(part: &str, paragraph_start: usize, xml: &[u8]) -> String {
     let key = typed_part_key(part);
-    if key != "footnotes" && key != "endnotes" {
+    if key != "footnotes" && key != "endnotes" && key != "comments" {
         return String::new();
     }
     let head = String::from_utf8_lossy(&xml[..paragraph_start.min(xml.len())]);
-    // The LAST opening note tag before the paragraph is the one containing it.
+    // The LAST opening entry tag before the paragraph is the one containing it.
+    // Comments count too: `locate_part_xml` treats `comment` alongside
+    // `footnote`/`endnote`, and anchors.docx's comments.P0 records "0".
     let mut best: Option<(usize, String)> = None;
-    for marker in ["<w:footnote ", "<w:endnote "] {
+    for marker in ["<w:footnote ", "<w:endnote ", "<w:comment "] {
         let Some(at) = head.rfind(marker) else {
             continue;
         };
@@ -578,6 +591,10 @@ struct Walker<'a> {
     bytes: &'a [u8],
     nodes: &'a [ElementNode],
     namespaces: BTreeMap<String, String>,
+    /// ElementTree's `ns0`, `ns1`, ... numbering is PER PARSE, not per
+    /// serialisation: `vml` becomes `ns1` in boxes.docx while math becomes
+    /// `ns0` in revisions.docx. The counter therefore lives with the walk.
+    unknown_prefixes: &'a mut BTreeMap<String, String>,
     part: String,
     paragraph_id: String,
     tokens: &'a mut Vec<TokenRecord>,
@@ -589,6 +606,7 @@ impl<'a> Walker<'a> {
         let raw = with_namespace(
             &String::from_utf8_lossy(&self.bytes[node.open_start..node.end]),
             &self.namespaces,
+            self.unknown_prefixes,
         );
         // `open`/`close` are built by `element_start_xml`/`element_end_xml` from
         // the tag and its ATTRIBUTES, so they carry no namespace declaration --
@@ -991,6 +1009,7 @@ impl<'a> Walker<'a> {
 pub fn token_table(package: &[u8]) -> Result<Vec<TokenRecord>, CoreError> {
     let part_xml = crate::document_projection::part_xml_members(package)?;
     let mut tokens: Vec<TokenRecord> = Vec::new();
+    let mut unknown_prefixes: BTreeMap<String, String> = BTreeMap::new();
 
     // Rule 1: the BODY first, whatever order typed.md lists paragraphs in.
     let mut order: Vec<String> = vec!["document".to_string()];
@@ -1032,6 +1051,7 @@ pub fn token_table(package: &[u8]) -> Result<Vec<TokenRecord>, CoreError> {
             bytes: xml,
             nodes: &nodes,
             namespaces,
+            unknown_prefixes: &mut unknown_prefixes,
             part: part_key.clone(),
             paragraph_id: String::new(),
             tokens: &mut tokens,
@@ -1063,6 +1083,7 @@ pub fn paragraph_nodes(package: &[u8]) -> Result<Vec<ParagraphNodes>, CoreError>
     let part_xml = crate::document_projection::part_xml_members(package)?;
     let mut out: Vec<ParagraphNodes> = Vec::new();
     let mut counter: Vec<TokenRecord> = Vec::new();
+    let mut unknown_prefixes: BTreeMap<String, String> = BTreeMap::new();
 
     let mut order: Vec<String> = vec!["document".to_string()];
     let mut others: Vec<String> = part_xml
@@ -1099,6 +1120,7 @@ pub fn paragraph_nodes(package: &[u8]) -> Result<Vec<ParagraphNodes>, CoreError>
             bytes: xml,
             nodes: &nodes,
             namespaces,
+            unknown_prefixes: &mut unknown_prefixes,
             part: part_key.clone(),
             paragraph_id: String::new(),
             tokens: &mut counter,
