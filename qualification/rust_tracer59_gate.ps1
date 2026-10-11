@@ -107,13 +107,6 @@ function New-OpId {
     return ([guid]::NewGuid().ToString("N"))
 }
 
-function Invoke-Oracle([string]$kind, [string]$path, [string]$extra = "") {
-    $argsList = @($oracle, $kind, $path)
-    if ($extra) { $argsList += $extra }
-    $result = Invoke-Python $argsList
-    if ($result.rc -ne 0) { throw "oracle failed: $kind $path $($result.stderr)" }
-    return ($result.stdout.Trim())
-}
 
 function Get-CommentElement([string]$path, [string]$id) {
     $stream = [System.IO.File]::OpenRead($path)
