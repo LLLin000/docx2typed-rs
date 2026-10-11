@@ -169,6 +169,70 @@ fn merge_adjacent_text(nodes: Vec<TypedNode>) -> Vec<TypedNode> {
     merged
 }
 
+/// Python's `qname`: a known namespace becomes its prefix, an unknown one
+/// becomes `{uri}local`.
+///
+/// The literal prefix is NOT the answer: `m:oMath` is declared
+/// `xmlns:m=".../officeDocument/2006/math"`, which is not one of the five
+/// namespaces `qname` knows, so the reference records
+/// `{http://schemas.openxmlformats.org/officeDocument/2006/math}oMath`. Using
+/// the literal prefix matched everything `w:`-prefixed and nothing else.
+fn qname(literal: &str, namespaces: &BTreeMap<String, String>) -> String {
+    let Some((prefix, local)) = literal.split_once(':') else {
+        return literal.to_string();
+    };
+    match namespaces.get(prefix).map(String::as_str) {
+        Some("http://schemas.openxmlformats.org/wordprocessingml/2006/main") => {
+            format!("w:{local}")
+        }
+        Some("http://schemas.openxmlformats.org/officeDocument/2006/relationships") => {
+            format!("r:{local}")
+        }
+        Some("http://schemas.microsoft.com/office/word/2012/wordml") => format!("w15:{local}"),
+        Some("http://www.w3.org/XML/1998/namespace") => format!("xml:{local}"),
+        Some("http://schemas.microsoft.com/office/word/2023/wordml/word16du") => {
+            format!("w16du:{local}")
+        }
+        Some(uri) => format!("{{{uri}}}{local}"),
+        None => literal.to_string(),
+    }
+}
+
+/// Every `xmlns:PREFIX="URI"` declared anywhere in a part.
+///
+/// NOT just the root: `m:oMath` declares its namespace on the math element
+/// itself, so a root-only map left it unresolved and the reference's
+/// `{uri}oMath` came out as the literal `m:oMath`. Prefixes are unique within
+/// a part in practice, so merging every declaration is both simpler and
+/// correct for the case that mattered.
+fn part_namespaces(bytes: &[u8], _nodes: &[ElementNode]) -> BTreeMap<String, String> {
+    // A direct scan, because `canonical_attribute_pairs` deliberately SKIPS
+    // xmlns declarations (ElementTree consumes them, so the canonical form
+    // never sees them) -- reading them through it found nothing at all.
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = BTreeMap::new();
+    let mut cursor = 0usize;
+    while let Some(at) = text[cursor..].find("xmlns:") {
+        let start = cursor + at + "xmlns:".len();
+        let Some(eq) = text[start..].find('=') else {
+            break;
+        };
+        let prefix = text[start..start + eq].trim().to_string();
+        let rest = &text[start + eq + 1..];
+        let quote = rest.chars().next().unwrap_or('"');
+        if quote == '"' || quote == '\'' {
+            if let Some(end) = rest[1..].find(quote) {
+                let uri = rest[1..1 + end].to_string();
+                if !prefix.is_empty() && !prefix.contains([' ', '\t', '\n', '\r']) {
+                    out.entry(prefix).or_insert(uri);
+                }
+            }
+        }
+        cursor = start + eq + 1;
+    }
+    out
+}
+
 /// `known_inline`: run children that are inlines rather than opaque interiors.
 const KNOWN_INLINE: [&str; 14] = [
     "t",
@@ -213,6 +277,7 @@ fn revision_kind(name: &str) -> Option<&'static str> {
 struct Walker<'a> {
     bytes: &'a [u8],
     nodes: &'a [ElementNode],
+    namespaces: BTreeMap<String, String>,
     part: String,
     paragraph_id: String,
     tokens: &'a mut Vec<TokenRecord>,
@@ -248,12 +313,14 @@ impl<'a> Walker<'a> {
         {
             end += 1;
         }
-        let name = String::from_utf8_lossy(&raw[1..end]).into_owned();
+        let literal = String::from_utf8_lossy(&raw[1..end]).into_owned();
+        let name = qname(&literal, &self.namespaces);
         let mut attrs = BTreeMap::new();
         for (key, value) in
             crate::prose::canonical_attribute_pairs(&self.bytes[node.open_start..node.end])
         {
-            attrs.insert(key, value);
+            // Attribute names go through `qname` too, so `w:val` stays `w:val`.
+            attrs.insert(qname(&key, &self.namespaces), value);
         }
         (name, attrs)
     }
@@ -605,9 +672,11 @@ pub fn token_table(package: &[u8]) -> Result<Vec<TokenRecord>, CoreError> {
         };
         // A fresh walker per part: the node arena is rebuilt each iteration,
         // and the counter lives in `tokens`, which outlives all of them.
+        let namespaces = part_namespaces(xml, &nodes);
         let mut walker = Walker {
             bytes: xml,
             nodes: &nodes,
+            namespaces,
             part: part_key.clone(),
             paragraph_id: String::new(),
             tokens: &mut tokens,
@@ -670,9 +739,11 @@ pub fn paragraph_nodes(package: &[u8]) -> Result<Vec<ParagraphNodes>, CoreError>
         } else {
             scan_part(xml, &part_key)?
         };
+        let namespaces = part_namespaces(xml, &nodes);
         let mut walker = Walker {
             bytes: xml,
             nodes: &nodes,
+            namespaces,
             part: part_key.clone(),
             paragraph_id: String::new(),
             tokens: &mut counter,

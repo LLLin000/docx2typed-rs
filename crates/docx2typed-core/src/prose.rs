@@ -1879,84 +1879,221 @@ fn attr_value(text: &str) -> String {
 /// only when its style differs from the paragraph's base style.
 ///
 /// Mirrors `_node_to_markup` for the text case, which is the whole of it until
-/// revisions and anchors are carried too.
-fn paragraph_markup(segments: &[Segment], base_style: &str) -> String {
-    // `merge_adjacent_text`: same style merges, so a run split by the scanner
-    // does not become two spans.
-    let mut merged: Vec<(&str, &str)> = Vec::new();
-    for segment in segments {
-        if segment.text.is_empty() {
-            continue;
-        }
-        match merged.last_mut() {
-            Some((style, text)) if *style == segment.style_id => {
-                let mut combined = text.to_string();
-                combined.push_str(&segment.text);
-                *text = Box::leak(combined.into_boxed_str());
-            }
-            _ => merged.push((segment.style_id.as_str(), segment.text.as_str())),
-        }
-    }
-    let mut out = String::new();
-    for (style_id, text) in merged {
-        let escaped = xml_escape_text(text);
-        if style_id == base_style {
-            out.push_str(&escaped);
-        } else {
-            out.push_str(&format!(
-                "<span data-s={}>{}</span>",
-                attr_value(style_id),
-                escaped
-            ));
-        }
-    }
-    out
+/// `_attrs_text`: the named keys first, in the given order, then the rest
+/// sorted -- which is what makes `<docx-anchor id kind w:id w:name/>` come out
+/// in the reference's order rather than the document's.
+fn attrs_text(attrs: &BTreeMap<String, String>, first: &[&str]) -> String {
+    let mut keys: Vec<&String> = first
+        .iter()
+        .filter_map(|key| attrs.get_key_value(*key).map(|(k, _)| k))
+        .collect();
+    let mut rest: Vec<&String> = attrs
+        .keys()
+        .filter(|key| !first.contains(&key.as_str()))
+        .collect();
+    rest.sort();
+    keys.extend(rest);
+    keys.iter()
+        .map(|key| format!("{key}={}", attr_value(&attrs[*key])))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// Serialize the typed projection exactly as the reference does.
+/// `_node_to_markup`, over the tree.
 ///
-/// Rust wrote a header-only file (#52), so the tree digest could never match:
-/// this is the whole document, which is what `styles.json` is keyed against and
-/// what a version's tree is computed over.
+/// The tree is what makes this correct: a `<docx-range>` must sit where its
+/// children sit and must hold them. A flat list put the range AFTER its own
+/// text and left it empty -- measured against the reference before the tree
+/// existed.
+fn node_markup(node: &crate::token_table::TypedNode, base_style: &str) -> String {
+    use crate::token_table::TypedNode;
+    let head = |token_id: &str, kind: &str, attrs: &BTreeMap<String, String>| {
+        let mut all = attrs.clone();
+        all.insert("id".to_string(), token_id.to_string());
+        all.insert("kind".to_string(), kind.to_string());
+        attrs_text(&all, &["id", "kind"])
+    };
+    match node {
+        TypedNode::Text { style_id, text } => {
+            let escaped = xml_escape_text(text);
+            if style_id == base_style {
+                escaped
+            } else {
+                format!("<span data-s={}>{escaped}</span>", attr_value(style_id))
+            }
+        }
+        TypedNode::Anchor {
+            token_id,
+            kind,
+            attrs,
+        } => {
+            format!("<docx-anchor {}/>", head(token_id, kind, attrs))
+        }
+        TypedNode::Inline {
+            token_id,
+            kind,
+            style_id,
+            attrs,
+        } => {
+            let mut all = attrs.clone();
+            all.insert("style".to_string(), style_id.clone());
+            format!("<docx-inline {}/>", head(token_id, kind, &all))
+        }
+        TypedNode::Opaque {
+            token_id,
+            kind,
+            attrs,
+        } => {
+            format!("<docx-opaque {}/>", head(token_id, kind, attrs))
+        }
+        TypedNode::Range {
+            token_id,
+            kind,
+            attrs,
+            children,
+        } => {
+            let inner: String = children
+                .iter()
+                .map(|c| node_markup(c, base_style))
+                .collect();
+            format!(
+                "<docx-range {}>{inner}</docx-range>",
+                head(token_id, kind, attrs)
+            )
+        }
+        TypedNode::Revision {
+            token_id,
+            kind,
+            attrs,
+            children,
+        } => {
+            let inner: String = children
+                .iter()
+                .map(|c| node_markup(c, base_style))
+                .collect();
+            format!(
+                "<docx-revision {}>{inner}</docx-revision>",
+                head(token_id, kind, attrs)
+            )
+        }
+    }
+}
+
+/// The body of one paragraph, from its node tree.
+fn paragraph_markup(nodes: &[crate::token_table::TypedNode], base_style: &str) -> String {
+    nodes
+        .iter()
+        .map(|node| node_markup(node, base_style))
+        .collect()
+}
+
 pub fn serialize_typed(
     source_name: &str,
     projection: &crate::document_projection::DocumentProjection,
+    trees: &[crate::token_table::ParagraphNodes],
 ) -> String {
     let header = format!(
         "<!--@typed schema=\"2\" format=\"format.json\" styles=\"styles.json\" template=\"_template.docx\" source={}-->",
         attr_value(source_name)
     );
     let mut blocks = vec![header];
-    // The walk starts at the BODY's key, which is the empty string: the
-    // reference initialises `current_part = ""`, so the first body paragraph
-    // emits no marker and a header only does.
     let mut current_part = Some(String::new());
-    // The body's part key is the empty string in this format; the projection
-    // names it "document". Mapping rather than renaming, because the island and
-    // format lanes address "document" and this is a serialization concern.
+    // The body's first paragraph falls back to Normal; a PART paragraph falls
+    // back to "", which is what the reference records -- measured on
+    // `comments.P0` and `header1.P0`, whose base is `""`.
     let mut fallback = crate::document_projection::default_style_id();
-    for paragraph in &projection.paragraphs {
-        let part = if paragraph.part == "document" {
-            String::new()
+    // The TREES are the typed document, not the projection's paragraphs: the
+    // projection deliberately excludes the comments part, and the reference
+    // lists it last. Walking the trees also keeps the markup and the token ids
+    // on one traversal.
+    let _ = projection;
+    // typed.md lists paragraphs in DOCUMENT order -- headers, body, footers,
+    // notes, comments -- while the trees are in TOKEN order, which is the
+    // parse order (body first, rule 1). Reordering here is what keeps the two
+    // orders straight: the ids stay the parse order's, the file follows the
+    // document's.
+    let mut ordered: Vec<&crate::token_table::ParagraphNodes> = trees.iter().collect();
+    ordered.sort_by_key(|tree| {
+        let key = crate::token_table::typed_part_key(&tree.part);
+        let rank = if key.starts_with("header") {
+            0
+        } else if key.is_empty() {
+            1
+        } else if key.starts_with("footer") {
+            2
+        } else if key == "footnotes" || key == "endnotes" {
+            3
         } else {
-            paragraph.part.clone()
+            4
         };
+        // Part rank ONLY, then the part key. The within-part order is the
+        // document's and `sort_by_key` is stable, so it survives. Adding the
+        // paragraph id here sorted them LEXICOGRAPHICALLY -- P10 before P2,
+        // T0.R0.C0.P0 after P1 -- and broke three documents that had matched.
+        (rank, key.clone())
+    });
+    for tree in ordered {
+        let part = crate::token_table::typed_part_key(&tree.part);
         if current_part.as_deref() != Some(part.as_str()) {
             blocks.push(format!("<!--@part key={}-->", attr_value(&part)));
             current_part = Some(part);
         }
-        let base_style = choose_base_style(&paragraph.segments, &fallback);
-        fallback = base_style.clone();
-        let body = paragraph_markup(&paragraph.segments, &base_style);
+        // The base style is the one covering the most characters in this
+        // paragraph's TEXT nodes; a paragraph with none keeps the fallback.
+        let segments: Vec<Segment> = tree
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                crate::token_table::TypedNode::Text { style_id, text } => Some(Segment {
+                    start: 0,
+                    end: text.chars().count(),
+                    text: text.clone(),
+                    style_id: style_id.clone(),
+                    revision: None,
+                    comment_ids: Vec::new(),
+                    editable: true,
+                    visibility: crate::document_projection::Visibility {
+                        original: true,
+                        tracked: true,
+                        final_view: true,
+                    },
+                }),
+                _ => None,
+            })
+            .collect();
+        // The reference assigns `base_style` ONLY in the body's walk
+        // (`parse_document_xml`); `parse_part_xml` calls `_parse_paragraph`
+        // without it, so a header/footer/note/comment paragraph keeps the
+        // dataclass default of "". Measured on `header1.P0` and `comments.P0`,
+        // whose base is "" despite carrying text.
+        let is_body = crate::token_table::typed_part_key(&tree.part).is_empty();
+        let base_style = if is_body {
+            let chosen = choose_base_style(&segments, &fallback);
+            fallback = chosen.clone();
+            chosen
+        } else {
+            String::new()
+        };
+        let body = paragraph_markup(&tree.nodes, &base_style);
         let marker = format!(
             "<!--@p id={} base={}-->",
-            attr_value(&paragraph.paragraph_id),
+            attr_value(&tree.paragraph_id),
             attr_value(&base_style)
         );
+        let mark = tree
+            .mark
+            .as_ref()
+            .map(|(kind, token_id, attrs)| {
+                let mut all = attrs.clone();
+                all.insert("kind".to_string(), kind.clone());
+                all.insert("id".to_string(), token_id.clone());
+                format!("\n<!--@mark {}-->", attrs_text(&all, &["kind", "id"]))
+            })
+            .unwrap_or_default();
         blocks.push(if body.is_empty() {
-            marker
+            format!("{marker}{mark}")
         } else {
-            format!("{marker}\n{body}")
+            format!("{marker}{mark}\n{body}")
         });
     }
     let mut text = blocks.join("\n\n");

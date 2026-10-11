@@ -2196,7 +2196,8 @@ fn typed_body_visible_text(body: &str) -> String {
             } else if lowered.starts_with("<span") || lowered.starts_with("<docx-range") {
                 stack.push("pass".to_string());
             } else if lowered.starts_with("<docx-revision") {
-                let passes = lowered.contains("kind=\"insert\"") || lowered.contains("kind=\"move_to\"");
+                let passes =
+                    lowered.contains("kind=\"insert\"") || lowered.contains("kind=\"move_to\"");
                 stack.push(if passes { "pass".into() } else { "skip".into() });
             } else if lowered.starts_with("<docx-anchor") {
                 // AnchorNode contributes no text.
@@ -2225,9 +2226,7 @@ fn typed_body_visible_text(body: &str) -> String {
         if !skipped {
             // `^{text}` / `_{text}`: the schema-2 vertical marker is markup, the
             // text inside it is the text.
-            if (character == '^' || character == '_')
-                && bytes.get(index + 1) == Some(&'{')
-            {
+            if (character == '^' || character == '_') && bytes.get(index + 1) == Some(&'{') {
                 index += 2;
                 let mut depth = 1usize;
                 while index < bytes.len() && depth > 0 {
@@ -2245,7 +2244,9 @@ fn typed_body_visible_text(body: &str) -> String {
         }
         index += 1;
     }
-    out.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, String> {

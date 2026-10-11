@@ -261,7 +261,8 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
     // over, so a header-only stub could never match the reference.
     let package_bytes = std::fs::read(&source_path).map_err(CoreError::io)?;
     let projection = crate::document_projection::project_document_bytes(&package_bytes)?;
-    let typed_md = crate::prose::serialize_typed(&source_name, &projection);
+    let trees = crate::token_table::paragraph_nodes(&package_bytes)?;
+    let typed_md = crate::prose::serialize_typed(&source_name, &projection, &trees);
 
     // The registry, built from the document's own runs. This was a hardcoded
     // empty object (#48), which made the format lane inert: a restyle is
