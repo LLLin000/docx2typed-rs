@@ -1859,6 +1859,18 @@ fn plan_patch(
                 let start = if let Some(start) = anchored {
                     start
                 } else {
+                    // A span that reads contiguous only because the placeholders
+                    // were stripped is not one editable run, and this must be
+                    // asked BEFORE trusting a visible-text match. Once
+                    // `visible_text` strips placeholders such a span IS found
+                    // (`count == 1`), so the not-found path below no longer sees
+                    // the case this guard exists for: it fell through to
+                    // `replace_at` and reported a bare `text-not-found` for text
+                    // plainly on screen. The boundary test caught it.
+                    if let Some(error) = span_crosses_boundary(paragraph_id, &body, old) {
+                        hunk_problem(&mut problems, number, hunk, error);
+                        continue;
+                    }
                     let count = visible.matches(old.as_str()).count();
                     if count != 1 {
                         // A span that is contiguous only once the inline tokens
