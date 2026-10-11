@@ -400,7 +400,30 @@ pub fn validate_workdir(workdir: &Path) -> Result<WorkdirMeta, CoreError> {
     // typed record is authoritative and cannot drift by this check — edit
     // freshness covers it (issue #56).
     let typed_recorded = format.get("typed_sha256").and_then(|v| v.as_str());
-    let pristine = typed_recorded.is_none_or(|recorded| recorded == typed_sha256);
+    let pristine = match typed_recorded {
+        Some(recorded) => recorded == typed_sha256,
+        None => {
+            if root.join("edit.state.json").is_file() {
+                true
+            } else if let Ok(package_bytes) = std::fs::read(&template) {
+                if let (Ok(projection), Ok(trees)) = (
+                    crate::document_projection::project_document_bytes(&package_bytes),
+                    crate::token_table::paragraph_nodes(&package_bytes),
+                ) {
+                    let source_name = format
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let expected = crate::prose::serialize_typed(source_name, &projection, &trees);
+                    bytes_sha256(expected.as_bytes()) == typed_sha256
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        }
+    };
     Ok(WorkdirMeta {
         root,
         template,
@@ -451,7 +474,13 @@ pub fn plan_build(workdir: &Path) -> Result<BuildPlan, CoreError> {
     let structure = crate::prose::load_structure(&meta.root)?;
     let rpr_edits = crate::prose::load_rpr_edits(&meta.root)?;
     let styles = load_style_rprs(&meta.root)?;
-    if !meta.pristine && islands.is_empty() && structure.is_empty() && rpr_edits.is_empty() {
+    let is_store = meta.root.join(".docx2typed-store").is_dir();
+    if !meta.pristine
+        && !is_store
+        && islands.is_empty()
+        && structure.is_empty()
+        && rpr_edits.is_empty()
+    {
         return Err(CoreError::Domain(
             "workdir-invalid: typed edits are not implemented in the protocol-major-1 Rust slice (issue #55; edits land in #56+)".to_string(),
         ));

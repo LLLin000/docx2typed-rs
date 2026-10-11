@@ -314,6 +314,195 @@ pub fn part_entry_id(part: &str, paragraph_start: usize, xml: &[u8]) -> String {
     best.map(|(_, id)| id).unwrap_or_default()
 }
 
+/// `visible_text`: the final-view text of a paragraph's nodes.
+///
+/// Mirrors the reference exactly -- text passes through, a range passes its
+/// children, a revision passes them only for insert/move_to, an inline `tab`
+/// becomes a tab and `br`/`cr` a newline, and an opaque becomes
+/// `[opaque:kind]`.
+///
+/// The inventory's own `visible_text` is built from `w:t` leaves alone, which
+/// is why a note paragraph of pure separators read as EMPTY while typed.md read
+/// `[opaque:separator]` -- and why the two sides disagreed about whether
+/// anything had been edited at all.
+pub fn visible_text(nodes: &[TypedNode]) -> String {
+    let mut out = String::new();
+    for node in nodes {
+        match node {
+            TypedNode::Text { text, .. } => out.push_str(text),
+            TypedNode::Range { children, .. } => out.push_str(&visible_text(children)),
+            TypedNode::Revision { kind, children, .. } => {
+                if kind == "insert" || kind == "move_to" {
+                    out.push_str(&visible_text(children));
+                }
+            }
+            TypedNode::Inline { kind, .. } => match kind.as_str() {
+                "tab" => out.push('\t'),
+                "br" | "cr" => out.push('\n'),
+                _ => {}
+            },
+            TypedNode::Opaque { kind, .. } => out.push_str(&format!("[opaque:{kind}]")),
+            TypedNode::Anchor { .. } => {}
+        }
+    }
+    out
+}
+
+const PROJECTION_TOKEN_START: char = '\u{27e6}';
+const PROJECTION_TOKEN_END: char = '\u{27e7}';
+
+fn escape_projection_text(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            PROJECTION_TOKEN_START => out.push_str("\\\u{27e6}"),
+            PROJECTION_TOKEN_END => out.push_str("\\\u{27e7}"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn projection_attr_value(value: &str) -> String {
+    let escaped = value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    format!("\"{escaped}\"")
+}
+
+fn render_node_attrs(attrs: &BTreeMap<String, String>) -> String {
+    let mut ordered: Vec<(String, String)> = Vec::new();
+    if let Some(v) = attrs.get("id") {
+        ordered.push(("id".to_string(), v.clone()));
+    }
+    if let Some(v) = attrs.get("kind") {
+        ordered.push(("kind".to_string(), v.clone()));
+    }
+    for (k, v) in attrs {
+        if k != "id" && k != "kind" {
+            ordered.push((k.clone(), v.clone()));
+        }
+    }
+    ordered
+        .into_iter()
+        .map(|(k, v)| format!("{k}={}", projection_attr_value(&v)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn project_node(node: &TypedNode) -> String {
+    match node {
+        TypedNode::Text { text, .. } => escape_projection_text(text),
+        TypedNode::Anchor {
+            token_id,
+            kind,
+            attrs,
+        } => {
+            let mut map = attrs.clone();
+            map.insert("id".to_string(), token_id.clone());
+            map.insert("kind".to_string(), kind.clone());
+            let rendered = render_node_attrs(&map);
+            format!("{PROJECTION_TOKEN_START}token {rendered}{PROJECTION_TOKEN_END}")
+        }
+        TypedNode::Inline {
+            token_id,
+            kind,
+            style_id,
+            attrs,
+        } => {
+            let mut map = attrs.clone();
+            map.insert("id".to_string(), token_id.clone());
+            map.insert("kind".to_string(), kind.clone());
+            if !style_id.is_empty() {
+                map.insert("style".to_string(), style_id.clone());
+            }
+            let rendered = render_node_attrs(&map);
+            format!("{PROJECTION_TOKEN_START}token {rendered}{PROJECTION_TOKEN_END}")
+        }
+        TypedNode::Opaque {
+            token_id,
+            kind,
+            attrs,
+        } => {
+            let mut map = attrs.clone();
+            map.insert("id".to_string(), token_id.clone());
+            map.insert("kind".to_string(), kind.clone());
+            let rendered = render_node_attrs(&map);
+            format!("{PROJECTION_TOKEN_START}token {rendered}{PROJECTION_TOKEN_END}")
+        }
+        TypedNode::Range {
+            token_id,
+            kind,
+            attrs,
+            children,
+        } => {
+            let mut map = attrs.clone();
+            map.insert("id".to_string(), token_id.clone());
+            map.insert("kind".to_string(), kind.clone());
+            let rendered = render_node_attrs(&map);
+            let inner = project_nodes(children);
+            format!(
+                "{PROJECTION_TOKEN_START}range-start {rendered}{PROJECTION_TOKEN_END}{inner}{PROJECTION_TOKEN_START}range-end id={}{PROJECTION_TOKEN_END}",
+                projection_attr_value(token_id)
+            )
+        }
+        TypedNode::Revision {
+            token_id,
+            kind,
+            attrs,
+            children,
+        } => {
+            if kind == "insert" || kind == "move_to" {
+                let kind_name = if kind == "insert" {
+                    "insert"
+                } else {
+                    "move-to"
+                };
+                let mut map = attrs.clone();
+                map.insert("id".to_string(), token_id.clone());
+                let mut ordered: Vec<(String, String)> = vec![("id".to_string(), token_id.clone())];
+                for (k, v) in &map {
+                    if k != "id" {
+                        ordered.push((k.clone(), v.clone()));
+                    }
+                }
+                ordered.sort_by(|a, b| {
+                    if a.0 == "id" {
+                        std::cmp::Ordering::Less
+                    } else if b.0 == "id" {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        a.0.cmp(&b.0)
+                    }
+                });
+                let rendered = ordered
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}={}", projection_attr_value(&v)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let inner = project_nodes(children);
+                format!(
+                    "{PROJECTION_TOKEN_START}{kind_name} {rendered}{PROJECTION_TOKEN_END}{inner}{PROJECTION_TOKEN_START}/{kind_name} id={}{PROJECTION_TOKEN_END}",
+                    projection_attr_value(token_id)
+                )
+            } else {
+                format!(
+                    "{PROJECTION_TOKEN_START}revision-gap id={} kind={}{PROJECTION_TOKEN_END}",
+                    projection_attr_value(token_id),
+                    projection_attr_value(kind)
+                )
+            }
+        }
+    }
+}
+
+pub fn project_nodes(nodes: &[TypedNode]) -> String {
+    nodes.iter().map(project_node).collect()
+}
+
 /// The `tokens` map `format.json` publishes: id -> the record, sorted by id.
 ///
 /// The payload differs by kind, exactly as `_TokenTable.add` records it: a

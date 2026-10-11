@@ -65,14 +65,19 @@ fn inventory_paragraphs_all_parts(
     workdir: &Path,
 ) -> Result<Vec<InventoryParagraph>, CollaborationError> {
     let package = workdir.join("_template.docx");
-    let inventory = docx2typed_core::prose::enumerate_package(&package)
+    let bytes = fs::read(&package)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    Ok(inventory
-        .paragraphs
+    // The TREE, not `enumerate_package`'s `visible_text`: the latter is built
+    // from `w:t` leaves alone, so a paragraph of pure separators reads as empty
+    // while typed.md reads `[opaque:separator]`. The tree gives the reference's
+    // `visible_text` for every node kind, which is what the comparison needs.
+    let trees = docx2typed_core::token_table::paragraph_nodes(&bytes)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    Ok(trees
         .into_iter()
-        .map(|paragraph| InventoryParagraph {
-            id: paragraph.paragraph_id.clone(),
-            visible_text: paragraph.visible_text.clone(),
+        .map(|tree| InventoryParagraph {
+            id: tree.paragraph_id.clone(),
+            visible_text: docx2typed_core::token_table::visible_text(&tree.nodes),
         })
         .collect())
 }
@@ -85,18 +90,18 @@ pub fn inventory_paragraphs(workdir: &Path) -> Result<Vec<InventoryParagraph>, C
             format!("_template.docx not found in {}", workdir.to_string_lossy()),
         ));
     }
-    let inventory = docx2typed_core::prose::enumerate_package(&package)
+    let bytes = fs::read(&package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let trees = docx2typed_core::token_table::paragraph_nodes(&bytes)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let mut paragraphs = Vec::new();
-    for paragraph in inventory.paragraphs {
-        // Body paragraphs carry the document part key (Rust inventory) or an
-        // empty key (Python); container/part paragraphs are out of scope.
-        if paragraph.part_key != "document" && !paragraph.part_key.is_empty() {
+    for tree in trees {
+        if tree.part != "document" && tree.part != "word/document.xml" && !tree.part.is_empty() {
             continue;
         }
         paragraphs.push(InventoryParagraph {
-            id: paragraph.paragraph_id.clone(),
-            visible_text: paragraph.visible_text.clone(),
+            id: tree.paragraph_id.clone(),
+            visible_text: docx2typed_core::token_table::project_nodes(&tree.nodes),
         });
     }
     Ok(paragraphs)
@@ -2359,7 +2364,13 @@ fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, Stri
                 .unwrap_or("")
                 .to_string();
             current = Some(id);
-        } else if trimmed.starts_with("<!--@delete") {
+        } else if trimmed.starts_with("<!--@delete") || trimmed.starts_with("<!--@part") {
+            flush(&mut records, &mut current, &mut body_lines);
+        } else if trimmed.starts_with("<!--@mark") {
+            // A paragraph-level revision mark is an annotation on the
+            // paragraph, not a terminator.
+            continue;
+        } else if trimmed.starts_with("<!--@") {
             flush(&mut records, &mut current, &mut body_lines);
         } else if current.is_some() && !trimmed.is_empty() {
             body_lines.push(line.to_string());
