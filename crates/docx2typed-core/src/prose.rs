@@ -3170,7 +3170,7 @@ pub fn style_id_for_rpr(rpr_xml: &str) -> Result<String, CoreError> {
 /// the reference produces `["w:sz",[["w:val","24"]]]`, and every style id
 /// diverged. `xmlns` is skipped because ElementTree consumes namespace
 /// declarations, so they never reach `element.attrib`.
-fn canonical_attribute_pairs(tag: &[u8]) -> Vec<(String, String)> {
+pub(crate) fn canonical_attribute_pairs(tag: &[u8]) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut index = 1; // past '<'
     while index < tag.len() && !tag[index].is_ascii_whitespace() {
