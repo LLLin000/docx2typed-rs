@@ -756,6 +756,73 @@ fn replace_nth_in_body(
     out.push_str(&body[position + old.len()..]);
     Ok(out)
 }
+
+/// Apply one literal or regex replacement to a run of text, honouring the
+/// case-sensitivity flag. Shared by the leaf-island and structure-body paths
+/// so both produce byte-identical results for the same input.
+fn apply_replacement(
+    regex: &Option<regex::Regex>,
+    find: &str,
+    replace: &str,
+    text: &str,
+    case_sensitive: bool,
+) -> String {
+    if let Some(re) = regex {
+        return re.replace_all(text, replace).to_string();
+    }
+    if case_sensitive {
+        return text.replace(find, replace);
+    }
+    let lower = text.to_lowercase();
+    let lower_find = find.to_lowercase();
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    while let Some(pos) = lower[cursor..].find(&lower_find) {
+        out.push_str(&text[cursor..cursor + pos]);
+        out.push_str(replace);
+        cursor += pos + lower_find.len();
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// True when one leaf of the (already enumerated) inventory carries the whole
+/// visible match.
+///
+/// `offset` and `length` are in visible characters of the FLATTENED paragraph,
+/// which is the coordinate space the match plan uses. Each leaf's visible text
+/// is walked in order to find the leaf the span falls in; a span that starts in
+/// one leaf and ends in another has no single owner and is refused (it cannot
+/// be rewritten without splitting a run).
+fn leaf_in_inventory_covers(
+    inventory: &docx2typed_core::prose::ProseInventory,
+    paragraph_id: &str,
+    offset: usize,
+    length: usize,
+) -> bool {
+    if length == 0 {
+        return false;
+    }
+    let Some(part) = docx2typed_core::prose::part_for_paragraph_id(paragraph_id) else {
+        return false;
+    };
+    let span_end = offset + length;
+    let mut cursor = 0usize;
+    for leaf in inventory
+        .leaves
+        .iter()
+        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
+    {
+        let leaf_start = cursor;
+        let leaf_end = cursor + leaf.text.chars().count();
+        cursor = leaf_end;
+        if offset >= leaf_start && span_end <= leaf_end {
+            return true;
+        }
+    }
+    false
+}
+
 /// The template leaf one island edit lands in, or None for a synthesised
 /// paragraph: it has no baseline leaf to replace (it is rendered from the
 /// inherit paragraph at build time and rewritten in the structure sidecar at
@@ -1998,8 +2065,29 @@ pub fn document_replace(
             ));
         }
     }
-    let allowed = docx2typed_core::document_search::scope_paragraph_ids(&blocks, args.scope)
+    // The replace scope is the DRAFT's own paragraphs, not just the baseline's:
+    // a paragraph inserted earlier in this session is a
+    // `<!--@new temp="N1"-->` block, and `scope_paragraph_ids` only names
+    // `<!--@p` records — so a straight call silently ignores it (measured: the
+    // reference reports 0 matches there too). Ask the scope for the baseline
+    // ids, then union in every draft block the scope's family covers, so
+    // "replace everywhere" means everywhere in the document the agent sees.
+    let baseline_scope = docx2typed_core::document_search::scope_paragraph_ids(&blocks, args.scope)
         .map_err(|e| CollaborationError::new("replace-scope-invalid", e.to_string()))?;
+    let allowed: Vec<String> = {
+        let mut ids = baseline_scope.clone();
+        let universe = matches!(args.scope, "body" | "" | "/body" | "/" | "all");
+        if universe {
+            for block in &blocks {
+                if let Some((kind, id, _)) = marker_of(block) {
+                    if (kind == "new" || kind == "p") && !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        ids
+    };
     if (args.scope == "comments"
         || args.scope == "/comments"
         || allowed.iter().any(|id| id.starts_with("comments.")))
@@ -2013,6 +2101,7 @@ pub fn document_replace(
 
     let mut plan: Vec<Value> = Vec::new();
     let mut unsafe_matches: Vec<Value> = Vec::new();
+    let inventory = docx2typed_core::prose::enumerate_package(&workdir.join("_template.docx")).ok();
 
     let regex_pattern = if args.regex {
         Some(
@@ -2040,7 +2129,10 @@ pub fn document_replace(
         let Some((kind, id, _)) = marker_of(block) else {
             continue;
         };
-        if kind != "p" || !allowed.contains(&id) {
+        if kind != "p" && kind != "new" {
+            continue;
+        }
+        if !allowed.contains(&id) {
             continue;
         }
         let body = block_body(block);
@@ -2113,7 +2205,27 @@ pub fn document_replace(
                 "normalized": false,
                 "match_ref": match_ref,
             });
-            if !crossed.is_empty() {
+            // A match the flattened paragraph text can see may still span
+            // several `<w:t>` leaves: `("长效润", "滑材料")` yields a visible
+            // `润滑` that no single leaf contains. Editing it would require
+            // splitting a run, which is exactly the surgery that produced
+            // Python's `unbound prefix` corruption on the same input. Refuse
+            // it loudly instead of reporting a match that cannot be applied.
+            let synthesised = kind == "new";
+            if !synthesised
+                && !inventory.as_ref().is_some_and(|inv| {
+                    leaf_in_inventory_covers(inv, &id, offset, matched_text.chars().count())
+                })
+            {
+                let mut u = entry.clone();
+                u["reason"] = serde_json::json!("match-spans-leaves");
+                u["capability"] = serde_json::json!("word.text.replace.cross-leaf");
+                u["detail"] = serde_json::json!(
+                    "the visible match spans more than one text run; rewriting it would \
+                     split a run and cannot be done losslessly"
+                );
+                unsafe_matches.push(u);
+            } else if !crossed.is_empty() {
                 let mut u = entry.clone();
                 u["reason"] = serde_json::json!("edit-span-crosses-revision-boundary");
                 u["boundary_crossings"] = serde_json::json!(crossed);
@@ -2131,6 +2243,24 @@ pub fn document_replace(
 
     let total = plan.len() + unsafe_matches.len();
     if !unsafe_matches.is_empty() {
+        let cross_leaf: Vec<Value> = unsafe_matches
+            .iter()
+            .filter(|u| u.get("reason") == Some(&serde_json::json!("match-spans-leaves")))
+            .cloned()
+            .collect();
+        if !cross_leaf.is_empty() {
+            return Err(CollaborationError::new(
+                "replace-cross-leaf-matches",
+                format!(
+                    "{} of {total} matches span more than one text run and cannot be rewritten \
+                     losslessly; nothing was written. Address each side of the run boundary \
+                     individually, or use a surrounding span that fits in one run. \
+                     cross_leaf_matches={}",
+                    cross_leaf.len(),
+                    serde_json::to_string(&cross_leaf).unwrap_or_default()
+                ),
+            ));
+        }
         let mode_fix = unsafe_matches.iter().any(|u| {
             u.get("reason") == Some(&serde_json::json!("revision-text-mutated-in-direct-mode"))
         });
@@ -2142,7 +2272,11 @@ pub fn document_replace(
         }
         return Err(CollaborationError::new(
             "replace-unsafe-matches",
-            "matches sit across a revision boundary and cannot be rewritten in one pass",
+            format!(
+                "matches sit across a revision boundary and cannot be rewritten in one pass; \
+                 nothing was written. unsafe={}",
+                serde_json::to_string(&unsafe_matches).unwrap_or_default()
+            ),
         ));
     }
 
@@ -2200,7 +2334,7 @@ pub fn document_replace(
         let Some((kind, id, marker)) = marker_of(block) else {
             continue;
         };
-        if kind != "p" {
+        if kind != "p" && kind != "new" {
             continue;
         }
         let Some(mut matches) = by_p.remove(&id) else {
@@ -2218,67 +2352,148 @@ pub fn document_replace(
         };
     }
 
-    let inventory = docx2typed_core::prose::enumerate_package(&workdir.join("_template.docx")).ok();
-    let mut new_islands: Vec<docx2typed_core::prose::IslandEdit> = Vec::new();
+    // Record the edits now, exactly as `replace_text` does: leaf-level island
+    // records for baseline paragraphs (the build applies them to the template
+    // bytes) and a structure-sidecar body update for paragraphs synthesised in
+    // this session (which have no baseline leaf to rewrite). `commit_sync`
+    // then settles `typed.md` from this draft; without these records a match
+    // would be reported as changed yet silently dropped by the build — the
+    // failure the reference ships in two forms (stale inserted paragraphs and
+    // `unbound prefix` corruption on a cross-run span, both measured).
+    let mut island_edits: Vec<docx2typed_core::prose::IslandEdit> = Vec::new();
     if let Some(inv) = &inventory {
         for entry in &plan {
             let pid = entry["paragraph_id"].as_str().unwrap_or("");
+            if blocks.iter().any(|block| {
+                marker_of(block).is_some_and(|(kind, id, _)| kind == "new" && id == pid)
+            }) {
+                continue;
+            }
             for leaf in inv
                 .leaves
                 .iter()
                 .filter(|l| l.part_key == "document" && l.paragraph_id == pid)
             {
-                let matches_find = if let Some(re) = &regex_pattern {
+                let hit = if let Some(re) = &regex_pattern {
                     re.is_match(&leaf.text)
                 } else if args.case_sensitive {
                     leaf.text.contains(args.find)
                 } else {
                     leaf.text.to_lowercase().contains(&args.find.to_lowercase())
                 };
-                if matches_find {
-                    let old_text = leaf.text.clone();
-                    let new_text = if let Some(re) = &regex_pattern {
-                        re.replace_all(&old_text, args.replace).to_string()
-                    } else if args.case_sensitive {
-                        old_text.replace(args.find, args.replace)
-                    } else {
-                        let mut res = String::new();
-                        let lower_old = old_text.to_lowercase();
-                        let lower_find = args.find.to_lowercase();
-                        let mut cursor = 0usize;
-                        while let Some(pos) = lower_old[cursor..].find(&lower_find) {
-                            res.push_str(&old_text[cursor..cursor + pos]);
-                            res.push_str(args.replace);
-                            cursor += pos + lower_find.len();
-                        }
-                        res.push_str(&old_text[cursor..]);
-                        res
-                    };
-                    if old_text != new_text
-                        && !new_islands
-                            .iter()
-                            .any(|e| e.paragraph_id == pid && e.leaf_index == leaf.leaf_index)
-                    {
-                        new_islands.push(docx2typed_core::prose::IslandEdit {
-                            part: "document".to_string(),
-                            paragraph_id: pid.to_string(),
-                            leaf_index: leaf.leaf_index,
-                            old: old_text,
-                            new: new_text,
-                            tracked: tracking.tracked,
-                            author: tracking.author.unwrap_or("").to_string(),
-                            date: tracking.date.unwrap_or("").to_string(),
-                        });
-                    }
+                if !hit {
+                    continue;
                 }
+                let old_text = leaf.text.clone();
+                let new_text = apply_replacement(
+                    &regex_pattern,
+                    args.find,
+                    args.replace,
+                    &old_text,
+                    args.case_sensitive,
+                );
+                if old_text == new_text
+                    || island_edits
+                        .iter()
+                        .any(|e| e.paragraph_id == pid && e.leaf_index == leaf.leaf_index)
+                {
+                    continue;
+                }
+                island_edits.push(docx2typed_core::prose::IslandEdit {
+                    part: "document".to_string(),
+                    paragraph_id: pid.to_string(),
+                    leaf_index: leaf.leaf_index,
+                    old: old_text,
+                    new: new_text,
+                    tracked: tracking.tracked,
+                    author: tracking.author.unwrap_or("").to_string(),
+                    date: tracking.date.unwrap_or("").to_string(),
+                });
             }
         }
     }
-
-    write_draft(workdir, &header, &blocks)?;
-    if !new_islands.is_empty() {
-        append_island_edits(workdir, &new_islands)?;
+    // Rewrite the synthesised paragraphs' bodies in the structure sidecar.
+    let mut structure = docx2typed_core::prose::load_structure(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let mut structure_changed = false;
+    let new_ids: Vec<String> = plan
+        .iter()
+        .filter_map(|e| e["paragraph_id"].as_str().map(str::to_string))
+        .filter(|id| {
+            blocks.iter().any(|block| {
+                marker_of(block).is_some_and(|(kind, bid, _)| kind == "new" && &bid == id)
+            })
+        })
+        .collect();
+    for pid in new_ids {
+        let Some(paragraph) = structure
+            .new_paragraphs
+            .iter_mut()
+            .find(|p| p.paragraph_id == pid)
+        else {
+            // The paragraph was inserted in this session but its structure
+            // record is still draft-only; `commit_sync` synthesises it from the
+            // draft, so the body update rides along in the draft block.
+            continue;
+        };
+        let updated = apply_replacement(
+            &regex_pattern,
+            args.find,
+            args.replace,
+            &paragraph.body,
+            args.case_sensitive,
+        );
+        if paragraph.body != updated {
+            paragraph.body = updated;
+            structure_changed = true;
+        }
     }
+    // Every changed paragraph must be recorded by a sidecar the build reads.
+    let recorded: std::collections::BTreeSet<String> = island_edits
+        .iter()
+        .map(|e| e.paragraph_id.clone())
+        .chain(
+            structure
+                .new_paragraphs
+                .iter()
+                .map(|p| p.paragraph_id.clone()),
+        )
+        .collect();
+    // A paragraph synthesised in this session has no baseline leaf and no
+    // structure record yet: `commit_sync` writes it from the draft `@new`
+    // block, so the draft block itself satisfies the requirement.
+    let draft_new: std::collections::BTreeSet<String> = blocks
+        .iter()
+        .filter_map(|block| {
+            let (kind, id, _) = marker_of(block)?;
+            (kind == "new").then_some(id)
+        })
+        .collect();
+    let uncovered: Vec<String> = plan
+        .iter()
+        .filter_map(|e| e["paragraph_id"].as_str().map(str::to_string))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|id| !recorded.contains(id) && !draft_new.contains(id))
+        .collect();
+    if !uncovered.is_empty() {
+        return Err(CollaborationError::new(
+            "replace-unrecorded-match",
+            format!(
+                "{} match(es) cannot be recorded for the build: {}; nothing was written",
+                uncovered.len(),
+                uncovered.join(", ")
+            ),
+        ));
+    }
+    if !island_edits.is_empty() {
+        append_island_edits(workdir, &island_edits)?;
+    }
+    if structure_changed {
+        docx2typed_core::prose::save_structure(workdir, &structure)
+            .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    }
+    write_draft(workdir, &header, &blocks)?;
     let revision_after = current_revision(workdir)?;
     Ok(serde_json::json!({
         "scope": args.scope,
