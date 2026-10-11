@@ -1963,14 +1963,32 @@ fn plan_patch(
         // while the call still reported success.
         let (record_old, record_new) =
             merged_leaf_island(workdir, &paragraph_id, leaf_index, &spans).ok_or_else(|| {
-                CollaborationError::new(
-                    "invalid-edit",
-                    format!(
-                        "{paragraph_id}: cannot map {} replacement(s) onto leaf {leaf_index}; \
-                         nothing was written",
-                        spans.len()
-                    ),
-                )
+                // The two cases are worth telling apart. An offset that cannot
+                // be mapped usually means the paragraph already carries an
+                // UNCOMMITTED edit that changed its length: the search reports
+                // draft offsets while the island must address the template's
+                // runs, and once the lengths differ those are different
+                // coordinate spaces. Naming it tells the agent to commit first
+                // instead of guessing.
+                if paragraph_lengths_differ(workdir, &paragraph_id) {
+                    CollaborationError::new(
+                        "paragraph-has-uncommitted-length-change",
+                        format!(
+                            "{paragraph_id} already carries an uncommitted edit that changed its \
+                             length, so draft offsets no longer address the template's runs; run \
+                             commit_sync first, then edit again. Nothing was written"
+                        ),
+                    )
+                } else {
+                    CollaborationError::new(
+                        "invalid-edit",
+                        format!(
+                            "{paragraph_id}: cannot map {} replacement(s) onto leaf {leaf_index}; \
+                             nothing was written",
+                            spans.len()
+                        ),
+                    )
+                }
             })?;
         islands.push(docx2typed_core::prose::IslandEdit {
             part: "document".to_string(),
@@ -1988,6 +2006,36 @@ fn plan_patch(
         applied,
         islands,
     })
+}
+
+/// True when a paragraph's DRAFT text and its template runs have different
+/// visible lengths, i.e. an uncommitted edit already changed the text size.
+fn paragraph_lengths_differ(workdir: &Path, paragraph_id: &str) -> bool {
+    let package = match fs::read(workdir.join("_template.docx")) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let Ok(inventory) = docx2typed_core::prose::enumerate_package_bytes(&package) else {
+        return false;
+    };
+    let Some(part) = docx2typed_core::prose::part_for_paragraph_id(paragraph_id) else {
+        return false;
+    };
+    let template_len: usize = inventory
+        .leaves
+        .iter()
+        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
+        .map(|leaf| leaf.text.chars().count())
+        .sum();
+    let Ok((_, blocks)) = read_blocks(workdir) else {
+        return false;
+    };
+    let draft_len = blocks
+        .iter()
+        .find(|block| marker_of(block).is_some_and(|(_, id, _)| id == paragraph_id))
+        .map(|block| visible_text(&block_body(block)).chars().count())
+        .unwrap_or(template_len);
+    draft_len != template_len
 }
 
 /// The whole-leaf form of one island edit, carrying every replacement that

@@ -122,22 +122,49 @@ pub fn locate(workdir: &Path, query: &str, scope: &str) -> Result<Value, Collabo
     let mut targets: Vec<LocatedTarget> = Vec::new();
     for block in &found.matches {
         for occurrence in &block.occurrences {
+            // The capability verdict comes from the SEARCH's own draft-space
+            // analysis, not from a walk of the template's runs. Those are two
+            // different coordinate spaces once an edit changes a paragraph's
+            // length: the offsets are draft offsets while the template's leaf
+            // boundaries are pre-edit, so comparing them misclassifies spans
+            // (measured: a paragraph read as `match-spans-leaves` purely
+            // because an earlier replacement made its text two chars longer).
+            //
+            // `patchable_as_single_hunk` is the same question the edit path
+            // enforces, asked in the space it will be answered in.
+            let (capability, reason) = if occurrence.patchable_as_single_hunk {
+                (Capability::Supported, None)
+            } else {
+                (
+                    Capability::Unsupported,
+                    Some(if occurrence.boundary_crossings.is_empty() {
+                        "match-spans-leaves".to_string()
+                    } else {
+                        format!("match-crosses-{}", occurrence.boundary_crossings.join("-"))
+                    }),
+                )
+            };
             targets.push(LocatedTarget {
                 handle: occurrence.match_ref.clone(),
                 paragraph_id: block.id.clone(),
                 text: occurrence.matched_text.clone(),
                 offset: occurrence.offset,
                 length: occurrence.matched_text.chars().count(),
-                capability: Capability::Supported,
+                capability,
                 candidates: Vec::new(),
-                reason: None,
+                reason,
             });
         }
     }
 
-    // A phrase the flattened text shows but no single run carries is a real
-    // state the agent must see, not a silent skip: mark it unsupported.
-    mark_cross_leaf(workdir, query, &mut targets)?;
+    // A synthesised paragraph is rendered wholesale at build time, so any span
+    // inside it is reachable regardless of how the template segments runs.
+    for target in targets.iter_mut() {
+        if target.paragraph_id.starts_with('N') {
+            target.capability = Capability::Supported;
+            target.reason = None;
+        }
+    }
 
     let supported = targets.iter().filter(|t| t.capability.is_ok()).count();
     Ok(json!({
@@ -149,65 +176,6 @@ pub fn locate(workdir: &Path, query: &str, scope: &str) -> Result<Value, Collabo
         "targets": targets,
         "next": "edit with a target handle, or narrow `scope` when ambiguous",
     }))
-}
-
-/// Re-classify targets whose spans leave a single text run.
-fn mark_cross_leaf(
-    workdir: &Path,
-    _query: &str,
-    targets: &mut [LocatedTarget],
-) -> Result<(), CollaborationError> {
-    let package = std::fs::read(workdir.join("_template.docx"))
-        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-    let inventory = prose::enumerate_package_bytes(&package)
-        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    for target in targets.iter_mut() {
-        if target.paragraph_id.starts_with('N') {
-            // A paragraph synthesised in this session is rendered wholesale at
-            // build time, so any span inside it is reachable.
-            continue;
-        }
-        if !leaf_covers(
-            &inventory,
-            &target.paragraph_id,
-            target.offset,
-            target.length,
-        ) {
-            target.capability = Capability::Unsupported;
-            target.reason = Some("match-spans-leaves".to_string());
-        }
-    }
-    Ok(())
-}
-
-/// True when one leaf of the inventory carries the whole visible span.
-fn leaf_covers(
-    inventory: &prose::ProseInventory,
-    paragraph_id: &str,
-    offset: usize,
-    length: usize,
-) -> bool {
-    if length == 0 {
-        return false;
-    }
-    let Some(part) = prose::part_for_paragraph_id(paragraph_id) else {
-        return false;
-    };
-    let span_end = offset + length;
-    let mut cursor = 0usize;
-    for leaf in inventory
-        .leaves
-        .iter()
-        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
-    {
-        let leaf_start = cursor;
-        let leaf_end = cursor + leaf.text.chars().count();
-        cursor = leaf_end;
-        if offset >= leaf_start && span_end <= leaf_end {
-            return true;
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
