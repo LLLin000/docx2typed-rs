@@ -61,6 +61,10 @@ path = "rust-tests/tracer.rs"
 required-features = ["python-oracle"]
 
 [[test]]
+name = "token_table_differential"
+path = "rust-tests/token_table_differential.rs"
+
+[[test]]
 name = "style_id_differential"
 path = "rust-tests/style_id_differential.rs"
 

@@ -1258,7 +1258,7 @@ impl<'a> TreeBuilder<'a> {
 
 /// Read the editable prose parts of a package (part key -> bytes), mirror
 /// of `prose::enumerate_package`'s read loop.
-fn part_xml_members(package: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, CoreError> {
+pub(crate) fn part_xml_members(package: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, CoreError> {
     let file = std::io::Cursor::new(package.to_vec());
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| CoreError::Message(format!("not a valid DOCX: {error}")))?;

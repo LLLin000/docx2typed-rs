@@ -1,0 +1,257 @@
+{
+ "schema": "docx2typed-token-table-expectation-1",
+ "note": "Captured from the Python reference (typed_docx.parse_package_document). The ids come from ONE counter over the whole parse and typed.md renders only some of them -- revisions.docx uses N0, N1, N3..N7 and skips N2 -- so this records the FULL sequence, not the rendered subset.",
+ "documents": {
+  "revisions": [
+   {
+    "id": "N0",
+    "kind": "revision"
+   },
+   {
+    "id": "N1",
+    "kind": "revision"
+   },
+   {
+    "id": "N2",
+    "kind": "paragraph-mark"
+   },
+   {
+    "id": "N3",
+    "kind": "opaque"
+   },
+   {
+    "id": "N4",
+    "kind": "opaque"
+   },
+   {
+    "id": "N5",
+    "kind": "revision"
+   },
+   {
+    "id": "N6",
+    "kind": "revision"
+   },
+   {
+    "id": "N7",
+    "kind": "revision"
+   }
+  ],
+  "anchors": [
+   {
+    "id": "N0",
+    "kind": "hyperlink"
+   },
+   {
+    "id": "N1",
+    "kind": "bookmark-start"
+   },
+   {
+    "id": "N2",
+    "kind": "bookmark-end"
+   },
+   {
+    "id": "N3",
+    "kind": "comment-start"
+   },
+   {
+    "id": "N4",
+    "kind": "comment-end"
+   },
+   {
+    "id": "N5",
+    "kind": "commentReference"
+   },
+   {
+    "id": "N6",
+    "kind": "annotationRef"
+   }
+  ],
+  "parts": [
+   {
+    "id": "N0",
+    "kind": "unsupported-run"
+   },
+   {
+    "id": "N1",
+    "kind": "unsupported-run"
+   },
+   {
+    "id": "N2",
+    "kind": "separator"
+   },
+   {
+    "id": "N3",
+    "kind": "continuationSeparator"
+   },
+   {
+    "id": "N4",
+    "kind": "separator"
+   },
+   {
+    "id": "N5",
+    "kind": "continuationSeparator"
+   }
+  ],
+  "boxes": [
+   {
+    "id": "N0",
+    "kind": "unsupported-run"
+   }
+  ],
+  "comments": [
+   {
+    "id": "N0",
+    "kind": "comment-start"
+   },
+   {
+    "id": "N1",
+    "kind": "comment-end"
+   },
+   {
+    "id": "N2",
+    "kind": "commentReference"
+   },
+   {
+    "id": "N3",
+    "kind": "comment-start"
+   },
+   {
+    "id": "N4",
+    "kind": "comment-end"
+   },
+   {
+    "id": "N5",
+    "kind": "commentReference"
+   },
+   {
+    "id": "N6",
+    "kind": "comment-start"
+   },
+   {
+    "id": "N7",
+    "kind": "comment-end"
+   },
+   {
+    "id": "N8",
+    "kind": "commentReference"
+   },
+   {
+    "id": "N9",
+    "kind": "annotationRef"
+   },
+   {
+    "id": "N10",
+    "kind": "annotationRef"
+   },
+   {
+    "id": "N11",
+    "kind": "annotationRef"
+   }
+  ],
+  "complex": [
+   {
+    "id": "N0",
+    "kind": "tab"
+   },
+   {
+    "id": "N1",
+    "kind": "br"
+   },
+   {
+    "id": "N2",
+    "kind": "noBreakHyphen"
+   },
+   {
+    "id": "N3",
+    "kind": "softHyphen"
+   },
+   {
+    "id": "N4",
+    "kind": "sym"
+   },
+   {
+    "id": "N5",
+    "kind": "bookmark-start"
+   },
+   {
+    "id": "N6",
+    "kind": "bookmark-end"
+   },
+   {
+    "id": "N7",
+    "kind": "comment-start"
+   },
+   {
+    "id": "N8",
+    "kind": "comment-end"
+   },
+   {
+    "id": "N9",
+    "kind": "commentReference"
+   },
+   {
+    "id": "N10",
+    "kind": "hyperlink"
+   },
+   {
+    "id": "N11",
+    "kind": "unsupported-run"
+   },
+   {
+    "id": "N12",
+    "kind": "tab"
+   },
+   {
+    "id": "N13",
+    "kind": "br"
+   },
+   {
+    "id": "N14",
+    "kind": "opaque"
+   },
+   {
+    "id": "N15",
+    "kind": "revision"
+   },
+   {
+    "id": "N16",
+    "kind": "opaque"
+   },
+   {
+    "id": "N17",
+    "kind": "unsupported-run"
+   },
+   {
+    "id": "N18",
+    "kind": "unsupported-run"
+   },
+   {
+    "id": "N19",
+    "kind": "unsupported-run"
+   },
+   {
+    "id": "N20",
+    "kind": "separator"
+   },
+   {
+    "id": "N21",
+    "kind": "continuationSeparator"
+   },
+   {
+    "id": "N22",
+    "kind": "separator"
+   },
+   {
+    "id": "N23",
+    "kind": "continuationSeparator"
+   },
+   {
+    "id": "N24",
+    "kind": "annotationRef"
+   }
+  ],
+  "plain": [],
+  "styled": [],
+  "table": []
+ }
+}
