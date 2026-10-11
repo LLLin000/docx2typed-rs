@@ -467,3 +467,50 @@ fn reported_count_matches_applied_edits() {
     assert!(text.contains("Y二"), "second run edited: {text}");
     assert!(!text.contains("润滑"), "no stale keyword: {text}");
 }
+
+// ---------------------------------------------------------------------------
+// 8. Coverage: a zero-match count must not imply "absent from the file".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replace_reports_the_parts_it_cannot_reach() {
+    let dir = scratch("coverage");
+    let workdir = dir.join("wd");
+    extract(&fixture("parts"), &workdir);
+
+    let results = mcp(&[
+        (
+            "workdir_open",
+            json!({"workdir": workdir.to_string_lossy()}),
+        ),
+        (
+            "document_replace",
+            json!({"find": "Draft", "replace": "X", "scope": "all", "dry_run": true, "operation_id": "cov"}),
+        ),
+    ]);
+    let coverage = &envelope(&results[1])["data"]["coverage"];
+    let scanned: Vec<&str> = coverage["scanned_parts"]
+        .as_array()
+        .expect("scanned_parts")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let unscanned: Vec<&str> = coverage["unscanned_parts"]
+        .as_array()
+        .expect("unscanned_parts")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(scanned, vec!["document"]);
+    assert!(
+        unscanned.contains(&"header1") && unscanned.contains(&"footnotes"),
+        "the unreachable parts must be named: {unscanned:?}"
+    );
+    assert!(
+        coverage["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not reachable"),
+        "the payload must say a 0 count is not proof of absence"
+    );
+}

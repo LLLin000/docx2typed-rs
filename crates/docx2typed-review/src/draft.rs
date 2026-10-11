@@ -2041,6 +2041,39 @@ pub struct DocumentReplaceArgs<'a> {
     pub dry_run: bool,
 }
 
+/// The parts a `document_replace` call can actually reach, and a plain-language
+/// statement of that reach.
+///
+/// The draft projection carries ONE part today — the main document story. The
+/// header, footer, footnote, endnote and comment parts are extracted and built
+/// but are not part of the editable projection, so a replace cannot touch them.
+/// Reporting this explicitly matters more than the limit itself: an agent that
+/// reads only `matches: 0` has no way to tell "the word is absent" from "the
+/// word is in a part this call never scans".
+fn replacement_coverage(scope: &str) -> Value {
+    let part = match scope {
+        s if s.starts_with("header")
+            || s.starts_with("footer")
+            || s.starts_with("footnotes")
+            || s.starts_with("endnotes")
+            || s.starts_with("comments") =>
+        {
+            s.split('.').next().unwrap_or(s)
+        }
+        _ => "document",
+    };
+    let known = ["header1", "footer1", "footnotes", "endnotes", "comments"];
+    let unscanned: Vec<&str> = known.iter().copied().filter(|p| *p != part).collect();
+    serde_json::json!({
+        "scanned_parts": [part],
+        "unscanned_parts": unscanned,
+        "note": "the editable projection covers the main document story only; \
+                 header, footer, footnote, endnote, comment and text-box parts are \
+                 built but not reachable by this call, so a `0` match count does not \
+                 mean the phrase is absent from the file",
+    })
+}
+
 pub fn document_replace(
     workdir: &Path,
     args: DocumentReplaceArgs<'_>,
@@ -2292,6 +2325,8 @@ pub fn document_replace(
     if total == 0 {
         return Ok(serde_json::json!({
             "scope": args.scope,
+        "coverage": replacement_coverage(args.scope),
+            "coverage": replacement_coverage(args.scope),
             "find": args.find,
             "matches": 0,
             "changed": 0,
@@ -2308,6 +2343,8 @@ pub fn document_replace(
     if args.dry_run {
         return Ok(serde_json::json!({
             "scope": args.scope,
+        "coverage": replacement_coverage(args.scope),
+            "coverage": replacement_coverage(args.scope),
             "find": args.find,
             "matches": total,
             "changed": 0,
@@ -2497,6 +2534,7 @@ pub fn document_replace(
     let revision_after = current_revision(workdir)?;
     Ok(serde_json::json!({
         "scope": args.scope,
+        "coverage": replacement_coverage(args.scope),
         "find": args.find,
         "matches": total,
         "changed": total,
