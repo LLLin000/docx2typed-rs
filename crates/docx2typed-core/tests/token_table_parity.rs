@@ -84,3 +84,56 @@ fn the_sequence_is_contiguous_and_never_renumbered() {
         "and the container's revisions come first"
     );
 }
+
+/// The tree and the flat table are two views of ONE walk, so their ids must
+/// agree. If they ever diverge, the markup and `format.json` would disagree
+/// about which token is which.
+#[test]
+fn the_tree_and_the_table_agree_on_every_id() {
+    use docx2typed_core::token_table::paragraph_nodes;
+    let fixture = expectation();
+    let documents = fixture["documents"].as_object().expect("documents");
+    for (name, expected) in documents {
+        let bytes = fs::read(corpus().join(format!("{name}.docx"))).expect("fixture");
+        let table = token_table(&bytes).expect("table");
+        let paragraphs = paragraph_nodes(&bytes).expect("tree");
+
+        // The tree's tokens in document order. A mark is allocated LAST within
+        // its paragraph (rule 2), so it is appended per paragraph rather than
+        // collected with the container's nodes.
+        let mut from_tree: Vec<(String, String)> = Vec::new();
+        for paragraph in &paragraphs {
+            let mut here: Vec<(String, String)> = Vec::new();
+            for node in &paragraph.nodes {
+                node.collect_token_ids(&mut here);
+            }
+            // A revision NODE says insert/delete/...; its TOKEN says
+            // "revision". The reference stores them the same way, so the node
+            // kind is mapped back rather than pretending they are one field.
+            from_tree.extend(here.into_iter().map(|(id, kind)| {
+                let kind = match kind.as_str() {
+                    "insert" | "delete" | "move_from" | "move_to" => "revision".to_string(),
+                    other => other.to_string(),
+                };
+                (id, kind)
+            }));
+            if let Some((_, token_id, _)) = &paragraph.mark {
+                from_tree.push((token_id.clone(), "paragraph-mark".to_string()));
+            }
+        }
+
+        let from_table: Vec<(String, String)> = table
+            .iter()
+            .map(|token| (token.id.clone(), token.kind.clone()))
+            .collect();
+        assert_eq!(
+            from_table, from_tree,
+            "{name}: the tree and the table disagree"
+        );
+        assert_eq!(
+            from_table.len(),
+            expected.as_array().unwrap().len(),
+            "{name}"
+        );
+    }
+}
