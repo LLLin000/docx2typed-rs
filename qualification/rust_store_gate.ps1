@@ -45,6 +45,10 @@ function Invoke-Rust([string[]]$arguments, [hashtable]$environment = @{}) {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    # The child must WRITE utf-8. These oracles print document text, and a CI
+    # console is cp1252: without this they die with UnicodeEncodeError on the
+    # first non-ASCII character (found on tracer59 printing 审稿人).
+    $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
     foreach ($key in $environment.Keys) {
         $psi.EnvironmentVariables[$key] = $environment[$key]
     }
