@@ -2101,61 +2101,97 @@ pub fn serialize_typed(
     text
 }
 
-/// The `skeleton` of a paragraph: its run sequence by style, which is what the
-/// reference records instead of the text itself.
-///
-/// Mirrors `skeleton` for the text case. Anchor, inline, opaque and revision
-/// nodes carry token ids this projection does not yet surface, so a paragraph
-/// containing one is reported by the differential rather than silently
-/// flattened into text.
-fn paragraph_skeleton(segments: &[Segment]) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    let mut last: Option<&str> = None;
-    for segment in segments {
-        if segment.text.is_empty() {
-            continue;
-        }
-        if last == Some(segment.style_id.as_str()) {
-            continue;
-        }
-        last = Some(segment.style_id.as_str());
-        out.push(serde_json::json!(["text", segment.style_id]));
-    }
-    out
-}
-
 /// The `format.json` paragraph records, one per paragraph in extract order.
 pub fn format_paragraphs(
     projection: &crate::document_projection::DocumentProjection,
+    trees: &[crate::token_table::ParagraphNodes],
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     let mut fallback = crate::document_projection::default_style_id();
-    for (index, paragraph) in projection.paragraphs.iter().enumerate() {
-        let base_style = choose_base_style(&paragraph.segments, &fallback);
-        fallback = base_style.clone();
+    // The trees are the typed document, so they carry the paragraph order and
+    // the nodes; the projection supplies nothing here that the tree lacks.
+    let _ = projection;
+    // The same document order typed.md uses -- headers, body, footers, notes,
+    // comments -- not the trees' token order.
+    let mut ordered: Vec<&crate::token_table::ParagraphNodes> = trees.iter().collect();
+    ordered.sort_by_key(|tree| {
+        let key = crate::token_table::typed_part_key(&tree.part);
+        let rank = if key.starts_with("header") {
+            0
+        } else if key.is_empty() {
+            1
+        } else if key.starts_with("footer") {
+            2
+        } else if key == "footnotes" || key == "endnotes" {
+            3
+        } else {
+            4
+        };
+        (rank, key)
+    });
+    for (index, tree) in ordered.into_iter().enumerate() {
+        let paragraph_id = tree.paragraph_id.clone();
+        let part_key = crate::token_table::typed_part_key(&tree.part);
+        let is_body = part_key.is_empty();
+        let segments: Vec<Segment> = tree
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                crate::token_table::TypedNode::Text { style_id, text } => Some(Segment {
+                    start: 0,
+                    end: text.chars().count(),
+                    text: text.clone(),
+                    style_id: style_id.clone(),
+                    revision: None,
+                    comment_ids: Vec::new(),
+                    editable: true,
+                    visibility: crate::document_projection::Visibility {
+                        original: true,
+                        tracked: true,
+                        final_view: true,
+                    },
+                }),
+                _ => None,
+            })
+            .collect();
+        // Same rule as the serializer: only the BODY's walk assigns base_style.
+        let base_style = if is_body {
+            let chosen = choose_base_style(&segments, &fallback);
+            fallback = chosen.clone();
+            chosen
+        } else {
+            String::new()
+        };
+        // `editable` is "the paragraph contains no opaque node" -- the
+        // reference's `not contains_opaque(children)`.
+        let editable = tree
+            .nodes
+            .iter()
+            .all(|node| !matches!(node, crate::token_table::TypedNode::Opaque { .. }));
         // The reference: the paragraph mark's rPr, then the first text run,
         // then the base style. The projection does not surface the mark, so a
         // paragraph WITH text uses its first run, which is the same answer.
-        let insertion_style = paragraph
-            .segments
+        let insertion_style = segments
             .iter()
             .find(|segment| !segment.text.is_empty())
             .map(|segment| segment.style_id.clone())
             .unwrap_or_else(|| base_style.clone());
-        let part_key = if paragraph.part == "document" {
-            String::new()
-        } else {
-            paragraph.part.clone()
-        };
         out.push(serde_json::json!({
-            "id": paragraph.paragraph_id,
+            "id": paragraph_id,
             "base_style": base_style,
             "insertion_style": insertion_style,
-            "skeleton": paragraph_skeleton(&paragraph.segments),
-            "token_ids": Vec::<serde_json::Value>::new(),
+            "skeleton": crate::token_table::skeleton(&tree.nodes),
+            "token_ids": crate::token_table::token_ids(&tree.nodes),
             "section_bearing": false,
-            "editable": paragraph.editable,
-            "mark_revision": serde_json::Value::Null,
+            "editable": editable,
+            "mark_revision": match &tree.mark {
+                Some((kind, token_id, attrs)) => serde_json::json!({
+                    "kind": kind,
+                    "token_id": token_id,
+                    "attrs": attrs,
+                }),
+                None => serde_json::Value::Null,
+            },
             "original_index": index,
             "part_key": part_key,
             "part_entry_id": "",

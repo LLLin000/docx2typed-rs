@@ -213,7 +213,14 @@ fn part_digests(package: &[u8]) -> Result<BTreeMap<String, String>, CoreError> {
     for index in 0..archive.len() {
         let (name, bytes) = read_member(&mut archive, index)?;
         if is_part_key(&name) {
-            out.insert(name, bytes_sha256(&bytes));
+            // The reference keys by PART KEY ("comments", "endnotes"), not by
+            // the package path ("word/comments.xml").
+            let key = name
+                .strip_prefix("word/")
+                .and_then(|rest| rest.strip_suffix(".xml"))
+                .unwrap_or(&name)
+                .to_string();
+            out.insert(key, bytes_sha256(&bytes));
         }
     }
     Ok(out)
@@ -262,6 +269,7 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
     let package_bytes = std::fs::read(&source_path).map_err(CoreError::io)?;
     let projection = crate::document_projection::project_document_bytes(&package_bytes)?;
     let trees = crate::token_table::paragraph_nodes(&package_bytes)?;
+    let tokens = crate::token_table::token_table(&package_bytes)?;
     let typed_md = crate::prose::serialize_typed(&source_name, &projection, &trees);
 
     // The registry, built from the document's own runs. This was a hardcoded
@@ -280,9 +288,6 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
     };
     let styles_sha256 = bytes_sha256(&styles_bytes);
 
-    let document_xml_text = String::from_utf8_lossy(&document_xml);
-    let source_track_enabled = document_xml_text.contains("w:trackChanges");
-
     let format = serde_json::json!({
         "schema": FORMAT_SCHEMA,
         "model_version": MODEL_VERSION,
@@ -298,9 +303,9 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
         // Per-part digests, and the paragraph records (#52). Both were empty,
         // which is most of why format.json could not match the reference.
         "parts": part_digests(&package_bytes)?,
-        "paragraphs": crate::prose::format_paragraphs(&projection),
-        "tokens": {},
-        "source_track_enabled": source_track_enabled,
+        "paragraphs": crate::prose::format_paragraphs(&projection, &trees),
+        "tokens": crate::token_table::tokens_map(&tokens),
+        "source_track_enabled": crate::token_table::source_track_enabled(&package_bytes),
         "uses_date_utc": false,
         "vertical_promotion": { "schema": "2", "promoted": 0 },
         // `typed_sha256` is deliberately absent: the reference pins typed.md

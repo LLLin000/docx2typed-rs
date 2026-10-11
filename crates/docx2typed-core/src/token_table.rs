@@ -40,6 +40,13 @@ pub struct TokenRecord {
     /// Byte range of the token's element inside its part.
     pub start: usize,
     pub end: usize,
+    /// `raw`: the element's own XML, for the kinds that publish it.
+    pub raw: String,
+    /// `open` / `close`: the tag pair, for a range or a revision.
+    pub open: String,
+    pub close: String,
+    /// The run's style, for an inline or a run-shaped token.
+    pub style_id: String,
 }
 
 /// One node of a paragraph's typed tree.
@@ -135,6 +142,260 @@ impl TypedNode {
             }
         }
     }
+}
+
+/// The element's opening tag with the namespaces ElementTree would emit.
+///
+/// `etree_xml` re-serialises through ElementTree, which writes the namespace
+/// declaration onto the element when the fragment is standalone -- measured on
+/// `w:fldSimple`, whose reference `raw` is
+/// `<w:fldSimple xmlns:w="..." w:instr=" PAGE ">`. The source bytes carry the
+/// declaration on the document root instead, so it has to be re-added.
+fn with_namespace(tag: &str, namespaces: &BTreeMap<String, String>) -> String {
+    if tag.contains("xmlns") || !tag.starts_with('<') || tag.starts_with("</") {
+        return tag.to_string();
+    }
+    let Some(name_end) = tag.find(|c: char| c.is_whitespace() || c == '>' || c == '/') else {
+        return tag.to_string();
+    };
+    let name = &tag[1..name_end];
+    let Some((prefix, local)) = name.split_once(':') else {
+        return tag.to_string();
+    };
+    let Some(uri) = namespaces.get(prefix) else {
+        return tag.to_string();
+    };
+    // ElementTree keeps the five REGISTERED prefixes and renames anything else
+    // to `ns0`, `ns1`, ... in order of use -- measured on `m:oMath`, whose
+    // reference raw is `<ns0:oMath xmlns:ns0=".../math" xmlns:w="...">`. It
+    // also emits every declaration in scope, not just the one it renamed.
+    let registered = [
+        (
+            "w",
+            "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        ),
+        (
+            "r",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        ),
+        (
+            "w15",
+            "http://schemas.microsoft.com/office/word/2012/wordml",
+        ),
+        (
+            "w16du",
+            "http://schemas.microsoft.com/office/word/2023/wordml/word16du",
+        ),
+    ];
+    let known = registered
+        .iter()
+        .any(|(_, known_uri)| *known_uri == uri.as_str());
+    let mut out = String::new();
+    if known {
+        out.push_str(&format!("<{name}"));
+    } else {
+        out.push_str(&format!("<ns0:{local}"));
+    }
+    // Only the namespaces this element actually USES: ElementTree emits a
+    // declaration per prefix that appears in the serialised subtree, so a
+    // `w:fldSimple` gets `xmlns:w` alone even though the document also
+    // declares `r`. Measured: emitting every in-scope declaration added an
+    // `xmlns:r` the reference does not have.
+    // When the prefix is unregistered it is RENAMED to ns0, so its original
+    // declaration must not appear -- the reference declares ns0 and w only.
+    // Every prefix used ANYWHERE in the element, children included: ElementTree
+    // declares per prefix that appears in the serialised subtree, and a
+    // `ns0:oMath` holding `<w:ins>` needs both.
+    let mut used: Vec<String> = if known {
+        vec![prefix.to_string()]
+    } else {
+        Vec::new()
+    };
+    let mut cursor = 0usize;
+    while let Some(at) = tag[cursor..].find('<') {
+        let start = cursor + at + 1;
+        let rest = &tag[start..];
+        let skip = usize::from(rest.starts_with('/'));
+        let name: String = rest[skip..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == ':' || *c == '_' || *c == '-')
+            .collect();
+        if let Some((found, _)) = name.split_once(':') {
+            // The element's OWN prefix is skipped when it is being renamed:
+            // the output says `ns0:oMath`, so declaring `xmlns:m` as well
+            // would be a declaration the reference does not have.
+            let is_own_prefix = found == prefix && !known;
+            if !is_own_prefix && !used.iter().any(|entry| entry == found) {
+                used.push(found.to_string());
+            }
+        }
+        cursor = start;
+    }
+    for (key, _) in crate::prose::canonical_attribute_pairs(tag.as_bytes()) {
+        if let Some((attribute_prefix, _)) = key.split_once(':') {
+            if !used.iter().any(|entry| entry == attribute_prefix) {
+                used.push(attribute_prefix.to_string());
+            }
+        }
+    }
+    // The RENAMED namespace is declared FIRST -- ElementTree writes the
+    // element's own namespace before the others it finds in use.
+    if !known {
+        out.push_str(&format!(" xmlns:ns0=\"{uri}\""));
+    }
+    let mut declared: Vec<String> = Vec::new();
+    for used_prefix in used {
+        if declared.iter().any(|entry| entry == &used_prefix) || used_prefix == "ns0" {
+            continue;
+        }
+        let Some(used_uri) = namespaces.get(&used_prefix) else {
+            continue;
+        };
+        declared.push(used_prefix.clone());
+        out.push_str(&format!(" xmlns:{used_prefix}=\"{used_uri}\""));
+    }
+    // ElementTree closes an empty element as ` />`; the source writes `/>`.
+    let mut tail = tag[name_end..].to_string();
+    tail = tail.replace("/>", " />");
+    out.push_str(&tail);
+    // The CLOSING tag is renamed too: a raw of `<ns0:oMath>...</m:oMath>` is
+    // not well-formed, and ElementTree renames both ends.
+    if !known {
+        out = out.replace(&format!("</{prefix}:{local}>"), &format!("</ns0:{local}>"));
+    }
+    out
+}
+
+/// The `tokens` map `format.json` publishes: id -> the record, sorted by id.
+///
+/// The payload differs by kind, exactly as `_TokenTable.add` records it: a
+/// range or revision carries `open`/`close`, everything else carries `raw`, and
+/// the run-shaped kinds also carry `style_id`.
+pub fn tokens_map(tokens: &[TokenRecord]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for token in tokens {
+        let mut record = serde_json::Map::new();
+        record.insert("kind".to_string(), serde_json::json!(token.kind));
+        record.insert(
+            "attrs".to_string(),
+            serde_json::Value::Object(
+                token
+                    .attrs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                    .collect(),
+            ),
+        );
+        if matches!(token.kind.as_str(), "hyperlink" | "revision") {
+            record.insert("open".to_string(), serde_json::json!(token.open));
+            record.insert("close".to_string(), serde_json::json!(token.close));
+        } else {
+            record.insert("raw".to_string(), serde_json::json!(token.raw));
+        }
+        if matches!(
+            token.kind.as_str(),
+            "empty-run" | "rpr-change" | "unsupported-run"
+        ) || KNOWN_INLINE.contains(&token.kind.as_str())
+        {
+            record.insert("style_id".to_string(), serde_json::json!(token.style_id));
+        }
+        map.insert(token.id.clone(), serde_json::Value::Object(record));
+    }
+    serde_json::Value::Object(map)
+}
+
+/// `source_track_enabled`: whether `word/settings.xml` turns track changes on.
+pub fn source_track_enabled(package: &[u8]) -> bool {
+    let reader = std::io::Cursor::new(package.to_vec());
+    let Ok(mut archive) = zip::ZipArchive::new(reader) else {
+        return false;
+    };
+    let Ok(mut file) = archive.by_name("word/settings.xml") else {
+        return false;
+    };
+    let mut text = String::new();
+    if std::io::Read::read_to_string(&mut file, &mut text).is_err() {
+        return false;
+    }
+    // A `<w:trackChanges/>` with no explicit false value.
+    let mut cursor = 0usize;
+    while let Some(at) = text[cursor..].find("trackChanges") {
+        let start = cursor + at;
+        let end = text[start..]
+            .find('>')
+            .map(|n| start + n)
+            .unwrap_or(text.len());
+        let tag = &text[start..end];
+        if !tag.contains("w:val=\"false\"") && !tag.contains("w:val=\"0\"") {
+            return true;
+        }
+        cursor = end + 1;
+    }
+    false
+}
+
+/// `skeleton`: the paragraph's shape by node kind, which is what `format.json`
+/// records instead of the text itself.
+///
+/// Mirrors `skeleton` exactly: a text node is `["text", style]`, an anchor
+/// `["anchor", kind, attrs]`, an inline `["inline", kind, style, attrs]`, an
+/// opaque `["opaque", kind, attrs]`, and a range or revision
+/// `[<kind>, kind, attrs, children]` with its own children nested.
+pub fn skeleton(nodes: &[TypedNode]) -> Vec<serde_json::Value> {
+    nodes.iter().map(skeleton_node).collect()
+}
+
+fn attrs_pairs(attrs: &BTreeMap<String, String>) -> serde_json::Value {
+    // `[[key, value], ...]` with the keys SORTED -- `sorted(node.attrs.items())`.
+    serde_json::Value::Array(
+        attrs
+            .iter()
+            .map(|(key, value)| serde_json::json!([key, value]))
+            .collect(),
+    )
+}
+
+fn skeleton_node(node: &TypedNode) -> serde_json::Value {
+    match node {
+        TypedNode::Text { style_id, .. } => serde_json::json!(["text", style_id]),
+        TypedNode::Anchor { kind, attrs, .. } => {
+            serde_json::json!(["anchor", kind, attrs_pairs(attrs)])
+        }
+        TypedNode::Inline {
+            kind,
+            style_id,
+            attrs,
+            ..
+        } => serde_json::json!(["inline", kind, style_id, attrs_pairs(attrs)]),
+        TypedNode::Opaque { kind, attrs, .. } => {
+            serde_json::json!(["opaque", kind, attrs_pairs(attrs)])
+        }
+        TypedNode::Range {
+            kind,
+            attrs,
+            children,
+            ..
+        } => serde_json::json!(["range", kind, attrs_pairs(attrs), skeleton(children)]),
+        TypedNode::Revision {
+            kind,
+            attrs,
+            children,
+            ..
+        } => serde_json::json!(["revision", kind, attrs_pairs(attrs), skeleton(children)]),
+    }
+}
+
+/// `_token_ids`: `[[token_id, kind], ...]`, with a range's or revision's
+/// children following it -- which `TypedNode::collect_token_ids` already does.
+pub fn token_ids(nodes: &[TypedNode]) -> Vec<serde_json::Value> {
+    let mut collected: Vec<(String, String)> = Vec::new();
+    for node in nodes {
+        node.collect_token_ids(&mut collected);
+    }
+    collected
+        .into_iter()
+        .map(|(id, kind)| serde_json::json!([id, kind]))
+        .collect()
 }
 
 /// A paragraph's typed tree, plus the paragraph's own mark token.
@@ -286,6 +547,21 @@ struct Walker<'a> {
 impl<'a> Walker<'a> {
     fn add(&mut self, kind: &str, attrs: BTreeMap<String, String>, node: &ElementNode) -> String {
         let id = format!("N{}", self.tokens.len());
+        let raw = with_namespace(
+            &String::from_utf8_lossy(&self.bytes[node.open_start..node.end]),
+            &self.namespaces,
+        );
+        // `open`/`close` are built by `element_start_xml`/`element_end_xml` from
+        // the tag and its ATTRIBUTES, so they carry no namespace declaration --
+        // unlike `raw`, which goes through `etree_xml`. Measured on N0, whose
+        // reference `open` is `<w:ins w:id="1" ...>` with no xmlns.
+        let open =
+            String::from_utf8_lossy(&self.bytes[node.open_start..node.open_end]).into_owned();
+        let close = if node.self_closing {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&self.bytes[node.close_start..node.end]).into_owned()
+        };
         self.tokens.push(TokenRecord {
             id,
             kind: kind.to_string(),
@@ -294,11 +570,30 @@ impl<'a> Walker<'a> {
             paragraph_id: self.paragraph_id.clone(),
             start: node.open_start,
             end: node.end,
+            raw,
+            open,
+            close,
+            style_id: String::new(),
         });
         self.tokens
             .last()
             .map(|token| token.id.clone())
             .unwrap_or_default()
+    }
+
+    /// The same, with the run's style recorded.
+    fn add_styled(
+        &mut self,
+        kind: &str,
+        attrs: BTreeMap<String, String>,
+        node: &ElementNode,
+        style_id: &str,
+    ) -> String {
+        let id = self.add(kind, attrs, node);
+        if let Some(last) = self.tokens.last_mut() {
+            last.style_id = style_id.to_string();
+        }
+        id
     }
 
     /// The literal tag name and attributes of one element, as the reference's
@@ -395,6 +690,15 @@ impl<'a> Walker<'a> {
                         let (_, attrs) = self.tag(mark);
                         let mark = mark.clone();
                         let token_id = self.add("paragraph-mark", attrs.clone(), &mark);
+                        // The mark's `raw` is the regex MATCH from the pPr
+                        // bytes, not an `etree_xml` re-serialisation, so it
+                        // carries no namespace declaration -- measured on N2,
+                        // whose reference raw is `<w:ins w:id="3" .../>`.
+                        if let Some(last) = self.tokens.last_mut() {
+                            last.raw =
+                                String::from_utf8_lossy(&self.bytes[mark.open_start..mark.end])
+                                    .into_owned();
+                        }
                         return Some((kind.to_string(), token_id, attrs));
                     }
                 }
@@ -420,6 +724,13 @@ impl<'a> Walker<'a> {
                         let (_, attrs) = self.tag(mark);
                         let mark = mark.clone();
                         self.add("paragraph-mark", attrs, &mark);
+                        // Same rule as `paragraph_mark_token`: the mark's raw
+                        // is the byte slice, not an ElementTree re-serialisation.
+                        if let Some(last) = self.tokens.last_mut() {
+                            last.raw =
+                                String::from_utf8_lossy(&self.bytes[mark.open_start..mark.end])
+                                    .into_owned();
+                        }
                     }
                 }
             }
@@ -525,7 +836,7 @@ impl<'a> Walker<'a> {
             }
             if KNOWN_INLINE.contains(&name.as_str()) {
                 let (_, attrs) = self.tag(&node);
-                let token_id = self.add(&name, attrs.clone(), &node);
+                let token_id = self.add_styled(&name, attrs.clone(), &node, &style_id);
                 out.push(TypedNode::Inline {
                     token_id,
                     kind: name.clone(),
@@ -592,10 +903,12 @@ impl<'a> Walker<'a> {
     fn run(&mut self, run: &ElementNode) {
         let mut rpr_change: Option<ElementNode> = None;
         let mut saw_content = false;
+        let mut style = crate::document_projection::default_style_id();
         for &child in &run.children {
             let node = self.nodes[child].clone();
             let name = node.name.clone();
             if name == "rPr" {
+                style = self.style_of(&node);
                 for &inner in &node.children {
                     if self.nodes[inner].name == "rPrChange" {
                         rpr_change = Some(self.nodes[inner].clone());
@@ -609,7 +922,9 @@ impl<'a> Walker<'a> {
             }
             if KNOWN_INLINE.contains(&name.as_str()) {
                 let (_, attrs) = self.tag(&node);
-                self.add(&name, attrs, &node);
+                // Styled, like `run_nodes`: an inline's token carries the run's
+                // style, and format.json publishes it.
+                self.add_styled(&name, attrs, &node, &style);
                 saw_content = true;
                 continue;
             }
