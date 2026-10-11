@@ -695,7 +695,10 @@ mod tests {
             Some(docx.to_string_lossy().as_ref())
         );
         // Padded, URL-safe alphabet: the reference's decoder needs the padding.
-        assert!(token.contains('=') || token.len().is_multiple_of(4), "{token}");
+        assert!(
+            token.contains('=') || token.len().is_multiple_of(4),
+            "{token}"
+        );
         assert!(!token.contains('+') && !token.contains('/'), "{token}");
         // The reference emits its payload base64url-encoded too, so a token
         // built the Python way decodes here.
