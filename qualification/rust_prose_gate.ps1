@@ -78,6 +78,11 @@ function Invoke-Python([string[]]$arguments) {
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    # The child must WRITE utf-8 too. These oracles print document text, and a
+    # CI console is cp1252: without this they die with UnicodeEncodeError on the
+    # first non-ASCII character (found on tracer59 printing 审稿人). Setting
+    # StandardOutputEncoding above only fixes how WE decode their bytes.
+    $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
     $proc = [System.Diagnostics.Process]::Start($psi)
     $stdout = $proc.StandardOutput.ReadToEnd()
     $stderr = $proc.StandardError.ReadToEnd()

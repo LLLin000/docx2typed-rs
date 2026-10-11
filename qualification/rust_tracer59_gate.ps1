@@ -9,7 +9,7 @@
 #        [-Bin ..\target\release\docx2typed.exe]
 
 param(
-    [string]$Bin = "..\target\release\docx2typed.exe"
+    [string]$Bin = "target\release\docx2typed.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,6 +52,11 @@ function Invoke-Python([string[]]$arguments) {
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    # The child must WRITE utf-8 too. These oracles print document text, and a
+    # CI console is cp1252: without this they die with UnicodeEncodeError on the
+    # first non-ASCII character (found on tracer59 printing 审稿人). Setting
+    # StandardOutputEncoding above only fixes how WE decode their bytes.
+    $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
     $proc = [System.Diagnostics.Process]::Start($psi)
     $stdout = $proc.StandardOutput.ReadToEnd()
     $stderr = $proc.StandardError.ReadToEnd()
@@ -76,7 +81,16 @@ function Invoke-Oracle([string]$kind, [string]$path, [string]$extra = "") {
     $argsList = @($oracle, $kind, $path)
     if ($extra) { $argsList += $extra }
     $result = Invoke-Python $argsList
-    if ($result.rc -ne 0) { throw "oracle failed: $kind $path $($result.stderr)" }
+    if ($result.rc -ne 0) {
+        # Print the traceback line by line BEFORE throwing. A CI log wraps a
+        # single long message into an unreadable block, which is how a failing
+        # oracle becomes a mystery instead of a diagnosis.
+        Write-Host "oracle failed: $kind $path (exit $($result.rc))"
+        foreach ($line in ($result.stderr -split "`r?`n")) {
+            if ($line.Trim()) { Write-Host "  $line" }
+        }
+        throw "oracle failed: $kind $path"
+    }
     return ($result.stdout.Trim())
 }
 
@@ -93,13 +107,6 @@ function New-OpId {
     return ([guid]::NewGuid().ToString("N"))
 }
 
-function Invoke-Oracle([string]$kind, [string]$path, [string]$extra = "") {
-    $argsList = @($oracle, $kind, $path)
-    if ($extra) { $argsList += $extra }
-    $result = Invoke-Python $argsList
-    if ($result.rc -ne 0) { throw "oracle failed: $kind $path $($result.stderr)" }
-    return ($result.stdout.Trim())
-}
 
 function Get-CommentElement([string]$path, [string]$id) {
     $stream = [System.IO.File]::OpenRead($path)

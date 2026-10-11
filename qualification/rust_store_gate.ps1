@@ -65,6 +65,10 @@ function Invoke-Python([string[]]$arguments, [hashtable]$environment = @{}) {
     foreach ($key in $environment.Keys) {
         $psi.EnvironmentVariables[$key] = $environment[$key]
     }
+    # The child must WRITE utf-8. These oracles print document text, and a CI
+    # console is cp1252: without this they die with UnicodeEncodeError on the
+    # first non-ASCII character (found on tracer59 printing 审稿人).
+    $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
     $proc = [System.Diagnostics.Process]::Start($psi)
     $stdout = $proc.StandardOutput.ReadToEnd()
     $stderr = $proc.StandardError.ReadToEnd()

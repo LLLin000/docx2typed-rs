@@ -91,6 +91,10 @@ function Invoke-Python([string[]]$arguments) {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.WorkingDirectory = $root
+    # The child must WRITE utf-8. These oracles print document text, and a CI
+    # console is cp1252: without this they die with UnicodeEncodeError on the
+    # first non-ASCII character (found on tracer59 printing 审稿人).
+    $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     [void]$proc.Start()

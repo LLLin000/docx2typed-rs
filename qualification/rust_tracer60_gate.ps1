@@ -10,7 +10,7 @@
 #        [-Bin ..\target\release\docx2typed.exe]
 
 param(
-    [string]$Bin = "..\target\release\docx2typed.exe"
+    [string]$Bin = "target\release\docx2typed.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,7 +53,14 @@ $mcpInput = @(
 # ---- 2. Adversarial oracle (raw-socket HTTP + MCP stdio + parity) ----
 $oracleResult = & python $oracle $bin $scratch 2>&1
 $oracleExit = $LASTEXITCODE
-$oracleJson = ($oracleResult -join "`n") | Select-Object -Last 1
+# The oracle prints one JSON object and MAY append a status line ("FAILED:
+# [...]"), so taking the last line parsed the status line as JSON whenever the
+# gate was failing -- which replaced the real diagnostics with a parse error on
+# exactly the runs that needed them. Take the line that IS the object.
+$oracleJson = ($oracleResult | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith("{") } | Select-Object -Last 1)
+if (-not $oracleJson) {
+    throw "tracer60 oracle produced no JSON object; raw output: $($oracleResult -join ' | ')"
+}
 $oracle = $oracleJson | ConvertFrom-Json
 if ($oracleExit -ne 0) {
     Write-Host "oracle failed (exit $oracleExit):"

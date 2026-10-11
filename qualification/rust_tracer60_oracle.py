@@ -173,16 +173,28 @@ def main():
     envelopes, raw, _ = mcp_session(bin_path, [("tools/list", {})])
     published = envelopes[0]["data"]["tools"]
     published_names = [tool["name"] for tool in published]
-    check("tool-surface-36", len(published_names) == 36, len(published_names))
+    # The expected surface comes from the FROZEN CONTRACT, never a literal. A
+    # hardcoded 36 made this gate red on main for every tool added since (#46),
+    # and a gate that is red by construction stops being read.
     check(
-        "tool-parity-python",
-        sorted(published_names) == sorted(python_names),
-        f"rust={len(published_names)} python={len(python_names)}",
+        "tool-surface-frozen",
+        sorted(published_names) == sorted(asset_names),
+        f"live={len(published_names)} frozen={len(asset_names)}",
+    )
+    # Rust must COVER the Python reference, never merely equal it. The in-repo
+    # scripts/ copy is a stale snapshot (36 tools against the external
+    # reference's 49), so equality was unsatisfiable by design: Rust passed it
+    # long ago and the check could only ever report the copy's staleness.
+    missing = sorted(set(python_names) - set(published_names))
+    check(
+        "tool-coverage-of-python",
+        not missing,
+        f"rust={len(published_names)} python_snapshot={len(python_names)} missing={missing}",
     )
     check(
         "tool-parity-asset",
         sorted(published_names) == sorted(asset_names),
-        "36 schemas in .mcp_schemas.json",
+        f"{len(asset_names)} schemas in .mcp_schemas.json",
     )
     check(
         "tool-schemas-frozen",
