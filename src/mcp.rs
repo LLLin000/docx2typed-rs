@@ -1852,7 +1852,9 @@ impl McpSession {
             Ok(workdir) => workdir.to_string(),
             Err(failure) => return failure,
         };
-        match docx2typed_review::facade::verify(Path::new(&workdir)) {
+        let query = args.get("query").and_then(Value::as_str);
+        let built = args.get("output").and_then(Value::as_str).map(Path::new);
+        match docx2typed_review::facade::verify(Path::new(&workdir), query, built) {
             Ok(data) => self.success("facade_verify", data, build_commit),
             Err(error) => self.failure("facade_verify", &error.code, &error.detail, build_commit),
         }

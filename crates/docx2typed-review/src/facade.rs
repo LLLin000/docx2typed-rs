@@ -379,7 +379,11 @@ pub fn edit(
 ///
 /// Answers what the agent needs to decide it is done: what changed, whether it
 /// is publishable, which version it descends from, and anything blocking.
-pub fn verify(workdir: &Path) -> Result<Value, CollaborationError> {
+pub fn verify(
+    workdir: &Path,
+    query: Option<&str>,
+    built: Option<&Path>,
+) -> Result<Value, CollaborationError> {
     draft::ensure_projection(workdir)?;
     let state = classify_edit_state(workdir)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
@@ -428,8 +432,31 @@ pub fn verify(workdir: &Path) -> Result<Value, CollaborationError> {
         )]
     };
 
+    // Three counts, kept separate on purpose. A single "matches" number cannot
+    // tell a full replacement from one that scanned a smaller document: an
+    // inserted paragraph lives only in the draft, and a build applies the
+    // sidecars, so baseline/draft/built can legitimately differ. Reporting them
+    // side by side is what makes "34 of 35" visible instead of "34, done".
+    let counts = query.map(|needle| {
+        let baseline = count_in_package(&workdir.join("_template.docx"), needle);
+        let draft_text = std::fs::read_to_string(workdir.join("edit.md")).unwrap_or_default();
+        let draft = draft_text.matches(needle).count();
+        let built = built.map(|path| count_in_package(path, needle));
+        json!({
+            "query": needle,
+            "baseline_matches": baseline,
+            "draft_matches": draft,
+            "built_matches": built,
+            "note": "baseline is the template, draft is the projection the agent \
+                     edits, built is the exported DOCX when one is named; a \
+                     session-inserted paragraph appears in draft and built but \
+                     not in baseline",
+        })
+    });
+
     Ok(json!({
         "schema": "docx2typed-facade-verify-1",
+        "counts": counts,
         "publishable": blocking.is_empty(),
         "draft_state": state.state,
         "changed_paragraph_ids": changed,
@@ -439,6 +466,24 @@ pub fn verify(workdir: &Path) -> Result<Value, CollaborationError> {
         "coverage": coverage("body"),
         "inventory_leaf_count": inventory.leaves.len(),
     }))
+}
+
+/// Count occurrences of `needle` in one DOCX's document part.
+///
+/// Counted over the LEAF inventory, not the raw XML: a phrase split across runs
+/// (`长效润` + `滑材料`) is one visible occurrence, and a byte count of the XML
+/// would miss it — the same reason the engine's own matching works on visible
+/// text.
+fn count_in_package(path: &Path, needle: &str) -> Option<usize> {
+    let bytes = std::fs::read(path).ok()?;
+    let inventory = prose::enumerate_package_bytes(&bytes).ok()?;
+    let mut visible = String::new();
+    for leaf in &inventory.leaves {
+        if leaf.part_key == "document" {
+            visible.push_str(&leaf.text);
+        }
+    }
+    Some(visible.matches(needle).count())
 }
 
 // ---------------------------------------------------------------------------

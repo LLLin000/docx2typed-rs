@@ -412,6 +412,14 @@
       "workdir": {
         "title": "Workdir",
         "type": "string"
+      },
+      "query": {
+        "title": "Query",
+        "type": "string"
+      },
+      "output": {
+        "title": "Output",
+        "type": "string"
       }
     },
     "title": "facade_verifyArguments",

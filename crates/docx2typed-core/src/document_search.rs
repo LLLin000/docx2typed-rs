@@ -223,7 +223,10 @@ pub fn document_search(
         let Some((kind, id)) = block_ident(block) else {
             continue;
         };
-        if kind != "p" || !allowed.contains(&id) {
+        // `@new` is a paragraph too: a session-inserted paragraph must be
+        // searchable, or a scoped read silently reports a smaller document
+        // than the one the agent is looking at.
+        if (kind != "p" && kind != "new") || !allowed.contains(&id) {
             continue;
         }
         let body = block_body(block);
@@ -800,10 +803,17 @@ pub(crate) fn escape_vertical_tag_body(text: &str) -> String {
 /// `_scope_paragraph_ids`: `body` (default), `all`, `comments`, a part prefix
 /// (`header1`, `T0`), or one paragraph id.
 pub fn scope_paragraph_ids(blocks: &[String], scope: &str) -> Result<Vec<String>, CoreError> {
+    // `@new` blocks are paragraphs too. A paragraph inserted earlier in the
+    // session lives in one, and filtering to `kind == "p"` alone made it
+    // invisible to every scoped read and edit: measured on a real patent, an
+    // inserted paragraph carrying the target phrase was never located, so the
+    // search reported 34 while the document held 35 (and the build left one
+    // unreplaced). The reference has the same filter (`mcp_server.py:5024`);
+    // Rust is deliberately stricter here.
     let ids: Vec<String> = blocks
         .iter()
         .filter_map(|block| block_ident(block))
-        .filter(|(kind, _)| kind == "p")
+        .filter(|(kind, _)| kind == "p" || kind == "new")
         .map(|(_, id)| id)
         .collect();
     let stripped = if scope == "/" {
@@ -813,11 +823,18 @@ pub fn scope_paragraph_ids(blocks: &[String], scope: &str) -> Result<Vec<String>
     };
     match stripped {
         "body" | "" => {
+            // Body paragraphs are `P<n>`; a paragraph inserted in this session
+            // carries the draft-local temp id `N<n>` and belongs to the body
+            // too. Keeping only `P<n>` made it invisible between the insert and
+            // the commit that reallocates the id — exactly the window an agent
+            // works in (measured: 34 located while the document held 35).
             return Ok(ids
                 .into_iter()
                 .filter(|id| {
-                    id.strip_prefix('P').is_some_and(|digits| {
-                        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                    ["P", "N"].iter().any(|prefix| {
+                        id.strip_prefix(prefix).is_some_and(|digits| {
+                            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                        })
                     })
                 })
                 .collect());

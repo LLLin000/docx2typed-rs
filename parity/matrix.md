@@ -40,7 +40,7 @@ Machine-readable: [`matrix.json`](matrix.json), [`python-lock.json`](python-lock
 
 | Surface | Python | Rust | Gap |
 |---|---|---|---|
-| MCP tools | **49** | **49** | 0 missing, 0 extra |
+| MCP tools | **49** | **53** | 0 missing, 0 extra |
 | CLI commands | **8** | **8** | **at parity** |
 
 The CLI is already at parity: both declare exactly
