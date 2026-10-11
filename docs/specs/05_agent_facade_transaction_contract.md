@@ -237,3 +237,70 @@ of "34, done".
 
 `complete` is therefore about execution; the coverage block is what the agent
 must read before telling the user the job is done.
+
+---
+
+## 9. Acceptance: the task suite, not the tool calls
+
+Tool-call success is not the metric an agent is judged on. `success` on every
+call can still leave the document wrong — that is the failure this whole line
+of work exists to remove. So acceptance is measured on the DOCUMENT:
+
+> A task passes only when the exported file reaches the expected state. A call
+> that reports success while the file keeps the old text is a FAILURE.
+
+`qualification/facade_task_suite.py` runs 19 natural-language tasks over 8
+kinds against a real patent, each asserting either the built DOCX content or
+specific payload fields. A task that only checks "no error" proves nothing, so
+none does.
+
+| kind | what it pins |
+|---|---|
+| unify-terminology | the whole-document rewrite lands, and the coverage block names the unreachable parts |
+| targeted-claim | one handle, one paragraph; the count of other targets is unchanged |
+| insert | a new dependent claim reaches the build; an inserted paragraph is itself editable |
+| parameter | a dosage edit locates, and an absent term reports zero rather than guessing |
+| refusal | empty query, bogus handle, cross-run span — each refused, nothing written |
+| atomicity | a batch with a bad target blocks with `staged: 0` |
+| idempotency | same `operation_id` replays byte-exactly; a repeat before commit refuses rather than doubling |
+| completion | execution and coverage evidence both present; counts agree with the built file |
+| history | a version is listed after a commit; restore works |
+
+```
+first-pass task success: 19/19 = 100%
+```
+
+### What building the suite found
+
+Two defects that no unit test had reached:
+
+1. **`locate` classified spans in the wrong coordinate space.** Offsets came
+   from the draft while the verdict walked the template's runs. They agree only
+   until an edit changes a paragraph's length — after which a healthy span read
+   as `match-spans-leaves`. The verdict now comes from the search's own
+   draft-space analysis, the same question the edit path enforces.
+
+2. **A repeat before commit refused unhelpfully.** When the replacement
+   contains the search term (`材料` -> `复合材料`), a naive second pass would
+   produce `复合复合材料`. It refused safely but as a bare `invalid-edit`. The
+   real cause is that draft offsets stop addressing the template's runs once an
+   uncommitted edit changed the length, so it now says so:
+   `paragraph-has-uncommitted-length-change`, naming `commit_sync` as the fix.
+
+### The remaining boundary, stated plainly
+
+A second edit to a paragraph that already carries an **uncommitted**
+length-changing edit is refused. That is deliberate and safe: the alternative
+is mapping draft offsets onto template runs whose lengths no longer correspond.
+The workflow is edit -> `commit_sync` -> edit again, and the refusal says so.
+
+## 10. Where the work now sits
+
+| layer | responsibility | state |
+|---|---|---|
+| Rust Document Engine | correct execution, fidelity, persistence, versioning | frozen |
+| Agent Facade | discoverable operations, locatable targets, explainable failures, evidenced completion | 19/19 acceptance |
+| Patent Writing Skill | intent, claim logic, description support, professional phrasing | not started |
+
+The boundary to hold: the Skill must not touch OOXML, and the engine must not
+make patent-domain judgements.
