@@ -1732,9 +1732,12 @@ fn plan_patch(
                 // the leaf is resolved (read-only) with the rest of validation.
                 match island_leaf_for(workdir, paragraph_id, old, *leaf_index) {
                     Ok(Some((_part, resolved_leaf))) => {
-                        // Defer: merge with any other occurrence in this leaf so
-                        // one whole-leaf edit carries them all.
-                        let char_start = anchored_chars.unwrap_or(start);
+                        // Defer: merge with any other occurrence in this leaf
+                        // so one whole-leaf edit carries them all. The leaf walk
+                        // indexes CHARS, so a text-searched hunk converts its
+                        // byte offset before deferring.
+                        let char_start =
+                            anchored_chars.unwrap_or_else(|| visible[..start].chars().count());
                         leaf_spans.push((
                             paragraph_id.clone(),
                             resolved_leaf,
@@ -1931,25 +1934,20 @@ fn plan_patch(
             .push((start, len, replacement));
     }
     for ((paragraph_id, leaf_index), spans) in merged {
-        let Some((record_old, record_new)) =
-            merged_leaf_island(workdir, &paragraph_id, leaf_index, &spans)
-        else {
-            // Cannot map the leaf: fall back to the first span's own form.
-            if let Some((start, len, replacement)) = spans.first() {
-                let _ = (start, len);
-                islands.push(docx2typed_core::prose::IslandEdit {
-                    part: "document".to_string(),
-                    paragraph_id: paragraph_id.clone(),
-                    leaf_index,
-                    old: String::new(),
-                    new: replacement.clone(),
-                    tracked: tracking.tracked,
-                    author: tracking.author.unwrap_or("").to_string(),
-                    date: tracking.date.unwrap_or("").to_string(),
-                });
-            }
-            continue;
-        };
+        // A leaf the walk cannot map is a refusal, never a half-recorded edit:
+        // an island with an empty `old` would silently do nothing at build time
+        // while the call still reported success.
+        let (record_old, record_new) =
+            merged_leaf_island(workdir, &paragraph_id, leaf_index, &spans).ok_or_else(|| {
+                CollaborationError::new(
+                    "invalid-edit",
+                    format!(
+                        "{paragraph_id}: cannot map {} replacement(s) onto leaf {leaf_index}; \
+                         nothing was written",
+                        spans.len()
+                    ),
+                )
+            })?;
         islands.push(docx2typed_core::prose::IslandEdit {
             part: "document".to_string(),
             paragraph_id,
