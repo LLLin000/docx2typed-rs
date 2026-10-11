@@ -340,7 +340,7 @@ pub fn visible_text(body: &str) -> String {
 }
 
 /// Parse one block marker line into (kind, id, extra attrs).
-fn marker_of(block: &str) -> Option<(String, String, String)> {
+pub(crate) fn marker_of(block: &str) -> Option<(String, String, String)> {
     let line = block.split('\n').next().unwrap_or("").trim();
     if let Some(rest) = line.strip_prefix("<!--@p id=\"") {
         let id = rest.split('"').next().unwrap_or("");
@@ -445,7 +445,10 @@ fn next_temp_id(blocks: &[String]) -> String {
 /// baseline (committed typed.md record where present, else the template
 /// inventory body). New blocks are always changed; delete markers are
 /// changed only when the id existed in the baseline.
-fn compute_changed(workdir: &Path, blocks: &[String]) -> Result<Vec<String>, CollaborationError> {
+pub(crate) fn compute_changed(
+    workdir: &Path,
+    blocks: &[String],
+) -> Result<Vec<String>, CollaborationError> {
     let typed_path = workdir.join("typed.md");
     let mut old_paragraphs: std::collections::BTreeMap<String, String> = if typed_path.is_file() {
         let text = fs::read_to_string(&typed_path)

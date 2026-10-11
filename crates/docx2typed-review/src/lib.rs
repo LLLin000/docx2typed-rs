@@ -12,6 +12,7 @@
 
 pub mod collab;
 pub mod draft;
+pub mod facade;
 pub mod frame;
 pub mod history;
 pub mod queue;
