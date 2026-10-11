@@ -54,6 +54,34 @@ pub struct InventoryParagraph {
 /// Enumerate the workdir's document body via the prose inventory (mirror of
 /// `enumerate` over the template). Only body paragraphs (empty part key)
 /// are listed — container/part paragraphs are out of the editable surface.
+/// Every paragraph of every part, keyed as typed.md keys them.
+///
+/// `inventory_paragraphs` deliberately narrows to the BODY, because the draft
+/// projection is body-only. This check needs the other end of the comparison:
+/// typed.md carries header, footer and note paragraphs too, and a baseline
+/// that lacks them reads each one as an unrecorded edit. That was latent until
+/// #52 -- typed.md had no paragraphs at all, so nothing ever failed to match.
+fn inventory_paragraphs_all_parts(
+    workdir: &Path,
+) -> Result<Vec<InventoryParagraph>, CollaborationError> {
+    let package = workdir.join("_template.docx");
+    let bytes = fs::read(&package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    // The TREE, not `enumerate_package`'s `visible_text`: the latter is built
+    // from `w:t` leaves alone, so a paragraph of pure separators reads as empty
+    // while typed.md reads `[opaque:separator]`. The tree gives the reference's
+    // `visible_text` for every node kind, which is what the comparison needs.
+    let trees = docx2typed_core::token_table::paragraph_nodes(&bytes)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    Ok(trees
+        .into_iter()
+        .map(|tree| InventoryParagraph {
+            id: tree.paragraph_id.clone(),
+            visible_text: docx2typed_core::token_table::visible_text(&tree.nodes),
+        })
+        .collect())
+}
+
 pub fn inventory_paragraphs(workdir: &Path) -> Result<Vec<InventoryParagraph>, CollaborationError> {
     let package = workdir.join("_template.docx");
     if !package.is_file() {
@@ -62,18 +90,18 @@ pub fn inventory_paragraphs(workdir: &Path) -> Result<Vec<InventoryParagraph>, C
             format!("_template.docx not found in {}", workdir.to_string_lossy()),
         ));
     }
-    let inventory = docx2typed_core::prose::enumerate_package(&package)
+    let bytes = fs::read(&package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let trees = docx2typed_core::token_table::paragraph_nodes(&bytes)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let mut paragraphs = Vec::new();
-    for paragraph in inventory.paragraphs {
-        // Body paragraphs carry the document part key (Rust inventory) or an
-        // empty key (Python); container/part paragraphs are out of scope.
-        if paragraph.part_key != "document" && !paragraph.part_key.is_empty() {
+    for tree in trees {
+        if tree.part != "document" && tree.part != "word/document.xml" && !tree.part.is_empty() {
             continue;
         }
         paragraphs.push(InventoryParagraph {
-            id: paragraph.paragraph_id.clone(),
-            visible_text: paragraph.visible_text.clone(),
+            id: tree.paragraph_id.clone(),
+            visible_text: docx2typed_core::token_table::project_nodes(&tree.nodes),
         });
     }
     Ok(paragraphs)
@@ -201,6 +229,87 @@ pub fn write_draft(
     out.push('\n');
     fs::write(workdir.join(PROJECTION_FILE), out)
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))
+}
+
+/// A draft body rendered as typed.md markup.
+///
+/// The two files speak DIFFERENT dialects and both match the reference:
+/// `edit.md` carries `⟦token id="N0" kind="unsupported-run" tag="…"⟧` and
+/// `typed.md` carries `<docx-opaque id="N0" kind="unsupported-run" tag="…"/>`.
+/// The commit writes typed.md from the draft's bodies, so without this the
+/// committed file would carry the draft's dialect -- and a later commit would
+/// compare the two and record a spurious edit for every token.
+///
+/// `tab`/`br`/`cr` render as their inline markers, everything else as its own
+/// element, which is what `_node_to_markup` does for each node kind.
+fn typed_markup_from_draft(body: &str) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] != '\u{27e6}' {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        let Some(close) = chars[index..].iter().position(|c| *c == '\u{27e7}') else {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        };
+        let token: String = chars[index + 1..index + close].iter().collect();
+        index += close + 1;
+        // `token id="…" kind="…" …` / `range-start …` / `range-end`
+        let (keyword, attrs) = match token.split_once(' ') {
+            Some((keyword, attrs)) => (keyword.to_string(), attrs.to_string()),
+            None => (token.clone(), String::new()),
+        };
+        let kind = attrs
+            .split("kind=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        match keyword.as_str() {
+            "range-end" => out.push_str("</docx-range>"),
+            "range-start" => {
+                let id = attrs
+                    .split("id=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                out.push_str(&format!("<docx-range id=\"{id}\" kind=\"{kind}\">"));
+            }
+            _ => match kind.as_str() {
+                "tab" | "br" | "cr" => {
+                    let id = attrs
+                        .split("id=\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("");
+                    out.push_str(&format!("<docx-inline id=\"{id}\" kind=\"{kind}\"/>"));
+                }
+                _ => {
+                    let id = attrs
+                        .split("id=\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or("");
+                    out.push_str(&format!("<docx-opaque id=\"{id}\" kind=\"{kind}\""));
+                    for pair in attrs.split(' ') {
+                        if let Some((key, value)) = pair.split_once('=') {
+                            if key == "id" || key == "kind" {
+                                continue;
+                            }
+                            out.push_str(&format!(" {key}={value}"));
+                        }
+                    }
+                    out.push_str("/>");
+                }
+            },
+        }
+    }
+    out
 }
 
 /// Python `_visible_text` for a token-free draft body: the body itself
@@ -1914,7 +2023,10 @@ pub fn apply_projection_with_options(
         };
         match kind.as_str() {
             "p" => {
-                let body = block_body(block);
+                // The draft speaks `⟦token …⟧`; typed.md speaks `<docx-opaque
+                // …/>`. Convert at the write, so the committed file is in the
+                // reference's dialect and a later commit does not diff the two.
+                let body = typed_markup_from_draft(&block_body(block));
                 typed.push_str(&format!("{}\n{body}\n", committed_marker(&id, &marker)));
             }
             "new" => {
@@ -1922,7 +2034,7 @@ pub fn apply_projection_with_options(
                 // reallocates the temp id at commit), with its inherit anchor
                 // riding along so a later commit can re-synthesise the
                 // paragraph from the same baseline.
-                let body = block_body(block);
+                let body = typed_markup_from_draft(&block_body(block));
                 let formal = formal_ids.get(&id).map(String::as_str).unwrap_or(&id);
                 typed.push_str(&format!("{}\n{body}\n", committed_marker(formal, &marker)));
             }
@@ -2120,10 +2232,11 @@ pub fn has_unrecorded_typed_edits(workdir: &Path) -> Result<bool, CollaborationE
     let typed = fs::read_to_string(workdir.join("typed.md"))
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     let recorded = parse_typed_paragraphs(&typed);
-    let baseline: std::collections::BTreeMap<String, String> = inventory_paragraphs(workdir)?
-        .into_iter()
-        .map(|paragraph| (paragraph.id, paragraph.visible_text))
-        .collect();
+    let baseline: std::collections::BTreeMap<String, String> =
+        inventory_paragraphs_all_parts(workdir)?
+            .into_iter()
+            .map(|paragraph| (paragraph.id, paragraph.visible_text))
+            .collect();
     for (id, body) in &recorded {
         match baseline.get(id) {
             Some(baseline_body) => {
@@ -2139,6 +2252,92 @@ pub fn has_unrecorded_typed_edits(workdir: &Path) -> Result<bool, CollaborationE
 
 /// Parse committed typed.md paragraph records: id -> body, plus the
 /// deleted id set (marker grammar `<!--@p id="X"-->` / `<!--@delete id="X"-->`).
+/// The visible (final-view) text of one typed.md paragraph body.
+///
+/// Mirrors `visible_text`: spans and ranges pass their children through,
+/// revisions pass children ONLY for insert/move_to (deletions are hidden), an
+/// inline `tab`/`br`/`cr` becomes whitespace, and an opaque block becomes its
+/// `[opaque:kind]` placeholder.
+///
+/// This was latent until #52: typed.md had no paragraph bodies, so the parser
+/// never had markup to strip, and `has_unrecorded_typed_edits` compared the
+/// markup against the template's plain text and declared every workdir edited.
+fn typed_body_visible_text(body: &str) -> String {
+    let bytes: Vec<char> = body.chars().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    let mut stack: Vec<String> = Vec::new();
+    while index < bytes.len() {
+        if bytes[index] == '<' {
+            let Some(close) = bytes[index..].iter().position(|c| *c == '>') else {
+                out.push(bytes[index]);
+                index += 1;
+                continue;
+            };
+            let tag: String = bytes[index..index + close + 1].iter().collect();
+            let lowered = tag.to_ascii_lowercase();
+            if let Some(name) = lowered
+                .strip_prefix("</")
+                .and_then(|rest| rest.split(|c: char| c.is_whitespace() || c == '>').next())
+            {
+                let _ = name;
+                stack.pop();
+            } else if lowered.starts_with("<span") || lowered.starts_with("<docx-range") {
+                stack.push("pass".to_string());
+            } else if lowered.starts_with("<docx-revision") {
+                let passes =
+                    lowered.contains("kind=\"insert\"") || lowered.contains("kind=\"move_to\"");
+                stack.push(if passes { "pass".into() } else { "skip".into() });
+            } else if lowered.starts_with("<docx-anchor") {
+                // AnchorNode contributes no text.
+                if !lowered.ends_with("/>") {
+                    stack.push("skip".to_string());
+                }
+            } else if lowered.starts_with("<docx-inline") {
+                if lowered.contains("kind=\"tab\"") {
+                    out.push('\t');
+                } else if lowered.contains("kind=\"br\"") || lowered.contains("kind=\"cr\"") {
+                    out.push('\n');
+                }
+            } else if lowered.starts_with("<docx-opaque") {
+                let kind = lowered
+                    .split("kind=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                out.push_str(&format!("[opaque:{kind}]"));
+            }
+            index += close + 1;
+            continue;
+        }
+        let skipped = stack.iter().any(|state| state == "skip");
+        let character = bytes[index];
+        if !skipped {
+            // `^{text}` / `_{text}`: the schema-2 vertical marker is markup, the
+            // text inside it is the text.
+            if (character == '^' || character == '_') && bytes.get(index + 1) == Some(&'{') {
+                index += 2;
+                let mut depth = 1usize;
+                while index < bytes.len() && depth > 0 {
+                    match bytes[index] {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        c if depth > 0 => out.push(c),
+                        _ => {}
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+            out.push(character);
+        }
+        index += 1;
+    }
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, String> {
     let mut records: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut current: Option<String> = None;
@@ -2147,13 +2346,11 @@ fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, Stri
                  current: &mut Option<String>,
                  body_lines: &mut Vec<String>| {
         if let Some(id) = current.take() {
-            records.insert(
-                id,
-                body_lines.join(
-                    "
-",
-                ),
-            );
+            // typed.md writes `marker\nbody\n`, so the trailing empty line is
+            // part of the FILE, not of the body -- joining it in added a
+            // newline the committed form does not have.
+            let body = body_lines.join("\n");
+            records.insert(id, typed_body_visible_text(body.trim_end_matches('\n')));
             body_lines.clear();
         }
     };
@@ -2167,7 +2364,13 @@ fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, Stri
                 .unwrap_or("")
                 .to_string();
             current = Some(id);
-        } else if trimmed.starts_with("<!--@delete") {
+        } else if trimmed.starts_with("<!--@delete") || trimmed.starts_with("<!--@part") {
+            flush(&mut records, &mut current, &mut body_lines);
+        } else if trimmed.starts_with("<!--@mark") {
+            // A paragraph-level revision mark is an annotation on the
+            // paragraph, not a terminator.
+            continue;
+        } else if trimmed.starts_with("<!--@") {
             flush(&mut records, &mut current, &mut body_lines);
         } else if current.is_some() && !trimmed.is_empty() {
             body_lines.push(line.to_string());
@@ -2309,5 +2512,51 @@ mod tests {
                 normalize_patch_hunks(std::slice::from_ref(&bad)).expect_err("invalid hunk");
             assert_eq!(error.code, "invalid-arguments", "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod visible_text_tests {
+    use super::typed_body_visible_text;
+
+    #[test]
+    fn the_vertical_markers_are_markup_and_their_text_is_text() {
+        // The shape typed.md actually writes, measured on complex.docx's P3.
+        assert_eq!(
+            typed_body_visible_text("highlight^{ superscript²}_{ subscript₂} code"),
+            "highlight superscript² subscript₂ code"
+        );
+    }
+
+    #[test]
+    fn spans_and_anchors_reduce_the_way_visible_text_does() {
+        assert_eq!(
+            typed_body_visible_text("<span data-s=\"s_x\">bold</span> plain"),
+            "bold plain"
+        );
+        assert_eq!(
+            typed_body_visible_text("<docx-anchor id=\"N0\" kind=\"bookmark-start\"/>x"),
+            "x"
+        );
+        assert_eq!(
+            typed_body_visible_text(
+                "<docx-opaque id=\"N1\" kind=\"unsupported-run\" tag=\"w:drawing\"/>y"
+            ),
+            "[opaque:unsupported-run]y"
+        );
+    }
+
+    #[test]
+    fn a_deletion_revision_hides_its_text_and_an_insertion_shows_it() {
+        assert_eq!(
+            typed_body_visible_text(
+                "<docx-revision id=\"N0\" kind=\"delete\">gone</docx-revision>kept"
+            ),
+            "kept"
+        );
+        assert_eq!(
+            typed_body_visible_text("<docx-revision id=\"N1\" kind=\"insert\">new</docx-revision>"),
+            "new"
+        );
     }
 }
