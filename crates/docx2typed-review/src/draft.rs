@@ -710,13 +710,28 @@ pub(crate) fn compute_changed(
         };
         match kind.as_str() {
             "p" => {
-                // Compare like with like. The draft speaks the token dialect
-                // (`⟦token id="N0" kind="empty-run"⟧`) while `old_paragraphs`
-                // holds typed.md reduced to VISIBLE TEXT, so a raw draft body
-                // never equals its own record for any paragraph carrying an
-                // inline token — every such paragraph read as "changed", and a
-                // real patent showed 5 of them (P7, P17, P58, P68, P81) with no
-                // edit at all. Reduce the draft the same way first.
+                // Compare like with like, and the two sides do NOT start alike.
+                // `old_paragraphs` holds typed.md reduced to VISIBLE TEXT, where
+                // a placeholder contributes nothing; the draft body spells the
+                // same placeholder as a token, which contributes a marker. So the
+                // draft has to be reduced to the text an editor sees first, or
+                // every paragraph carrying an inline token reads as changed —
+                // measured: 5 on a real patent with no edit at all (P7, P17,
+                // P58, P68, P81).
+                //
+                // This is the DRAFT reducer, and it is not the converter: it
+                // answers "what does this paragraph say", which is what the
+                // comparison needs. Nothing that PRODUCES typed.md goes through
+                // it.
+                // `typed_body_visible_text` over the TYPED spelling of the
+                // draft body, which is what the committed side was reduced with.
+                // `visible_text` alone is not the same reduction: it drops
+                // placeholders but leaves `^{…}`/`_{…}` and escapes alone, so the
+                // two sides disagreed for paragraphs carrying those and the
+                // commit reported paragraphs as changed that no one had touched
+                // (measured on `parts.docx`: P1 and P2, the footnote and endnote
+                // slots, appeared as edits and the build refused the inherited
+                // anchor).
                 let body = typed_body_visible_text(&typed_markup_from_draft(&block_body(block)));
                 let prior = old_paragraphs.get(&id).cloned().unwrap_or_default();
                 if prior != body {
@@ -3474,9 +3489,16 @@ pub fn apply_projection_with_options(
                     }
                 } else {
                     // Unchanged: keep the committed projection byte for byte.
+                    // Every `@p` block comes from the file being rewritten, so
+                    // the committed body is always there; if it somehow is not,
+                    // say so rather than render a poorer spelling of a paragraph
+                    // nobody asked to change.
                     match committed_markup.get(&id) {
                         Some(previous) => previous.clone(),
-                        None => typed_markup_from_draft(&block_body(block)),
+                        None => {
+                            report_projection_gap(&id);
+                            typed_markup_from_draft(&block_body(block))
+                        }
                     }
                 };
                 typed.push_str(&format!("{}\n{body}\n", committed_marker(&id, &marker)));
