@@ -520,6 +520,7 @@ impl McpSession {
             .to_string();
         let tracked = self.track;
         let author = self.author.clone();
+        let date = self.date.clone();
         let leaf_index = args
             .get("leaf_index")
             .and_then(Value::as_u64)
@@ -538,7 +539,7 @@ impl McpSession {
                 draft::EditTracking {
                     tracked,
                     author: author.as_deref(),
-                    date: None,
+                    date: date.as_deref(),
                 },
             )
             .map_err(|error| MutationError::new(error.code, error.detail))
@@ -615,6 +616,7 @@ impl McpSession {
     fn commit_sync(&self, args: &Value, build_commit: &str) -> Value {
         let tracked = self.track;
         let author = self.author.clone();
+        let date = self.date.clone();
         self.draft_tool_with_boundary("commit_sync", args, build_commit, true, move |target| {
             // Bootstrap the review session BEFORE `apply_projection` rewrites
             // typed.md. The bootstrap pins the current typed.md hash as the C0
@@ -623,9 +625,20 @@ impl McpSession {
             // refuse with `current-not-changed` even though the draft had edits.
             docx2typed_review::collab::ensure_session(target)
                 .map_err(|error| MutationError::new(error.code, error.detail))?;
-            let changed =
-                draft::apply_projection_with_options(target, tracked, author.as_deref(), None)
-                    .map_err(|error| MutationError::new(error.code, error.detail))?;
+            // The commit re-records the island for every paragraph it settles,
+            // so it must carry the session's identity too. Passing `None` here
+            // OVERWROTE the author and date the edit had just stored correctly:
+            // measured on the real patent, `facade_edit` wrote
+            // `date="2026-10-12T09:30:00Z"` and the very next `commit_sync`
+            // replaced it with an empty string, so the revision reached the
+            // document undated and the projection showed `w:date=""`.
+            let changed = draft::apply_projection_with_options(
+                target,
+                tracked,
+                author.as_deref(),
+                date.as_deref(),
+            )
+            .map_err(|error| MutationError::new(error.code, error.detail))?;
             if changed.is_empty() {
                 return Ok(json!({
                     "changed_paragraph_ids": [],
@@ -2065,6 +2078,7 @@ impl McpSession {
             .unwrap_or(false);
         let tracked = self.track;
         let author = self.author.clone();
+        let date = self.date.clone();
         self.draft_tool("document_patch", args, build_commit, move |target| {
             draft::ensure_projection(target)
                 .map_err(|error| MutationError::new(error.code, error.detail))?;
@@ -2081,7 +2095,7 @@ impl McpSession {
                 draft::EditTracking {
                     tracked,
                     author: author.as_deref(),
-                    date: None,
+                    date: date.as_deref(),
                 },
             )
             .map_err(|error| MutationError::new(error.code, error.detail))
@@ -2126,6 +2140,7 @@ impl McpSession {
             .unwrap_or(false);
         let tracked = self.track;
         let author = self.author.clone();
+        let date = self.date.clone();
 
         self.draft_tool("document_replace", args, build_commit, move |target| {
             draft::ensure_projection(target)
@@ -2146,7 +2161,7 @@ impl McpSession {
                 draft::EditTracking {
                     tracked,
                     author: author.as_deref(),
-                    date: None,
+                    date: date.as_deref(),
                 },
             )
             .map_err(|error| MutationError::new(error.code, error.detail))
