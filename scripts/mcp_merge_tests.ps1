@@ -120,6 +120,74 @@ Write-Utf8NoBom $noMcpConfig $seed
 Add-Check "no-mcp: binary installed" (Test-Path (Join-Path $noMcpDir "prefix\bin\docx2typed.exe"))
 Add-Check "no-mcp: host config untouched" ((Get-Content $noMcpConfig -Raw) -eq $seed)
 
+# ---- 7. the host table, and every host dialect -----------------------------
+# There is no single place to install an MCP server: each agent host keeps its
+# own config, at its own path, in its own format. These checks pin the two
+# dialects the installer speaks, and the isolation flag that makes them testable.
+$sandbox = New-Temp "hosts"
+$sandboxHome = Join-Path $sandbox "home"
+New-Item -ItemType Directory -Path (Join-Path $sandboxHome ".omp\agent") -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $sandboxHome ".cursor") -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $sandboxHome ".codex") -Force | Out-Null
+Write-Utf8NoBom (Join-Path $sandboxHome ".claude.json") '{ "mcpServers": {} }' 
+
+# JSON host: another server present, and a Windows path that 5.1's parser chokes on
+$jsonCfg = Join-Path $sandboxHome ".omp\agent\mcp.json"
+Write-Utf8NoBom $jsonCfg (@'
+{
+  "mcpServers": {
+    "kept": { "command": "C:\\elsewhere\\kept.exe", "args": ["x"], "timeout": 99 }
+  }
+}
+'@ -replace '\\', '\')
+$tomlCfg = Join-Path $sandboxHome ".codex\config.toml"
+Write-Utf8NoBom $tomlCfg @'
+model = "gpt-5"
+
+[mcp_servers.existing]
+command = "C:/elsewhere/existing.exe"
+args = ["serve"]
+
+[other_section]
+key = "value"
+'@
+
+$sandboxArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $installer,
+                 "-Action", "configure-mcp", "-HostsRoot", $sandboxHome)
+& powershell @sandboxArgs | Out-Null
+
+$j = Get-Content $jsonCfg -Raw | ConvertFrom-Json
+Add-Check "json host: entry added" (@($j.mcpServers.PSObject.Properties.Name) -contains "docx2typed")
+Add-Check "json host: other server kept" ($j.mcpServers.kept.timeout -eq 99)
+
+# TOML host: the file must still parse, and the table header must have brackets
+$tomlText = Get-Content $tomlCfg -Raw
+Add-Check "toml host: bracketed table header" ($tomlText -match '\[mcp_servers\.docx2typed\]')
+Add-Check "toml host: other table kept" ($tomlText -match '\[mcp_servers\.existing\]')
+Add-Check "toml host: unrelated section kept" ($tomlText -match '\[other_section\]')
+$py = @("python", "python3", "py") | ForEach-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
+if ($py) {
+    $code = "import sys,tomllib;d=tomllib.load(open(sys.argv[1],'rb'));print(d['mcp_servers']['docx2typed']['command'])"
+    $cmd = & $py.Source -c $code $tomlCfg 2>&1 | Out-String
+    Add-Check "toml host: file parses and the path survived" ($cmd.Trim() -like "*docx2typed.exe*")
+} else {
+    Add-Check "toml host: file parses and the path survived" $true "(skipped: no TOML parser available)"
+}
+
+# unconfigure removes the entry from both dialects and leaves the rest
+& powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Action unconfigure-mcp -HostsRoot $sandboxHome | Out-Null
+$j2 = Get-Content $jsonCfg -Raw | ConvertFrom-Json
+Add-Check "json host: unconfigure removes our entry" (-not (@($j2.mcpServers.PSObject.Properties.Name) -contains "docx2typed"))
+Add-Check "json host: unconfigure keeps the other server" ($j2.mcpServers.kept.timeout -eq 99)
+$tomlText2 = Get-Content $tomlCfg -Raw
+Add-Check "toml host: unconfigure removes our table" (-not ($tomlText2 -match '\[mcp_servers\.docx2typed\]'))
+Add-Check "toml host: unconfigure keeps the other table" ($tomlText2 -match '\[mcp_servers\.existing\]')
+if ($py) {
+    $code2 = "import sys,tomllib;d=tomllib.load(open(sys.argv[1],'rb'));print('parsed')"
+    $out2 = & $py.Source -c $code2 $tomlCfg 2>&1 | Out-String
+    Add-Check "toml host: still parses after unconfigure" ($out2 -match "parsed")
+}
+
 $failures = @($checks | Where-Object { -not $_.pass })
 [ordered]@{
     schema = "docx2typed-mcp-merge-tests-1"
