@@ -95,3 +95,7 @@ path = "rust-tests/replace_semantics.rs"
 [[test]]
 name = "facade"
 path = "rust-tests/facade.rs"
+
+[[test]]
+name = "descriptor_commands"
+path = "rust-tests/descriptor_commands.rs"

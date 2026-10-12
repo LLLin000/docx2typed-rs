@@ -75,23 +75,6 @@ impl Operation {
             Operation::ProjectView => "project-view",
         }
     }
-
-    /// The frozen finite-command set the CLI/MCP expose.
-    pub const IMPLEMENTED_COMMANDS: [&str; 13] = [
-        "extract",
-        "build",
-        "verify",
-        "inspect",
-        "migrate",
-        "edit",
-        "store-state",
-        "enumerate",
-        "revisions",
-        "decide",
-        "comment",
-        "audit",
-        "project-view",
-    ];
 }
 
 /// Typed, adapter-validated operation arguments (adapters parse and convert

@@ -57,12 +57,38 @@ pub const CONTRACT_RANGES: [(&str, ContractRange); 5] = [
 pub const FEATURES: [&str; 3] = ["hybrid-fidelity", "locked-structure", "typed-mode"];
 pub const REQUIRED_FEATURES: [&str; 3] = FEATURES;
 
-/// The frozen finite-command set (mirroring `scripts/protocol.py`
-/// `PROTOCOL_COMMANDS`). This slice implements extract/build/verify/
-/// inspect/migrate; decide/edit/validate are declared for negotiation
-/// parity and land with their operations in #57+.
-pub const PROTOCOL_COMMANDS: [&str; 8] = [
-    "build", "decide", "edit", "extract", "inspect", "migrate", "validate", "verify",
+/// The commands THIS binary dispatches, sorted.
+///
+/// `engine_info` publishes this as `commands.finite`, and a consumer reads that
+/// field to decide what it may run. So it has to describe the binary answering,
+/// not a reference implementation elsewhere.
+///
+/// It previously mirrored `scripts/protocol.py`'s frozen `PROTOCOL_COMMANDS`
+/// verbatim. That list has eight entries and includes `validate`; the Rust
+/// dispatcher has thirteen and has no `validate` — it was declared "for
+/// negotiation parity" and never landed. The advertised set therefore named a
+/// command that exits `Unknown command: validate`, while hiding six the binary
+/// accepts (`store-state`, `enumerate`, `revisions`, `comment`, `audit`,
+/// `project-view`).
+///
+/// Measured against the dispatcher in `docx2typed-app`, which is the authority:
+/// this list is checked against it by a test, so the two cannot drift again.
+/// The reference's own list stays in `scripts/protocol.py`; it is a fact about
+/// that implementation.
+pub const PROTOCOL_COMMANDS: [&str; 13] = [
+    "audit",
+    "build",
+    "comment",
+    "decide",
+    "edit",
+    "enumerate",
+    "extract",
+    "inspect",
+    "migrate",
+    "project-view",
+    "revisions",
+    "store-state",
+    "verify",
 ];
 pub const PROTOCOL_TOOLS: [&str; 2] = ["engine_info", "workdir_open"];
 
