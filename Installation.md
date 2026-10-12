@@ -1,286 +1,264 @@
-# docx2typed installation and agent setup
+# Installing docx2typed — the agent procedure
 
-This guide installs the **Rust production binary** and connects an agent to its
-MCP server. It intentionally separates three things that are often confused:
+Read this when the user asks you to install, configure, upgrade, or remove
+`docx2typed`. It is written for **you**, not for a human operator: every step
+names the command, what it changes, and what to check before moving on.
 
-1. obtaining a target-matched binary;
-2. installing that binary on the host;
-3. adding one authorized MCP entry.
+Two things get installed, and they are separate:
 
-The Python implementation is maintained in
-[`LLLin000/docx2typed`](https://github.com/LLLin000/docx2typed). It is an offline
-qualification reference, not a Rust runtime dependency.
+| | what | why it is separate |
+|---|---|---|
+| **the engine** | the Rust binary | runs the document work; usable from a shell on its own |
+| **the wiring** | the MCP entry + the skill | makes the engine reachable from the agent you are running in |
 
-## Choose one binary source
+The wiring is host-specific. There is no single place to install an MCP server,
+so **you configure the host you are running in, and you ask before touching any
+other.** A machine can have several agents installed at once, each with its own
+config file and its own format.
 
-### A. Build from a checkout
+---
 
-Use this for development or when no release bundle is available:
+## Step 0 — Preflight (change nothing yet)
+
+Find out what already exists, and report it before acting.
+
+```powershell
+# Is an engine already installed, and is it the Rust one?
+Get-Command docx2typed -ErrorAction SilentlyContinue | Select-Object Source
+& docx2typed --version --json    # must say "name": "docx2typed-rust"
+```
+
+```powershell
+# Which agent hosts are present, and where does each keep its MCP config?
+pwsh -NoProfile -File scripts/install_binary.ps1 -ListHosts
+```
+
+That prints the host table. As of this writing:
+
+| host | config | format | key |
+|---|---|---|---|
+| omp | `~/.omp/agent/mcp.json` | JSON | `mcpServers` |
+| claude-code | `~/.claude.json` | JSON | `mcpServers` |
+| claude-desktop | `%APPDATA%\Claude\claude_desktop_config.json` | JSON | `mcpServers` |
+| cursor | `~/.cursor/mcp.json` | JSON | `mcpServers` |
+| windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON | `mcpServers` |
+| continue | `~/.continue/config.json` | JSON | `mcpServers` |
+| **codex** | `~/.codex/config.toml` | **TOML** | `[mcp_servers.<name>]` |
+| **vscode / copilot** | `%APPDATA%\Code\User\settings.json` | JSON | **`servers`** |
+| zed | `%APPDATA%\Zed\settings.json` | JSON | `context_servers` |
+
+**Report what you found, including anything stale.** A host pointing at an old
+binary is a real problem worth naming: the engine changes, and an entry left on
+an earlier build silently runs the earlier behaviour.
+
+## Step 1 — Confirm the scope with the user
+
+Ask, in one message:
+
+1. **Which host(s)** should be wired? The default is the one you are running in.
+   Do not silently edit another agent's configuration.
+2. **Which binary source** (Step 2), if more than one is available.
+
+If the user has already said "install it", wiring the host you are running in is
+the reasonable reading. Wiring *every* host is not — say what you would change
+and let them choose.
+
+## Step 2 — Obtain the binary
+
+**A. From crates.io (preferred when the user has Rust).** The crate is published
+as `0.1.0-rc1`; this builds and installs in one step:
+
+```text
+cargo install docx2typed --version 0.1.0-rc1
+```
+
+Result: `~/.cargo/bin/docx2typed[.exe]`. Skip to Step 3 and pass that path.
+
+**B. A release bundle**, if one is offered. Verify before using it — the bundle
+carries `SHA256SUMS.txt` and a detached signature:
+
+```text
+sha256sum -c SHA256SUMS.txt
+```
+
+No bundle is published by this repository at the time of writing; do not invent
+a download URL.
+
+**C. Build from a checkout** (development, or when neither of the above is
+available):
 
 ```text
 cargo build --release --locked
 ```
 
-The output is target-specific:
+Result: `target/release/docx2typed[.exe]`.
+
+Whichever source you use, check it before installing:
 
 ```text
-Windows: target\release\docx2typed.exe
-Unix:    target/release/docx2typed
+docx2typed --version --json
 ```
 
-### B. Use a release bundle
+`"name": "docx2typed-rust"` and a `target` matching the machine. If it says
+anything else, stop and report — you have the wrong artifact.
 
-A target-matched bundle contains the self-contained binary and its release
-metadata:
+## Step 3 — Install the engine
 
-```text
-docx2typed-<target>-stable/
-├── docx2typed[.exe]
-├── SHA256SUMS.txt
-├── SHA256SUMS.txt.sig
-├── provenance.json
-├── reproducibility.txt
-├── sbom.json
-├── licenses/
-└── ...
-```
-
-Verify `SHA256SUMS.txt` and its detached signature before copying the binary.
-The bundle does not contain Python, a background service, or the repository's
-PowerShell installer. The current repository qualifies bundles through GitHub
-Actions; it does not currently publish a universal package-manager installer.
-
-### C. Release operator workflow
-
-From a Windows checkout, the release operator can produce a signed bundle:
+The Windows installer is receipt-safe: it records every path it owns, so
+uninstall removes exactly those and nothing else.
 
 ```powershell
-cargo build --release --locked
 powershell -NoProfile -ExecutionPolicy Bypass `
-  -File .\scripts\package_release.ps1 `
-  -Bin .\target\release\docx2typed.exe `
-  -Target windows-x86_64-msvc `
-  -Channel stable `
-  -Coverage this-host
-```
-
-Packaging requires the signing-key policy described by
-[`reference/keys/README.md`](reference/keys/README.md). A dev-key bundle is a
-reproducibility artifact, not a public release.
-
-## Windows installation
-
-One command installs the binary **and** configures the agent's MCP entry. The
-installer is receipt-safe and Windows-only; it accepts an already-built or
-already-verified binary and does not download one.
-
-```powershell
-$source = (Resolve-Path .\target\release\docx2typed.exe).Path
-& $source --version --json
-
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File .\scripts\install_binary.ps1 `
+  -File scripts\install_binary.ps1 `
   -Action install `
-  -Bin $source
+  -Bin <path to the binary from Step 2>
 ```
 
-That is the whole setup: the binary lands in `%LOCALAPPDATA%\docx2typed\bin\`
-and the `docx2typed` entry is merged into `~/.omp/agent/mcp.json`. Nothing else
-is needed — no PATH edit, no hand-copied JSON.
-
-### What the installer does to the agent config
-
-A binary MCP server has no `npx`/`uvx` one-liner, and omp offers no `mcp add`
-command, so the installer merges the host's own configuration. It is written to
-be a good citizen about a file it does not own:
-
-| Step | Behaviour |
-|---|---|
-| read | the host config, or a new one if absent |
-| back up | a timestamped `mcp.json.bak-<utc>` beside it, before any write |
-| merge | **only** `mcpServers.docx2typed`; every other server and every other key is preserved |
-| validate | the merged text is re-parsed; a bad merge restores the backup and fails |
-| publish | atomically (temp file in the same directory, then rename) |
-| record | the path goes in the receipt, so uninstall removes exactly what was added |
-| **verify** | the server is launched and `tools/list` counted — proof the entry works, not just that JSON was written |
-
-Idempotent: re-running replaces the entry, never duplicates it. A config that
-does not parse is **refused and left byte-identical** — it is the host's file,
-and a config that already fails to parse is the user's to fix.
-
-Options:
-
-| Flag | Effect |
-|---|---|
-| `-HostMcpConfig <path>` | configure a different host config instead of `~/.omp/agent/mcp.json` |
-| `-NoMcp` | install the binary only; configure later with `-Action configure-mcp` |
-
-Standalone actions: `-Action configure-mcp` and `-Action unconfigure-mcp` do
-just the config half, and `uninstall` removes both the binary and the entry.
-
-Default layout:
+Layout:
 
 ```text
 %LOCALAPPDATA%\docx2typed\
 ├── bin\docx2typed.exe       installed Rust binary
-├── receipt.json              version, SHA-256, and owned paths
+├── receipt.json              version, SHA-256, owned paths
 └── mcp.config.json           MCP snippet with the absolute binary path
 ```
 
-The installer does not modify `PATH`. Use the absolute path in automation, or
-opt into the current PowerShell session:
+`-Action update` replaces an existing install and keeps one backup;
+`-Action rollback` consumes it.
+
+On macOS/Linux there is no installer: copy the binary to a user-owned directory
+and use its absolute path in Step 4.
+
+## Step 4 — Wire the MCP entry
+
+This is the host-specific step. **The entry must point at the installed binary's
+absolute path** and pass `mcp` as its only argument.
+
+### If the host is in the table
+
+One command configures every host whose config already exists:
 
 ```powershell
-$bin = Join-Path $env:LOCALAPPDATA 'docx2typed\bin\docx2typed.exe'
-$env:Path = "$(Split-Path $bin);$env:Path"
-& $bin --version --json
+pwsh -NoProfile -File scripts\install_binary.ps1 -Action configure-mcp
 ```
 
-If using a release bundle instead of a checkout, either run the installer from
-a matching repository checkout or copy the verified binary to a user-owned
-location and use that absolute path in MCP. Do not pretend that a copied binary
-has a receipt unless the installer created one.
-
-Lifecycle operations require an existing receipt:
+Or name them:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File .\scripts\install_binary.ps1 `
-  -Action update `
-  -Bin .\target\release\docx2typed.exe
-
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File .\scripts\install_binary.ps1 -Action rollback
-
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File .\scripts\install_binary.ps1 -Action uninstall
+pwsh -NoProfile -File scripts\install_binary.ps1 -Action configure-mcp -Hosts omp,codex
 ```
 
-`update` keeps one verified backup. `rollback` consumes that backup.
-`uninstall` removes only receipt-owned files whose recorded hashes still match;
-it refuses to guess after user changes.
+**`-Prefix` must match what Step 3 used.** `configure-mcp` wires the binary it
+finds under the prefix, defaulting to `%LOCALAPPDATA%\docx2typed`. If you
+installed with a custom `-Prefix`, pass the same one here or you will wire the
+default install — or nothing, if there is no default. The single-command flow
+(`-Action install` without `-NoMcp`) does not have this problem: it wires the
+binary it just installed.
 
-## macOS/Linux installation
+What it does to each config, in order: read → **back up** (timestamped, beside
+the file) → merge **only** `docx2typed` → re-parse the merged text → publish
+atomically → **launch the server and count `tools/list`**. A config that does
+not parse is refused and left byte-identical.
 
-There is no cross-platform installer in this repository. Copy a verified,
-target-matched binary to a user-owned directory:
+### If the host is NOT in the table
 
-```bash
-mkdir -p "$HOME/.local/bin"
-cp target/release/docx2typed "$HOME/.local/bin/docx2typed"
-chmod 755 "$HOME/.local/bin/docx2typed"
-export PATH="$HOME/.local/bin:$PATH"
-docx2typed --version --json
-```
-
-For a persistent `PATH`, add `$HOME/.local/bin` through the host's normal shell
-configuration. The binary remains self-contained; the host does not need the
-Rust toolchain after installation.
-
-## Configure the agent MCP entry
-
-Use the installed binary's **absolute path**. This is the canonical shape:
+Do not guess the format. Print the snippet, and let the user place it:
 
 ```json
 {
   "mcpServers": {
     "docx2typed": {
-      "command": "C:\\Users\\<you>\\AppData\\Local\\docx2typed\\bin\\docx2typed.exe",
+      "command": "<absolute path to the installed binary>",
       "args": ["mcp"]
     }
   }
 }
 ```
 
-On macOS/Linux, replace `command` with the absolute path to the copied binary.
-On Windows, the installer writes this object to
-`%LOCALAPPDATA%\docx2typed\mcp.config.json`.
+Adapt the key to the host's own convention (`servers` for VS Code,
+`[mcp_servers.docx2typed]` for TOML hosts) — and say which you adapted, so the
+user can check it.
 
-Copy the object into the host's configuration only after authorization. Keep
-all existing MCP servers. Do not replace the command with `python`, `uvx`,
-`cargo run`, a relative path, or a repository import.
+## Step 5 — Install the skill
+
+Enable this repository's `SKILL.md` through the host's own skill mechanism. Do
+not create a second copy if the host manager already has one, and do not remove
+the user's other skills.
+
+The skill is what tells you *how* to use the engine — the facade, the completion
+rules, the refusal paths. The MCP entry is what gives you the tools. Both are
+needed; neither substitutes for the other.
+
+## Step 6 — Verify, and report only what you observed
+
+```text
+1. the binary reports "docx2typed-rust"                docx2typed --version --json
+2. extract succeeds on a representative DOCX           docx2typed extract <doc> -o <wd>
+3. build and independent verify succeed                docx2typed build <wd> -o <out>
+                                                       docx2typed verify <wd> <out>
+4. the MCP entry points at the installed absolute
+   binary with args ["mcp"]                            read the config back
+5. the server answers tools/list                       launch it and count
+6. existing user configuration is unchanged except
+   for the additions the user authorized                diff against the backup
+```
+
+Office save/reopen is a **separate, host-dependent** gate. If no real
+Word/LibreOffice is available, report `not-run-no-host`. Do not claim it, and do
+not build Office automation to fake it.
+
+## Step 7 — Upgrade, rollback, remove
+
+```powershell
+# upgrade to new bytes (keeps one backup)
+powershell -File scripts\install_binary.ps1 -Action update -Bin <new binary>
+
+# go back to the previous bytes
+powershell -File scripts\install_binary.ps1 -Action rollback
+
+# remove the MCP entry only
+pwsh -File scripts\install_binary.ps1 -Action unconfigure-mcp
+
+# remove the entry AND the binary (receipt-scoped)
+powershell -File scripts\install_binary.ps1 -Action uninstall
+```
+
+---
+
+## What not to do
+
+- **Do not edit another agent's configuration without asking.** Several hosts on
+  one machine is normal; each config belongs to its host.
+- **Do not hand-edit a config you cannot validate.** JSON is re-parsed before it
+  is written; TOML is checked with a real parser or refused.
+- **Do not claim a verification you did not run.** Step 6 is a checklist of
+  observations, not a formality.
+- **Do not replace the entry's command with `python`, `uvx`, or a wrapper.** The
+  engine is the binary; a Python interpreter in that field is a different,
+  unsupported runtime.
+- **Do not hand-edit the DOCX package.** Once installed, all document work goes
+  through the engine.
+
+## Known environment limits
+
+- **Windows PowerShell 5.1 cannot parse every host config.** Measured on a real
+  `~/.omp/agent/mcp.json`: 5.1 rejects it with *unrecognized escape sequence* at
+  the first doubled backslash in a Windows path, while PowerShell 7 parses the
+  same file. The installer detects this and hands the action to `pwsh` when it
+  exists; if `pwsh` is absent it says so rather than corrupting or refusing the
+  file.
+- **TOML validation needs a real parser.** Python 3.11+ (`tomllib`) is used when
+  present; without it the installer refuses the TOML edit and restores the
+  backup, because a structural guess is not a parse.
 
 ## Test the installer
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\mcp_merge_tests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\mcp_merge_tests.ps1
 ```
 
-Sixteen checks over temp prefixes and temp host configs: other servers survive,
+27 checks over temp prefixes and temp host configs — other servers survive,
 re-running is idempotent, every "no entry yet" shape works, a corrupt config is
-refused untouched, uninstall removes only our entry, and `-NoMcp` touches
-nothing. It needs no signing key and never reads the real host configuration.
-
-## Verify the installation
-
-Use the installed absolute path when `PATH` is not configured:
-
-```powershell
-$bin = Join-Path $env:LOCALAPPDATA 'docx2typed\bin\docx2typed.exe'
-& $bin --version --json
-& $bin extract input.docx -o workdir --json
-& $bin enumerate workdir --json
-& $bin build workdir -o output.docx --json
-& $bin verify workdir output.docx --json
-```
-
-On Unix, replace `$bin` with the absolute path to `docx2typed` and use the same
-subcommands. The descriptor must report `"name": "docx2typed-rust"`.
-
-The production command surface is:
-
-```text
-extract, build, verify, inspect, migrate, edit, store-state,
-enumerate, revisions, decide, comment, audit, mcp, review
-```
-
-The binary has no separate `--help` command; use
-[`capabilities.md`](capabilities.md) for the exact arguments.
-
-## MCP stdio smoke
-
-The MCP process reads one JSON request per line and writes one protocol reply
-per line. Logs belong on stderr:
-
-```text
-{"tool":"engine_info","args":{}}
-{"tool":"tools/list","args":{}}
-```
-
-Expected result: two `OK` lines and 36 frozen tools in `tools/list`.
-
-## Browser review
-
-After extracting a workdir, start the local review server with the same binary:
-
-```powershell
-& $bin review workdir --host 127.0.0.1 --port 8876
-```
-
-Open `http://127.0.0.1:8876/`. The browser queues decisions and patches; it does
-not write the DOCX behind the agent's back. The agent applies the queue,
-builds a new output, and independently verifies it.
-
-The Rust binary has no `--tailscale` option and does not silently broaden a local
-bind to `0.0.0.0`. Remote access requires an explicitly controlled private
-interface and host ACLs.
-
-## Skill setup and completion criteria
-
-Use the host's normal skill manager to enable this repository's `SKILL.md`. Do
-not create a second copy unless the host manager requires it, and preserve the
-user's existing skills and MCP entries.
-
-Installation is complete only when:
-
-1. the selected Rust binary reports `docx2typed-rust`;
-2. `extract` and `enumerate` succeed on a representative DOCX;
-3. `build` and independent `verify` succeed for the requested path;
-4. the MCP entry uses the installed absolute Rust binary and `args: ["mcp"]`;
-5. the review server, when requested, binds only to the authorized interface;
-6. existing user configuration is unchanged except for explicitly authorized
-   additions.
-
-Office save/reopen is a separate host-dependent qualification gate. If no real
-Word/LibreOffice host is available, report `not-run-no-host`; do not invent a
-pass and do not build Office COM automation.
+refused untouched, both dialects round-trip, uninstall removes only our entry,
+and `-NoMcp` touches nothing. No signing key, no release bundle, and it never
+reads a real host configuration.
