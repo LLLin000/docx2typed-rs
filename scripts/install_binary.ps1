@@ -67,10 +67,28 @@ function Get-BinaryVersion([string]$path) {
 
 function Publish-Atomically([string]$tempPath, [string]$destPath, [string]$backupPath) {
     # Atomic replace with backup when dest exists; atomic rename otherwise.
-    if (Test-Path $destPath) {
-        [System.IO.File]::Replace($tempPath, $destPath, $backupPath)
-    } else {
+    if (-not (Test-Path $destPath)) {
         [System.IO.File]::Move($tempPath, $destPath)
+        return
+    }
+    try {
+        [System.IO.File]::Replace($tempPath, $destPath, $backupPath)
+        return
+    } catch [System.IO.IOException] {
+        # The destination is locked, which on Windows almost always means a
+        # running docx2typed process — an MCP server the agent host started and
+        # will respawn. `File.Replace` cannot unlink a mapped image, so the only
+        # fix is to stop them. Say that, and say which ones, instead of surfacing
+        # a bare IOException that reads like a filesystem fault.
+        $holders = @(Get-Process -Name 'docx2typed' -ErrorAction SilentlyContinue)
+        if ($holders.Count -gt 0) {
+            $ids = ($holders | ForEach-Object { $_.Id }) -join ', '
+            throw ("the installed binary is in use by $($holders.Count) running docx2typed " +
+                   "process(es) (pid $ids), so it cannot be replaced. Stop them and re-run, or " +
+                   "install to a different -Prefix. The build at '$tempPath' is intact.")
+        }
+        throw ("could not replace '$destPath' (locked, and no docx2typed process was found to " +
+               "explain it). The build at '$tempPath' is intact.")
     }
 }
 
