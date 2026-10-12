@@ -57,20 +57,46 @@ pub const CONTRACT_RANGES: [(&str, ContractRange); 5] = [
 pub const FEATURES: [&str; 3] = ["hybrid-fidelity", "locked-structure", "typed-mode"];
 pub const REQUIRED_FEATURES: [&str; 3] = FEATURES;
 
-/// The frozen finite-command set (mirroring `scripts/protocol.py`
-/// `PROTOCOL_COMMANDS`). This slice implements extract/build/verify/
-/// inspect/migrate; decide/edit/validate are declared for negotiation
-/// parity and land with their operations in #57+.
-pub const PROTOCOL_COMMANDS: [&str; 8] = [
-    "build", "decide", "edit", "extract", "inspect", "migrate", "validate", "verify",
+/// The commands THIS binary dispatches, sorted.
+///
+/// `engine_info` publishes this as `commands.finite`, and a consumer reads that
+/// field to decide what it may run. So it has to describe the binary answering,
+/// not a reference implementation elsewhere.
+///
+/// It previously mirrored `scripts/protocol.py`'s frozen `PROTOCOL_COMMANDS`
+/// verbatim. That list has eight entries and includes `validate`; the Rust
+/// dispatcher has thirteen and has no `validate` — it was declared "for
+/// negotiation parity" and never landed. The advertised set therefore named a
+/// command that exits `Unknown command: validate`, while hiding six the binary
+/// accepts (`store-state`, `enumerate`, `revisions`, `comment`, `audit`,
+/// `project-view`).
+///
+/// Measured against the dispatcher in `docx2typed-app`, which is the authority:
+/// this list is checked against it by a test, so the two cannot drift again.
+/// The reference's own list stays in `scripts/protocol.py`; it is a fact about
+/// that implementation.
+pub const PROTOCOL_COMMANDS: [&str; 13] = [
+    "audit",
+    "build",
+    "comment",
+    "decide",
+    "edit",
+    "enumerate",
+    "extract",
+    "inspect",
+    "migrate",
+    "project-view",
+    "revisions",
+    "store-state",
+    "verify",
 ];
 pub const PROTOCOL_TOOLS: [&str; 2] = ["engine_info", "workdir_open"];
 
-/// Version declared in the descriptor. Python's fallback package version is
-/// `0.1.0rc1` (its own `_package_version()`); the Rust descriptor mirrors it
-/// verbatim for negotiation parity even though Cargo's semver is
-/// `0.1.0-rc1`.
-pub const PACKAGE_VERSION: &str = "0.1.0rc1";
+/// Version declared in the descriptor, in Python's normalised spelling: no
+/// hyphen, so `0.2.0` rather than a Cargo-style `0.2.0-rc1`. The descriptor is
+/// read by both the Python and the Rust side, and the Python spelling is the
+/// one both parse.
+pub const PACKAGE_VERSION: &str = "0.2.0";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContractRange {

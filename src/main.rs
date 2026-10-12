@@ -26,7 +26,14 @@ fn run_main() -> i32 {
     // `--json` may appear anywhere in the invocation (Python semantics).
     let json_mode = argv.iter().any(|arg| arg == "--json");
     let argv: Vec<String> = argv.into_iter().filter(|arg| arg != "--json").collect();
-    let build_commit = std::env::var("DOCX2TYPED_BUILD_COMMIT").unwrap_or_default();
+    // Priority: the runtime override, then the commit baked in at build time.
+    // The override exists for CI and for tests that need a fixed string; every
+    // real user has no such variable, and a released binary that reports
+    // "unknown" cannot be traced back to a revision.
+    let build_commit = std::env::var("DOCX2TYPED_BUILD_COMMIT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| env!("DOCX2TYPED_BUILD_COMMIT_COMPILED").to_string());
     dispatch(&argv, json_mode, &build_commit)
 }
 
@@ -71,6 +78,7 @@ fn dispatch(argv: &[String], json_mode: bool, build_commit: &str) -> i32 {
         "decide" => cli::run(Operation::Decide, &argv[1..], json_mode, build_commit),
         "comment" => cli::run(Operation::Comment, &argv[1..], json_mode, build_commit),
         "audit" => cli::run(Operation::Audit, &argv[1..], json_mode, build_commit),
+        "project-view" => cli::run(Operation::ProjectView, &argv[1..], json_mode, build_commit),
         "mcp" => mcp::run(build_commit),
         "review" => review(build_commit),
         other => {

@@ -7,37 +7,37 @@
  "workspace_crates": [
   {
    "name": "docx2typed",
-   "version": "0.1.0-rc1",
+   "version": "0.2.0",
    "license": "MIT"
   },
   {
    "name": "docx2typed-app",
-   "version": "0.1.0-rc1",
+   "version": "0.2.0",
    "license": "MIT"
   },
   {
    "name": "docx2typed-core",
-   "version": "0.1.0-rc1",
+   "version": "0.2.0",
    "license": "MIT"
   },
   {
    "name": "docx2typed-protocol",
-   "version": "0.1.0-rc1",
+   "version": "0.2.0",
    "license": "MIT"
   },
   {
    "name": "docx2typed-review",
-   "version": "0.1.0-rc1",
+   "version": "0.2.0",
    "license": "MIT"
   },
   {
    "name": "docx2typed-store",
-   "version": "0.1.0-rc1",
+   "version": "0.2.0",
    "license": "MIT"
   },
   {
    "name": "docx2typed-verify",
-   "version": "0.1.0-rc1",
+   "version": "0.2.0",
    "license": "MIT"
   }
  ],

@@ -242,13 +242,113 @@ pub fn write_draft(
 ///
 /// `tab`/`br`/`cr` render as their inline markers, everything else as its own
 /// element, which is what `_node_to_markup` does for each node kind.
+/// The tree-rendered body of a paragraph this commit synthesised.
+///
+/// A synthesised paragraph has a name on each side, and they are DIFFERENT
+/// KINDS of name: `structure.json` stores the id the DRAFT allocated, chosen as
+/// the next free `P<n>` over the draft's ids, while the tree numbers paragraphs
+/// POSITIONALLY over the output document. The splicer inserts raw bytes at the
+/// `insert_before` anchor and never uses the stored id, so the two agree only
+/// when the insert happens to land where the draft's numbering lined up.
+///
+/// Measured on `parts.docx`: an insert after `P0` was stored as `P3` while the
+/// tree called the inserted paragraph `P1` and called the endnote slot `P3` — a
+/// lookup by id alone returned the ENDNOTE's markup for a body paragraph. So the
+/// body must agree before an id is trusted, and failing that the position the
+/// anchor names is the answer.
+fn synthesised_body(
+    current_markup: &std::collections::BTreeMap<String, String>,
+    structure: &docx2typed_core::prose::StructureEdits,
+    formal: &str,
+    block_id: &str,
+) -> Option<String> {
+    let row = structure
+        .new_paragraphs
+        .iter()
+        .find(|paragraph| paragraph.paragraph_id == formal || paragraph.paragraph_id == block_id)?;
+    // An id that also carries the right body is the common case.
+    if let Some(body) = current_markup
+        .get(formal)
+        .filter(|text| paragraph_says(text, &row.body))
+    {
+        return Some(body.clone());
+    }
+    // Otherwise resolve through the anchor, which both sides know.
+    let mut documents: Vec<&str> = current_markup
+        .keys()
+        .map(String::as_str)
+        .filter(|id| id.starts_with('P') && !id.contains('.'))
+        .collect();
+    documents.sort_by_key(|id| {
+        id.trim_start_matches('P')
+            .parse::<usize>()
+            .unwrap_or(usize::MAX)
+    });
+    match &row.insert_before {
+        Some(anchor) => {
+            let at = documents.iter().position(|id| *id == anchor.as_str())?;
+            documents
+                .iter()
+                .skip(at)
+                .copied()
+                .find(|id| {
+                    current_markup
+                        .get(*id)
+                        .is_some_and(|text| paragraph_says(text, &row.body))
+                })
+                .and_then(|id| current_markup.get(id))
+                .cloned()
+        }
+        None => documents
+            .last()
+            .and_then(|id| current_markup.get(*id))
+            .cloned(),
+    }
+}
+
+/// Whether a rendered body is the one this new paragraph's text describes.
+///
+/// Reduced with the TYPED reducer: a body out of `paragraph_markup_map` is typed
+/// markup (`<span data-s="…">text</span>`), not the draft dialect. Reducing it
+/// with `visible_text` strips tokens the string does not contain and leaves
+/// every XML tag in place, so the comparison could never hold and every
+/// synthesised paragraph fell to the refusal path.
+fn paragraph_says(rendered: &str, recorded: &str) -> bool {
+    typed_body_visible_text(rendered) == recorded
+}
+
+/// Record that the tree could not address a paragraph this commit changed.
+///
+/// A capability gap is reported, never guessed at.
+fn report_projection_gap(paragraph_id: &str) {
+    if let Ok(path) = std::env::var("DOCX2TYPED_REPORT_PROJECTION_GAP") {
+        let _ = std::fs::write(
+            path,
+            format!("no tree body for changed paragraph {paragraph_id}\n"),
+        );
+    }
+}
+
 fn typed_markup_from_draft(body: &str) -> String {
     let chars: Vec<char> = body.chars().collect();
     let mut out = String::new();
     let mut index = 0usize;
     while index < chars.len() {
         if chars[index] != '\u{27e6}' {
-            out.push(chars[index]);
+            // Literal text is DATA here, and `typed.md` spells data escaped.
+            // The draft carries a bare `<angle>`; the typed view carries
+            // `&lt;angle&gt;`. Copying the bare form through made the written
+            // file unescaped, and made every comparison against it reduce
+            // differently: `<angle>` parses as a tag, so the reduction dropped
+            // it and the paragraph read as changed with nothing changed.
+            // Measured on the `complex` fixture: P3 and T0.R2.C1.P0, both
+            // false positives, both then re-rendered and degraded.
+            match chars[index] {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                other => out.push(other),
+            }
             index += 1;
             continue;
         }
@@ -279,6 +379,103 @@ fn typed_markup_from_draft(body: &str) -> String {
                     .and_then(|rest| rest.split('"').next())
                     .unwrap_or("");
                 out.push_str(&format!("<docx-range id=\"{id}\" kind=\"{kind}\">"));
+            }
+            // A revision is a range in `typed.md` and a keyword in the draft.
+            // Falling through to the `kind` dispatch below matched nothing for
+            // them (the keyword IS the kind) and emitted `<docx-opaque kind="">`,
+            // which dropped the revision's text from the typed view. Measured on
+            // a real patent: the tree side then read `Fe` where the typed side
+            // read `[opaque:]`, every revision-bearing paragraph looked rewritten,
+            // `commit_sync` recorded 23 phantom paragraphs as inserted and
+            // deleted, and the build refused the workdir it had just written.
+            "insert" | "move-to" => {
+                let id = attrs
+                    .split("id=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                let kind_name = if keyword == "insert" {
+                    "insert"
+                } else {
+                    "move_to"
+                };
+                out.push_str(&format!("<docx-revision id=\"{id}\" kind=\"{kind_name}\""));
+                for pair in attrs.split(' ') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        if key == "id" || key == "kind" {
+                            continue;
+                        }
+                        out.push_str(&format!(" {key}={value}"));
+                    }
+                }
+                out.push('>');
+            }
+            "/insert" | "/move-to" => out.push_str("</docx-revision>"),
+            "revision-gap" => {
+                let id = attrs
+                    .split("id=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                out.push_str(&format!("<docx-revision id=\"{id}\" kind=\"{kind}\""));
+                for pair in attrs.split(' ') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        if key == "id" || key == "kind" {
+                            continue;
+                        }
+                        out.push_str(&format!(" {key}={value}"));
+                    }
+                }
+                out.push_str("></docx-revision>");
+            }
+            // The engine classifies a token; the renderer must not re-invent
+            // that classification. Ask it, so the two views of one paragraph
+            // cannot drift apart.
+            _ if docx2typed_core::token_table::is_anchor_token_kind(&kind) => {
+                let id = attrs
+                    .split("id=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                out.push_str(&format!("<docx-anchor id=\"{id}\" kind=\"{kind}\""));
+                for pair in attrs.split(' ') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        if key == "id" || key == "kind" {
+                            continue;
+                        }
+                        out.push_str(&format!(" {key}={value}"));
+                    }
+                }
+                out.push_str("/>");
+            }
+            _ if docx2typed_core::token_table::is_inline_token_kind(&kind) => {
+                let id = attrs
+                    .split("id=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                let style = attrs
+                    .split("style=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                let style_attr = if style.is_empty() {
+                    String::new()
+                } else {
+                    format!(" style=\"{style}\"")
+                };
+                out.push_str(&format!(
+                    "<docx-inline id=\"{id}\" kind=\"{kind}\"{style_attr}"
+                ));
+                for pair in attrs.split(' ') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        if key == "id" || key == "kind" || key == "style" {
+                            continue;
+                        }
+                        out.push_str(&format!(" {key}={value}"));
+                    }
+                }
+                out.push_str("/>");
             }
             _ => match kind.as_str() {
                 "tab"
@@ -333,11 +530,40 @@ fn typed_markup_from_draft(body: &str) -> String {
     out
 }
 
-/// Python `_visible_text` for a token-free draft body: the body itself
-/// (escaping is identity for plain text without `\`, `⟦`, `⟧`).
+/// The token-free text an editor sees: `⟦...⟧` placeholders removed.
+///
+/// The editable projection carries a placeholder for every comment anchor,
+/// revision boundary and embedded object, and those placeholders are long —
+/// measured on a real patent, one paragraph held 39 of them, 1882 of its 2199
+/// characters. Search offsets, by contrast, are reported in the token-free
+/// space (a match at prose offset 87 sat at body offset 295 in that
+/// paragraph), and the template's leaves are token-free too. Comparing or
+/// counting against the raw body therefore measures a different string than
+/// the one every caller here means.
+///
+/// Measured consequence while this returned the body unchanged: any paragraph
+/// carrying a comment anchor reported a draft length that could never equal
+/// its template's, so `paragraph_lengths_differ` declared it permanently
+/// length-changed and every edit to it was refused with an instruction to run
+/// `commit_sync` — which cannot change either side of that comparison.
 pub fn visible_text(body: &str) -> String {
-    body.to_string()
+    let mut out = String::with_capacity(body.len());
+    let mut depth = 0usize;
+    for ch in body.chars() {
+        match ch {
+            TOKEN_START => depth += 1,
+            TOKEN_END => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
 }
+
+/// `⟦` — opens a placeholder in the editable projection.
+const TOKEN_START: char = '\u{27e6}';
+/// `⟧` — closes one.
+const TOKEN_END: char = '\u{27e7}';
 
 /// Index of the block addressing a paragraph id, whichever marker carries it.
 ///
@@ -484,13 +710,28 @@ pub(crate) fn compute_changed(
         };
         match kind.as_str() {
             "p" => {
-                // Compare like with like. The draft speaks the token dialect
-                // (`⟦token id="N0" kind="empty-run"⟧`) while `old_paragraphs`
-                // holds typed.md reduced to VISIBLE TEXT, so a raw draft body
-                // never equals its own record for any paragraph carrying an
-                // inline token — every such paragraph read as "changed", and a
-                // real patent showed 5 of them (P7, P17, P58, P68, P81) with no
-                // edit at all. Reduce the draft the same way first.
+                // Compare like with like, and the two sides do NOT start alike.
+                // `old_paragraphs` holds typed.md reduced to VISIBLE TEXT, where
+                // a placeholder contributes nothing; the draft body spells the
+                // same placeholder as a token, which contributes a marker. So the
+                // draft has to be reduced to the text an editor sees first, or
+                // every paragraph carrying an inline token reads as changed —
+                // measured: 5 on a real patent with no edit at all (P7, P17,
+                // P58, P68, P81).
+                //
+                // This is the DRAFT reducer, and it is not the converter: it
+                // answers "what does this paragraph say", which is what the
+                // comparison needs. Nothing that PRODUCES typed.md goes through
+                // it.
+                // `typed_body_visible_text` over the TYPED spelling of the
+                // draft body, which is what the committed side was reduced with.
+                // `visible_text` alone is not the same reduction: it drops
+                // placeholders but leaves `^{…}`/`_{…}` and escapes alone, so the
+                // two sides disagreed for paragraphs carrying those and the
+                // commit reported paragraphs as changed that no one had touched
+                // (measured on `parts.docx`: P1 and P2, the footnote and endnote
+                // slots, appeared as edits and the build refused the inherited
+                // anchor).
                 let body = typed_body_visible_text(&typed_markup_from_draft(&block_body(block)));
                 let prior = old_paragraphs.get(&id).cloned().unwrap_or_default();
                 if prior != body {
@@ -1547,6 +1788,42 @@ fn span_crosses_boundary(paragraph_id: &str, body: &str, old: &str) -> Option<Co
 /// Replace `old` at the recorded offset. Spans are applied in descending
 /// offset order, so every offset validated against the pre-batch body is still
 /// exact when its turn comes (mirror of `_replace_in_body(start_offset=...)`).
+/// Translate a byte offset in the token-free visible text back into the byte
+/// offset of the same position in the raw body, whose `⟦...⟧`
+/// placeholders occupy bytes the visible text does not contain.
+///
+/// Two spaces, and before `visible_text` stripped placeholders they were the
+/// same string so nothing had to convert. They are not the same once a
+/// paragraph carries a comment anchor: search reports visible offsets, the
+/// island record needs visible offsets, and only the draft-body update indexes
+/// the raw text. Feeding a visible offset straight to `replace_at` lands inside
+/// a placeholder and refuses with `text-not-found` on text that is plainly
+/// there.
+fn raw_offset_for_visible(body: &str, visible_byte: usize) -> usize {
+    let mut depth = 0usize;
+    let mut emitted = 0usize;
+    for (raw, ch) in body.char_indices() {
+        match ch {
+            TOKEN_START => depth += 1,
+            TOKEN_END => depth = depth.saturating_sub(1),
+            _ if depth == 0 => {
+                // Only a visible character can be the target. Returning the
+                // offset of a leading placeholder would hand `replace_at` a
+                // position whose text is `⟦`, not the text being replaced —
+                // measured on a real patent, a paragraph that is one comment
+                // anchor around its whole body reported "背景技术 is no longer at
+                // offset 0" while sitting at visible offset 0.
+                if emitted == visible_byte {
+                    return raw;
+                }
+                emitted += ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    body.len()
+}
+
 fn replace_at(
     body: &str,
     start: usize,
@@ -1697,6 +1974,18 @@ fn plan_patch(
                 let start = if let Some(start) = anchored {
                     start
                 } else {
+                    // A span that reads contiguous only because the placeholders
+                    // were stripped is not one editable run, and this must be
+                    // asked BEFORE trusting a visible-text match. Once
+                    // `visible_text` strips placeholders such a span IS found
+                    // (`count == 1`), so the not-found path below no longer sees
+                    // the case this guard exists for: it fell through to
+                    // `replace_at` and reported a bare `text-not-found` for text
+                    // plainly on screen. The boundary test caught it.
+                    if let Some(error) = span_crosses_boundary(paragraph_id, &body, old) {
+                        hunk_problem(&mut problems, number, hunk, error);
+                        continue;
+                    }
                     let count = visible.matches(old.as_str()).count();
                     if count != 1 {
                         // A span that is contiguous only once the inline tokens
@@ -1926,7 +2215,8 @@ fn plan_patch(
         let mut ordered: Vec<&ReplaceSpan> = spans.iter().collect();
         ordered.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
         for (start, old, new) in ordered {
-            body = replace_at(&body, *start, old, new, paragraph_id)?;
+            let raw = raw_offset_for_visible(&body, *start);
+            body = replace_at(&body, raw, old, new, paragraph_id)?;
         }
         blocks[index] = if body.is_empty() {
             marker
@@ -2940,134 +3230,22 @@ pub fn apply_projection_with_options(
     let typed_before = fs::read_to_string(workdir.join("typed.md"))
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     let mut before = parse_typed_paragraphs(&typed_before);
+    // The same read, kept in its written form: a paragraph the commit does not
+    // change must come out of it spelled exactly as it went in.
+    let committed_markup = parse_typed_markup(&typed_before);
+    // File order of the committed projection, so the blocks the draft does not
+    // cover can be carried over in place. The draft is the editable body
+    // story; typed.md is the whole document, and it also records the parts
+    // that are not editable here — the advisor's comments above all. Writing
+    // only the draft's blocks silently dropped them: measured on a real
+    // patent, 20 `comments.P*` paragraphs disappeared from the canonical
+    // projection on the first commit that carried an edit.
+    let committed_layout = parse_typed_layout(&typed_before);
     // Rust-extracted workdirs carry a header-only typed.md; the pre-commit
     // bodies live in the template inventory (same source compute_changed uses).
     for paragraph in inventory_paragraphs(workdir)? {
         before.entry(paragraph.id).or_insert(paragraph.visible_text);
     }
-    let typed_path = workdir.join("typed.md");
-    let mut typed = String::new();
-    let mut wrote_header = false;
-    if typed_path.is_file() {
-        let text = fs::read_to_string(&typed_path)
-            .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-        for line in text.lines() {
-            if line.trim_start().starts_with("<!--@typed") && !wrote_header {
-                typed.push_str(line);
-                typed.push('\n');
-                wrote_header = true;
-            }
-        }
-    }
-    if !wrote_header {
-        typed.push_str(
-            "<!--@typed schema=\"1\" format=\"format.json\" styles=\"styles.json\" \
-             template=\"_template.docx\" source=\"mcp-commit\"/>
-",
-        );
-    }
-    // A delete marker outlives the draft only for a BASELINE paragraph.
-    // Deleting a paragraph that was synthesised in this lineage simply removes
-    // it, so the marker would be stale bookkeeping addressing an id that exists
-    // nowhere. The reference drops it: after insert -> commit -> delete ->
-    // commit, Python's typed.md carries no `@delete` at all. `before` cannot
-    // answer this question (it is seeded from the previous typed.md, which
-    // already lists synthesised ids), so the template inventory is the source.
-    let baseline_ids: std::collections::BTreeSet<String> = inventory_paragraphs(workdir)?
-        .into_iter()
-        .map(|paragraph| paragraph.id)
-        .collect();
-    for block in &blocks {
-        let Some((kind, id, marker)) = marker_of(block) else {
-            continue;
-        };
-        match kind.as_str() {
-            "p" => {
-                // The draft speaks `⟦token …⟧`; typed.md speaks `<docx-opaque
-                // …/>`. Convert at the write, so the committed file is in the
-                // reference's dialect and a later commit does not diff the two.
-                let body = typed_markup_from_draft(&block_body(block));
-                typed.push_str(&format!("{}\n{body}\n", committed_marker(&id, &marker)));
-            }
-            "new" => {
-                // A new block is committed under its FORMAL id (Python
-                // reallocates the temp id at commit), with its inherit anchor
-                // riding along so a later commit can re-synthesise the
-                // paragraph from the same baseline.
-                let body = typed_markup_from_draft(&block_body(block));
-                let formal = formal_ids.get(&id).map(String::as_str).unwrap_or(&id);
-                typed.push_str(&format!("{}\n{body}\n", committed_marker(formal, &marker)));
-            }
-            "delete" if baseline_ids.contains(&id) => {
-                typed.push_str(&format!("<!--@delete id=\"{id}\"-->"));
-                typed.push('\n');
-            }
-            // A deleted non-baseline paragraph leaves no trace: it never
-            // existed in the baseline, so there is nothing to record.
-            _ => {}
-        }
-    }
-    fs::write(&typed_path, typed)
-        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-    // Rebind the projection to the NEW typed.md: edit.md is now the
-    // canonical projection (its body is unchanged), so only the sidecar
-    // hashes move — the workdir classifies clean again.
-    let typed_sha256 = file_sha256(&typed_path)
-        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-    // Rebind the projection: regenerate the @edit header with the NEW
-    // base-typed-sha256 (mirror of Python's projection refresh after sync)
-    // while keeping the draft body — header, sidecar, and typed.md then
-    // agree and the workdir classifies clean.
-    let draft_text = fs::read_to_string(workdir.join(PROJECTION_FILE))
-        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-    let lines = py_splitlines(&draft_text);
-    // Canonicalize the committed draft (mirror of the Python post-sync
-    // projection, which is regenerated from the synced document): new-block
-    // markers become canonical `<!--@p` records (formal paragraph
-    // allocation stays deferred), and committed delete markers are dropped.
-    // A repeat commit is then a clean no-op.
-    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
-    for (index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if index > 0 && trimmed.starts_with("<!--@delete") {
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("<!--@new temp=\"") {
-            let id = rest.split('"').next().unwrap_or("");
-            let formal = formal_ids.get(id).map(String::as_str).unwrap_or(id);
-            kept.push(committed_marker(formal, trimmed));
-            continue;
-        }
-        kept.push(line.clone());
-    }
-    let mut lines = kept;
-    // Rebind the @edit header to the NEW typed.md; the body hash binds the
-    // canonicalized draft body (header excluded), so header, sidecar, and
-    // typed.md agree and the workdir classifies clean again.
-    let body_hash = edit_body_sha256(&lines.join("\n"))
-        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    if let Some(first) = lines.first_mut() {
-        *first = format!(
-            "<!--@edit schema=\"1\" sync-contract=\"1\" base-typed-sha256=\"{}\" \
-             base-projection-sha256=\"{}\" segmentation=\"{}\"-->",
-            typed_sha256, body_hash, SEGMENTATION_CONTRACT
-        );
-    }
-    let final_text = lines.join("\n");
-    fs::write(workdir.join(PROJECTION_FILE), final_text)
-        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-    let state = state_json(&typed_sha256, &body_hash);
-    fs::write(
-        workdir.join(STATE_FILE),
-        serde_json::to_vec_pretty(&state).expect("serializes"),
-    )
-    .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-    // Record the committed text changes as island edits so build_docx applies
-    // them to the template bytes and verify_output re-checks them. Existing
-    // island records for the same paragraph are replaced (latest commit wins).
-    // Store replay re-runs this mutation on an already-committed copy where
-    // typed.md is final and `changed` recomputes empty — skip the save there
-    // so the recorded edits survive byte-identical replay.
     let mut islands = docx2typed_core::prose::load_islands(workdir)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let mut structure = docx2typed_core::prose::load_structure(workdir)
@@ -3075,10 +3253,25 @@ pub fn apply_projection_with_options(
     let mut recorded = 0usize;
     let mut structured = false;
     let inventory = docx2typed_core::prose::enumerate_package(&workdir.join("_template.docx")).ok();
-    let committed = parse_typed_paragraphs(
-        &fs::read_to_string(workdir.join("typed.md"))
-            .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?,
-    );
+    // The bodies THIS commit is committing, keyed by the id it commits them
+    // under — not what happens to be on disk. The recording now runs before the
+    // write, so reading `typed.md` here would see the PREVIOUS commit's file.
+    // Measured on `parts.docx`: a paragraph the draft had just created was not in
+    // that older file, so the commit recorded a DELETION of an id that existed
+    // nowhere and the build refused the workdir it had just written.
+    let committed: std::collections::BTreeMap<String, String> = {
+        let mut map = std::collections::BTreeMap::new();
+        for block in &blocks {
+            let Some((kind, id, _)) = marker_of(block) else {
+                continue;
+            };
+            if kind == "p" || kind == "new" {
+                let formal = formal_ids.get(&id).map(String::as_str).unwrap_or(&id);
+                map.insert(formal.to_string(), visible_text(&block_body(block)));
+            }
+        }
+        map
+    };
     for id in &changed {
         let Some(new_body) = committed.get(id) else {
             // No committed @p record: the draft removed this paragraph.
@@ -3205,6 +3398,214 @@ pub fn apply_projection_with_options(
         docx2typed_core::prose::save_structure(workdir, &structure)
             .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     }
+
+    // ---- the current logical state, as markup -------------------------------
+    //
+    // `typed.md` is a view of the document AS IT NOW STANDS, so it is rendered
+    // from the package this commit is producing — and rendered HERE, after the
+    // records were saved, so that package is built from the bodies this commit
+    // decided on rather than the previous ones. Rendering before the save built
+    // it from the stale sidecar: the splicer then named a paragraph whose body
+    // was the older text, the commit wrote a file byte-identical to the last
+    // one, and `publish_current` refused it as unchanged.
+    //
+    // The draft dialect cannot be the source either: it spells a revision as a
+    // token with nowhere to put the text, the author or the date, so a tracked
+    // edit produced a projection with no revision in it at all.
+    let current_markup: std::collections::BTreeMap<String, String> =
+        docx2typed_core::prose::apply_build(
+            &workdir.join("_template.docx"),
+            &islands,
+            &structure,
+            &docx2typed_core::prose::load_rpr_edits(workdir).unwrap_or_default(),
+            &docx2typed_core::prose::load_style_rprs_for(workdir).unwrap_or_default(),
+        )
+        .ok()
+        .and_then(|(package, _)| docx2typed_core::prose::paragraph_markup_map(&package).ok())
+        .unwrap_or_default();
+
+    let typed_path = workdir.join("typed.md");
+    let mut typed = String::new();
+    let mut wrote_header = false;
+    if typed_path.is_file() {
+        let text = fs::read_to_string(&typed_path)
+            .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+        for line in text.lines() {
+            if line.trim_start().starts_with("<!--@typed") && !wrote_header {
+                typed.push_str(line);
+                typed.push('\n');
+                wrote_header = true;
+            }
+        }
+    }
+    if !wrote_header {
+        typed.push_str(
+            "<!--@typed schema=\"1\" format=\"format.json\" styles=\"styles.json\" \
+             template=\"_template.docx\" source=\"mcp-commit\"/>
+",
+        );
+    }
+    // A delete marker outlives the draft only for a BASELINE paragraph.
+    // Deleting a paragraph that was synthesised in this lineage simply removes
+    // it, so the marker would be stale bookkeeping addressing an id that exists
+    // nowhere. The reference drops it: after insert -> commit -> delete ->
+    // commit, Python's typed.md carries no `@delete` at all. `before` cannot
+    // answer this question (it is seeded from the previous typed.md, which
+    // already lists synthesised ids), so the template inventory is the source.
+    let baseline_ids: std::collections::BTreeSet<String> = inventory_paragraphs(workdir)?
+        .into_iter()
+        .map(|paragraph| paragraph.id)
+        .collect();
+    // Which paragraphs this write covers. Anything else in the committed file
+    // belongs to a part the draft cannot address and must survive untouched.
+    let mut written_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for block in &blocks {
+        let Some((kind, id, marker)) = marker_of(block) else {
+            continue;
+        };
+        written_ids.insert(id.clone());
+        match kind.as_str() {
+            "p" => {
+                // A paragraph this commit did NOT change keeps the projection it
+                // already had, byte for byte. Re-rendering it through the draft
+                // dialect is lossy by construction — the draft carries tokens where
+                // the typed view carries markup, so style spans, anchors and
+                // inlines do not survive the round trip — and rewriting every
+                // paragraph meant one edit in one paragraph destroyed the
+                // projection of all of them. Measured on a real patent: a single
+                // tracked edit to P41 took `data-s` spans 838 -> 0, anchors
+                // 28 -> 23 and inlines 100 -> 52 across the whole file, none of
+                // which the edit touched.
+                let body = if changed.contains(&id) {
+                    // Changed: render from the current node tree. Falling back
+                    // to the draft dialect is the OLD lossy route, and it is
+                    // reported, never taken silently.
+                    match current_markup.get(&id) {
+                        Some(tree_body) => tree_body.clone(),
+                        None => {
+                            report_projection_gap(&id);
+                            typed_markup_from_draft(&block_body(block))
+                        }
+                    }
+                } else {
+                    // Unchanged: keep the committed projection byte for byte.
+                    // Every `@p` block comes from the file being rewritten, so
+                    // the committed body is always there; if it somehow is not,
+                    // say so rather than render a poorer spelling of a paragraph
+                    // nobody asked to change.
+                    match committed_markup.get(&id) {
+                        Some(previous) => previous.clone(),
+                        None => {
+                            report_projection_gap(&id);
+                            typed_markup_from_draft(&block_body(block))
+                        }
+                    }
+                };
+                typed.push_str(&format!("{}\n{body}\n", committed_marker(&id, &marker)));
+            }
+            "new" => {
+                // A new block is committed under its FORMAL id (Python
+                // reallocates the temp id at commit), with its inherit anchor
+                // riding along so a later commit can re-synthesise the
+                // paragraph from the same baseline.
+                let formal = formal_ids.get(&id).map(String::as_str).unwrap_or(&id);
+                let body = synthesised_body(&current_markup, &structure, formal, &id)
+                    .unwrap_or_else(|| {
+                        report_projection_gap(&id);
+                        typed_markup_from_draft(&block_body(block))
+                    });
+                typed.push_str(&format!("{}\n{body}\n", committed_marker(formal, &marker)));
+            }
+            "delete" if baseline_ids.contains(&id) => {
+                typed.push_str(&format!("<!--@delete id=\"{id}\"-->"));
+                typed.push('\n');
+            }
+            // A deleted non-baseline paragraph leaves no trace: it never
+            // existed in the baseline, so there is nothing to record.
+            _ => {}
+        }
+    }
+    // Carry over every committed block the draft does not cover, in its
+    // original order, with the `@part` line that introduces it. The draft is
+    // the editable body; typed.md is the whole document and also records the
+    // parts that are read-only here — the advisor's comments above all.
+    // Writing only the draft's blocks silently dropped them: measured on a
+    // real patent, 20 `comments.P*` paragraphs vanished from the canonical
+    // projection on the first commit that carried an edit.
+    let mut carried_part: Option<&str> = None;
+    for entry in &committed_layout {
+        match entry {
+            CommittedEntry::Part(line) => carried_part = Some(line.as_str()),
+            CommittedEntry::Paragraph { id, marker, body } => {
+                if written_ids.contains(id) {
+                    continue;
+                }
+                if let Some(line) = carried_part.take() {
+                    typed.push_str(line);
+                    typed.push('\n');
+                }
+                typed.push_str(marker);
+                typed.push('\n');
+                typed.push_str(body);
+                typed.push('\n');
+            }
+        }
+    }
+    fs::write(&typed_path, typed)
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    // Rebind the projection to the NEW typed.md: edit.md is now the
+    // canonical projection (its body is unchanged), so only the sidecar
+    // hashes move — the workdir classifies clean again.
+    let typed_sha256 = file_sha256(&typed_path)
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    // Rebind the projection: regenerate the @edit header with the NEW
+    // base-typed-sha256 (mirror of Python's projection refresh after sync)
+    // while keeping the draft body — header, sidecar, and typed.md then
+    // agree and the workdir classifies clean.
+    let draft_text = fs::read_to_string(workdir.join(PROJECTION_FILE))
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    let lines = py_splitlines(&draft_text);
+    // Canonicalize the committed draft (mirror of the Python post-sync
+    // projection, which is regenerated from the synced document): new-block
+    // markers become canonical `<!--@p` records (formal paragraph
+    // allocation stays deferred), and committed delete markers are dropped.
+    // A repeat commit is then a clean no-op.
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if index > 0 && trimmed.starts_with("<!--@delete") {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("<!--@new temp=\"") {
+            let id = rest.split('"').next().unwrap_or("");
+            let formal = formal_ids.get(id).map(String::as_str).unwrap_or(id);
+            kept.push(committed_marker(formal, trimmed));
+            continue;
+        }
+        kept.push(line.clone());
+    }
+    let mut lines = kept;
+    // Rebind the @edit header to the NEW typed.md; the body hash binds the
+    // canonicalized draft body (header excluded), so header, sidecar, and
+    // typed.md agree and the workdir classifies clean again.
+    let body_hash = edit_body_sha256(&lines.join("\n"))
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    if let Some(first) = lines.first_mut() {
+        *first = format!(
+            "<!--@edit schema=\"1\" sync-contract=\"1\" base-typed-sha256=\"{}\" \
+             base-projection-sha256=\"{}\" segmentation=\"{}\"-->",
+            typed_sha256, body_hash, SEGMENTATION_CONTRACT
+        );
+    }
+    let final_text = lines.join("\n");
+    fs::write(workdir.join(PROJECTION_FILE), final_text)
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    let state = state_json(&typed_sha256, &body_hash);
+    fs::write(
+        workdir.join(STATE_FILE),
+        serde_json::to_vec_pretty(&state).expect("serializes"),
+    )
+    .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     Ok(changed)
 }
 
@@ -3333,6 +3734,119 @@ fn typed_body_visible_text(body: &str) -> String {
     out.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")
+}
+
+/// The committed projection's bodies, RAW: markup preserved, not reduced to
+/// visible text.
+///
+/// `parse_typed_paragraphs` answers "what does this paragraph say"; this
+/// answers "how is this paragraph written". The commit needs the second one to
+/// leave a paragraph it did not touch exactly as it found it.
+fn parse_typed_markup(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut records: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut current: Option<String> = None;
+    let mut body_lines: Vec<String> = Vec::new();
+    let flush = |records: &mut std::collections::BTreeMap<String, String>,
+                 current: &mut Option<String>,
+                 body_lines: &mut Vec<String>| {
+        if let Some(id) = current.take() {
+            records.insert(id, body_lines.join("\n").trim_end_matches('\n').to_string());
+            body_lines.clear();
+        }
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<!--@p id=\"") {
+            flush(&mut records, &mut current, &mut body_lines);
+            let id = trimmed
+                .strip_prefix("<!--@p id=\"")
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or("")
+                .to_string();
+            current = Some(id);
+            continue;
+        }
+        // `<!--@mark …-->` is a line INSIDE a paragraph, not a new block:
+        // it records a revision boundary the paragraph carries. Treating it
+        // as a boundary dropped it, and a paragraph that lost its mark no
+        // longer matched the one it was supposed to be preserved as.
+        if trimmed.starts_with("<!--@p ")
+            || trimmed.starts_with("<!--@new ")
+            || trimmed.starts_with("<!--@delete ")
+            || trimmed.starts_with("<!--@part ")
+            || trimmed.starts_with("<!--@typed")
+        {
+            flush(&mut records, &mut current, &mut body_lines);
+            continue;
+        }
+        if current.is_some() {
+            body_lines.push(line.to_string());
+        }
+    }
+    flush(&mut records, &mut current, &mut body_lines);
+    records
+}
+
+/// One entry of the committed projection, in file order.
+enum CommittedEntry {
+    /// A `<!--@part key="…"-->` line introducing a part's paragraphs.
+    Part(String),
+    /// A paragraph block: its id, its marker line, and its body.
+    Paragraph {
+        id: String,
+        marker: String,
+        body: String,
+    },
+}
+
+/// The committed projection as an ordered list of parts and paragraphs.
+///
+/// A map answers "what is P41"; the commit also needs "what else is in this
+/// file", because a draft covers only the editable body and everything it does
+/// not cover still has to survive the write.
+fn parse_typed_layout(text: &str) -> Vec<CommittedEntry> {
+    let mut out: Vec<CommittedEntry> = Vec::new();
+    let mut marker: Option<String> = None;
+    let mut id: Option<String> = None;
+    let mut body_lines: Vec<String> = Vec::new();
+    let flush = |out: &mut Vec<CommittedEntry>,
+                 marker: &mut Option<String>,
+                 id: &mut Option<String>,
+                 body_lines: &mut Vec<String>| {
+        if let (Some(m), Some(i)) = (marker.take(), id.take()) {
+            out.push(CommittedEntry::Paragraph {
+                id: i,
+                marker: m,
+                body: body_lines.join("\n").trim_end_matches('\n').to_string(),
+            });
+        }
+        body_lines.clear();
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<!--@part ") {
+            flush(&mut out, &mut marker, &mut id, &mut body_lines);
+            out.push(CommittedEntry::Part(trimmed.to_string()));
+            continue;
+        }
+        if trimmed.starts_with("<!--@p ") {
+            flush(&mut out, &mut marker, &mut id, &mut body_lines);
+            let pid = trimmed
+                .split("id=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or("")
+                .to_string();
+            marker = Some(trimmed.to_string());
+            id = Some(pid);
+            continue;
+        }
+        if id.is_some() {
+            body_lines.push(line.to_string());
+        }
+    }
+    flush(&mut out, &mut marker, &mut id, &mut body_lines);
+    out
 }
 
 fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, String> {

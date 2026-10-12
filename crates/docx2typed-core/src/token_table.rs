@@ -575,6 +575,13 @@ pub fn project_node(node: &TypedNode) -> String {
                 };
                 let mut map = attrs.clone();
                 map.insert("id".to_string(), token_id.clone());
+                // The reference carries `kind` on the token itself
+                // (`\u27e6insert id="N40" kind="insert" w:author=...\u27e7`). Omitting it
+                // left the draft unable to say what the token IS: every consumer
+                // that reads the token back had to infer it from the keyword, and
+                // `typed_markup_from_draft` did not, so an insert became
+                // `<docx-opaque kind="">` and its text disappeared.
+                map.insert("kind".to_string(), kind.to_string());
                 let mut ordered: Vec<(String, String)> = vec![("id".to_string(), token_id.clone())];
                 for (k, v) in &map {
                     if k != "id" {
@@ -871,6 +878,33 @@ const KNOWN_INLINE: [&str; 14] = [
     "continuationSeparator",
     "lastRenderedPageBreak",
 ];
+
+/// Whether a token kind renders as an anchor in `typed.md`.
+///
+/// The draft projection is a different text from the typed one, and something
+/// has to render one as the other. That renderer must classify a token exactly
+/// as the node tree does, or the two views disagree about the same paragraph
+/// and every consumer that compares them concludes the text changed. Exposing
+/// the rule here is what keeps the renderer honest: measured on a real patent,
+/// a duplicated list in the renderer sent comment anchors and `commentReference`
+/// to the opaque arm, the typed side then read `[opaque:comment-start]` where
+/// the tree side read nothing, and `commit_sync` recorded paragraphs as
+/// inserted and deleted that no one had touched.
+pub fn is_anchor_token_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "bookmark-start" | "bookmark-end" | "comment-start" | "comment-end"
+    )
+}
+
+/// Whether a token kind renders as an inline in `typed.md`.
+///
+/// Mirrors the run walk: the known inline children, plus the two kinds it
+/// synthesises (`rpr-change`, `empty-run`). `unsupported-run` is deliberately
+/// absent — it is the opaque the walk falls back to.
+pub fn is_inline_token_kind(kind: &str) -> bool {
+    KNOWN_INLINE.contains(&kind) || matches!(kind, "rpr-change" | "empty-run")
+}
 
 /// `bookmarkStart` / `bookmarkEnd` / `commentRangeStart` / `commentRangeEnd`
 /// and the kind each records.
@@ -1225,8 +1259,18 @@ impl<'a> Walker<'a> {
             }];
         }
         if let Some(change) = rpr_change {
-            let (_, attrs) = self.tag(&change);
-            let token_id = self.add("rpr-change", attrs.clone(), &change);
+            // The reference records the TAG NAME here, not the element's own
+            // OOXML attributes, and the style of the RUN the change sits in —
+            // the formatting in force at that point — not a style derived from
+            // the change element, which has none. `raw` still carries the full
+            // XML, so nothing is lost by not duplicating the attributes; the
+            // `style_id` is the part a consumer needs and Rust was recording
+            // as empty. Measured on a real patent: 84 `rpr-change` tokens
+            // whose `raw` matched the reference byte for byte while the model
+            // disagreed on both fields.
+            let attrs: BTreeMap<String, String> =
+                std::iter::once(("tag".to_string(), "w:rPrChange".to_string())).collect();
+            let token_id = self.add_styled("rpr-change", attrs.clone(), &change, &style_id);
             out.push(TypedNode::Inline {
                 token_id,
                 kind: "rpr-change".to_string(),
@@ -1306,12 +1350,16 @@ impl<'a> Walker<'a> {
             return;
         }
         if let Some(change) = rpr_change {
-            let (_, attrs) = self.tag(&change);
-            self.add("rpr-change", attrs, &change);
+            // Same model as the run walk: the tag name, and the style of the
+            // RUN the change sits in. Both walks reach `rpr-change`, and a
+            // paragraph-mark change must record what a run change records.
+            let attrs: BTreeMap<String, String> =
+                std::iter::once(("tag".to_string(), "w:rPrChange".to_string())).collect();
+            self.add_styled("rpr-change", attrs, &change, &style);
         }
         if !saw_content {
             let (_, attrs) = self.tag(run);
-            self.add("empty-run", attrs, run);
+            self.add_styled("empty-run", attrs, run, &style);
         }
     }
 }

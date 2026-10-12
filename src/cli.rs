@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use docx2typed_app::{
     AuditArgs, BuildArgs, CommentArgs, DecideArgs, EditArgs, Engine, EnumerateArgs, ExtractArgs,
-    InspectArgs, MigrateArgs, Operation, OperationArgs, OperationContext, RevisionsArgs,
-    StoreStateArgs, TextEdit, VerifyArgs,
+    InspectArgs, MigrateArgs, Operation, OperationArgs, OperationContext, ProjectViewArgs,
+    RevisionsArgs, StoreStateArgs, TextEdit, VerifyArgs,
 };
 use docx2typed_protocol::{Diagnostic, ResultEnvelope};
 
@@ -740,6 +740,22 @@ fn parse(operation: Operation, argv: &[String]) -> Result<ParseResult, String> {
                 args: OperationArgs::Audit(AuditArgs {
                     source: PathBuf::from(source),
                     catalog_path,
+                }),
+                operation_id: docx2typed_protocol::new_operation_id(),
+            })
+        }
+        Operation::ProjectView => {
+            let positional: Vec<&String> = argv.iter().filter(|a| !a.starts_with('-')).collect();
+            let input: String = positional
+                .first()
+                .map(|value| (*value).clone())
+                .ok_or("project-view requires a .docx")?;
+            if positional.len() > 1 {
+                return Err("project-view accepts exactly one source".to_string());
+            }
+            Ok(ParseResult {
+                args: OperationArgs::ProjectView(ProjectViewArgs {
+                    input: PathBuf::from(input),
                 }),
                 operation_id: docx2typed_protocol::new_operation_id(),
             })

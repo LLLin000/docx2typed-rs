@@ -506,3 +506,105 @@ fn a_session_inserted_paragraph_is_located_and_edited() {
         "the edit must reach the exported DOCX: {counts}"
     );
 }
+
+/// Every tracked-edit lane keeps the session's identity through the commit.
+///
+/// An island states who made a revision and when, and three different lanes can
+/// write one: `facade_edit`, the raw `document_patch`, and `document_replace`.
+/// Each captures the session's identity itself, so each has to capture the DATE
+/// too — and all three passed `None` for it while passing the author through.
+///
+/// Measured on the real patent: `document_patch` recorded
+/// `date=""` on the island it wrote, the commit preserved that, and the revision
+/// reached the document undated while the reply said `success`. `facade_edit`
+/// looked correct the whole time, which is exactly why the lane that was broken
+/// is the one the test drives.
+#[test]
+fn a_tracked_edit_keeps_its_author_and_date_through_the_commit() {
+    let dir = scratch("tracked-identity");
+    let workdir = dir.join("wd");
+    extract(&fixture("plain"), &workdir);
+    let out = dir.join("out.docx");
+
+    let identity = json!({
+        "workdir": workdir.to_string_lossy(),
+        "track": true,
+        "author": "金晓强",
+        "date": "2026-10-12T09:30:00Z",
+    });
+
+    // The raw patch lane: it writes the island itself, so it must carry the
+    // date itself.
+    let results = mcp(&[
+        ("workdir_open", identity.clone()),
+        (
+            "document_patch",
+            json!({
+                "hunks": [{ "paragraph_id": "P0", "old": "剂量", "new": "用量" }],
+                "operation_id": "id-patch",
+            }),
+        ),
+    ]);
+    assert_eq!(
+        envelope(&results[1])["outcome"],
+        "success",
+        "the patch must apply: {}",
+        results[1]
+    );
+
+    let islands = std::fs::read_to_string(workdir.join("islands.json")).expect("islands.json");
+    let parsed: Value = serde_json::from_str(&islands).expect("islands parse");
+    let edits = parsed["edits"].as_array().expect("edits array");
+    assert!(!edits.is_empty(), "the patch recorded no island: {islands}");
+    for edit in edits {
+        assert_eq!(
+            edit["author"], "金晓强",
+            "the patch dropped the author: {edit}"
+        );
+        assert_eq!(
+            edit["date"], "2026-10-12T09:30:00Z",
+            "the patch dropped the date, so the revision cannot be dated: {edit}"
+        );
+    }
+
+    // And the commit must not re-record it without the identity.
+    let results = mcp(&[
+        ("workdir_open", identity),
+        ("commit_sync", json!({ "operation_id": "id-commit" })),
+        (
+            "build_docx",
+            json!({ "output": out.to_string_lossy(), "operation_id": "id-build" }),
+        ),
+    ]);
+    for index in [1, 2] {
+        assert_eq!(
+            envelope(&results[index])["outcome"],
+            "success",
+            "call {index} failed: {}",
+            results[index]
+        );
+    }
+    let islands = std::fs::read_to_string(workdir.join("islands.json")).expect("islands.json");
+    let parsed: Value = serde_json::from_str(&islands).expect("islands parse");
+    for edit in parsed["edits"].as_array().expect("edits array") {
+        assert_eq!(
+            edit["date"], "2026-10-12T09:30:00Z",
+            "the commit re-recorded the island without the date: {edit}"
+        );
+    }
+
+    // And it reaches the artifact: a `w:ins`/`w:del` states who and when.
+    let file = std::fs::File::open(&out).expect("built docx");
+    let mut archive = zip::ZipArchive::new(file).expect("zip");
+    let mut member = archive.by_name("word/document.xml").expect("document.xml");
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut member, &mut xml).expect("read");
+    assert!(
+        xml.contains(r#"w:author="金晓强""#),
+        "the built document does not name the editor: {xml}"
+    );
+    assert!(
+        xml.contains(r#"w:date="2026-10-12T09:30:00Z""#),
+        "the built document does not date the revision: {xml}"
+    );
+}

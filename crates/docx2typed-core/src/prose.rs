@@ -2113,26 +2113,57 @@ fn promote_vertical_alignment(
 /// The TEXT nodes of a paragraph as canonical segments — what
 /// `choose_base_style` counts, and nothing else.
 fn text_segments(nodes: &[crate::token_table::TypedNode]) -> Vec<Segment> {
-    nodes
-        .iter()
-        .filter_map(|node| match node {
-            crate::token_table::TypedNode::Text { style_id, text, .. } => Some(Segment {
-                start: 0,
-                end: text.chars().count(),
-                text: text.clone(),
-                style_id: style_id.clone(),
-                revision: None,
-                comment_ids: Vec::new(),
-                editable: true,
-                visibility: crate::document_projection::Visibility {
-                    original: true,
-                    tracked: true,
-                    final_view: true,
-                },
-            }),
-            _ => None,
-        })
-        .collect()
+    // Recursive, and only over the text that reaches the FINAL view: the
+    // reference's `choose_base_style` visits a range's children, visits a
+    // revision's children only for insert/move_to, and skips deleted text
+    // because it is not in the final view. Collecting top-level text alone
+    // votes on a different set than the reference does, so the paragraph is
+    // assigned a different base style and every byte of its markup changes.
+    // Measured on a real patent: 13 paragraphs, all of them revision-heavy.
+    let mut out: Vec<Segment> = Vec::new();
+    collect_text_segments(nodes, &mut out);
+    out
+}
+
+fn collect_text_segments(nodes: &[crate::token_table::TypedNode], out: &mut Vec<Segment>) {
+    for node in nodes {
+        match node {
+            crate::token_table::TypedNode::Range { children, .. } => {
+                collect_text_segments(children, out);
+            }
+            crate::token_table::TypedNode::Revision { kind, children, .. } => {
+                if kind == "insert" || kind == "move_to" {
+                    collect_text_segments(children, out);
+                }
+            }
+            crate::token_table::TypedNode::Text { .. } => {
+                if let Some(segment) = text_segment(node) {
+                    out.push(segment);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn text_segment(node: &crate::token_table::TypedNode) -> Option<Segment> {
+    match node {
+        crate::token_table::TypedNode::Text { style_id, text, .. } => Some(Segment {
+            start: 0,
+            end: text.chars().count(),
+            text: text.clone(),
+            style_id: style_id.clone(),
+            revision: None,
+            comment_ids: Vec::new(),
+            editable: true,
+            visibility: crate::document_projection::Visibility {
+                original: true,
+                tracked: true,
+                final_view: true,
+            },
+        }),
+        _ => None,
+    }
 }
 
 /// typed.md lists paragraphs in DOCUMENT order — headers, body, footers, notes,
@@ -2229,32 +2260,145 @@ pub fn serialize_typed(
             blocks.push(format!("<!--@part key={}-->", attr_value(&part)));
             current_part = Some(part);
         }
-        let body = paragraph_markup(&entry.nodes, &entry.base_style);
-        let marker = format!(
-            "<!--@p id={} base={}-->",
-            attr_value(&entry.tree.paragraph_id),
-            attr_value(&entry.base_style)
-        );
-        let mark = entry
-            .tree
-            .mark
-            .as_ref()
-            .map(|(kind, token_id, attrs)| {
-                let mut all = attrs.clone();
-                all.insert("kind".to_string(), kind.clone());
-                all.insert("id".to_string(), token_id.clone());
-                format!("\n<!--@mark {}-->", attrs_text(&all, &["kind", "id"]))
-            })
-            .unwrap_or_default();
-        blocks.push(if body.is_empty() {
-            format!("{marker}{mark}")
-        } else {
-            format!("{marker}{mark}\n{body}")
-        });
+        blocks.push(typed_paragraph_block(entry));
     }
     let mut text = blocks.join("\n\n");
     text.push('\n');
     text
+}
+
+/// Paragraph id -> its `typed.md` body, rendered from a package's node tree.
+///
+/// The per-paragraph form of `project_current_typed`, for a caller that has to
+/// splice bodies into an existing file rather than write a whole one. Rendered
+/// through `typed_paragraph_block`, so a body produced here is spelled exactly
+/// as one produced for a full projection — two ways of asking for the same
+/// paragraph cannot give two answers.
+pub fn paragraph_markup_map(package: &[u8]) -> Result<BTreeMap<String, String>, CoreError> {
+    let trees = crate::token_table::paragraph_nodes(package)?;
+    let catalog = StyleCatalog::build(package)?;
+    let (prepared, _promoted) = prepare_paragraphs(&trees, &catalog);
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for entry in &prepared {
+        let block = typed_paragraph_block(entry);
+        // `typed_paragraph_block` includes the marker line; a map entry is the
+        // body that follows it.
+        let body = match block.split_once('\n') {
+            Some((first, rest)) if first.starts_with("<!--@p ") => match rest.split_once('\n') {
+                Some((second, tail)) if second.starts_with("<!--@mark ") => tail.to_string(),
+                _ => rest.to_string(),
+            },
+            _ => String::new(),
+        };
+        out.insert(entry.tree.paragraph_id.clone(), body);
+    }
+    Ok(out)
+}
+
+/// A stable digest of a package's members: names and per-member hashes, in
+/// order, hashed once.
+///
+/// The same shape `format.json` records as `package_manifest`, reduced to one
+/// string, so a projection can say which document state it describes without
+/// dragging the whole manifest into a header line. Built from the same
+/// `package_manifest_bytes` the model uses, so the two can never mean different
+/// things by "the same package".
+pub fn package_digest(package: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    match crate::package_manifest_bytes(package) {
+        Ok(manifest) => {
+            for (name, hash) in manifest {
+                hasher.update(name.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(hash.as_bytes());
+                hasher.update(b"\n");
+            }
+        }
+        Err(_) => hasher.update(package),
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// One paragraph of `typed.md`: marker, optional mark, body.
+///
+/// The single renderer for a paragraph in the typed dialect. `serialize_typed`
+/// and `project_current_typed` both go through it, so the two ways a
+/// `typed.md` can come into being cannot disagree about how a paragraph is
+/// spelled.
+pub fn typed_paragraph_block(entry: &PreparedParagraph) -> String {
+    let body = paragraph_markup(&entry.nodes, &entry.base_style);
+    let marker = format!(
+        "<!--@p id={} base={}-->",
+        attr_value(&entry.tree.paragraph_id),
+        attr_value(&entry.base_style)
+    );
+    let mark = entry
+        .tree
+        .mark
+        .as_ref()
+        .map(|(kind, token_id, attrs)| {
+            let mut all = attrs.clone();
+            all.insert("kind".to_string(), kind.clone());
+            all.insert("id".to_string(), token_id.clone());
+            format!("\n<!--@mark {}-->", attrs_text(&all, &["kind", "id"]))
+        })
+        .unwrap_or_default();
+    if body.is_empty() {
+        format!("{marker}{mark}")
+    } else {
+        format!("{marker}{mark}\n{body}")
+    }
+}
+
+/// `typed.md` for the CURRENT logical state, rendered from the node tree.
+///
+/// The projection the Agent works against must be a view of the document as it
+/// now stands, so this takes the *edited* package: `apply_build` has already
+/// folded the committed islands, structural edits and restyles into it. Reading
+/// `_template.docx` again instead would render a faithful picture of the
+/// document the session STARTED from and silently drop everything since.
+///
+/// It exists because the previous route wrote `typed.md` by re-parsing the
+/// draft's `edit.md` dialect. That dialect carries tokens where the typed view
+/// carries markup, so style spans, anchors, inlines and a delete revision's
+/// attributes and text could not survive the round trip — the loss was
+/// structural, not a bug in any one branch, and no amount of converter work
+/// could recover information the intermediate never held.
+///
+/// The header records the template's digest because the template is what the
+/// islands address; `format.json` and `styles.json` are carried as names, as
+/// the reference carries them.
+pub fn project_current_typed(
+    parts_digest: &str,
+    source_name: &str,
+    package: &[u8],
+) -> Result<String, CoreError> {
+    let projection = crate::document_projection::project_document_bytes(package)?;
+    let trees = crate::token_table::paragraph_nodes(package)?;
+    let catalog = StyleCatalog::build(package)?;
+    let (prepared, _promoted) = prepare_paragraphs(&trees, &catalog);
+
+    let header = format!(
+        "<!--@typed schema=\"2\" format=\"format.json\" styles=\"styles.json\" \
+         template=\"_template.docx\" source={} parts_sha256={}-->",
+        attr_value(source_name),
+        attr_value(parts_digest)
+    );
+    let mut blocks = vec![header];
+    let mut current_part = Some(String::new());
+    let _ = &projection;
+    for entry in &prepared {
+        let part = crate::token_table::typed_part_key(&entry.tree.part);
+        if current_part.as_deref() != Some(part.as_str()) {
+            blocks.push(format!("<!--@part key={}-->", attr_value(&part)));
+            current_part = Some(part);
+        }
+        blocks.push(typed_paragraph_block(entry));
+    }
+    let mut text = blocks.join("\n\n");
+    text.push('\n');
+    Ok(text)
 }
 
 /// The `format.json` paragraph records, one per paragraph in extract order.

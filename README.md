@@ -1,6 +1,6 @@
 # docx2typed
 
-[中文版本](README.zh-CN.md) · [Installation and collaboration](Installation.md)
+[中文版本](https://github.com/LLLin000/docx2typed-rs/blob/main/README.zh-CN.md) · [Installation and collaboration](https://github.com/LLLin000/docx2typed-rs/blob/main/Installation.md)
 
 > Structure-preserving DOCX editing from a self-contained Rust binary, with MCP review workflows and independent verification.
 
@@ -154,7 +154,7 @@ $bin = Join-Path $env:LOCALAPPDATA 'docx2typed\bin\docx2typed.exe'
 
 Use `docx2typed revisions`, `decide`, `comment`, and the MCP review tools for
 tracked revisions, comments, table structure, and human-agent handoff. See
-[`capabilities.md`](capabilities.md) for the complete command surface.
+[`capabilities.md`](https://github.com/LLLin000/docx2typed-rs/blob/main/capabilities.md) for the complete command surface.
 
 ## Browser review
 
@@ -187,8 +187,8 @@ host-dependent check; without a real host, report `not-run-no-host`.
 
 ## Further reading
 
-- [Installation and collaboration guide](Installation.md)
-- [CLI and MCP capabilities](capabilities.md)
-- [End-to-end workflows](composites.md)
-- [Verification guarantees](verification.md)
-- [Agent skill](SKILL.md)
+- [Installation and collaboration guide](https://github.com/LLLin000/docx2typed-rs/blob/main/Installation.md)
+- [CLI and MCP capabilities](https://github.com/LLLin000/docx2typed-rs/blob/main/capabilities.md)
+- [End-to-end workflows](https://github.com/LLLin000/docx2typed-rs/blob/main/composites.md)
+- [Verification guarantees](https://github.com/LLLin000/docx2typed-rs/blob/main/verification.md)
+- [Agent skill](https://github.com/LLLin000/docx2typed-rs/blob/main/SKILL.md)

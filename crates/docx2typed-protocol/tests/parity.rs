@@ -39,7 +39,7 @@ fn descriptor_contracts_match_frozen_ranges() {
     let descriptor = docx2typed_protocol::engine_descriptor("test-commit");
     assert_eq!(descriptor.schema, "docx2typed-engine-descriptor-1");
     assert_eq!(descriptor.name, "docx2typed-rust");
-    assert_eq!(descriptor.version, "0.1.0rc1");
+    assert_eq!(descriptor.version, "0.2.0");
     assert_eq!(descriptor.build_commit, "test-commit");
     let contracts = descriptor.contracts.as_object().expect("contracts object");
     for name in ["cli", "mcp", "result", "evidence", "workdir"] {
