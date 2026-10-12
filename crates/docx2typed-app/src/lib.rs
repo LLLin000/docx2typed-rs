@@ -48,6 +48,10 @@ pub enum Operation {
     /// Issue #59: comment inventory and byte-surgery deletion (CLI
     /// `comment list|delete`).
     Comment,
+    /// A1: render `typed.md` from a package's node tree, read-only. The new
+    /// projection route, exposed so the two renderers can be run against one
+    /// state and compared before anything depends on either.
+    ProjectView,
     /// Issue #59: read-only governed Unicode normalization audit (CLI
     /// `audit`).
     Audit,
@@ -68,11 +72,12 @@ impl Operation {
             Operation::Decide => "decide",
             Operation::Comment => "comment",
             Operation::Audit => "audit",
+            Operation::ProjectView => "project-view",
         }
     }
 
     /// The frozen finite-command set the CLI/MCP expose.
-    pub const IMPLEMENTED_COMMANDS: [&str; 12] = [
+    pub const IMPLEMENTED_COMMANDS: [&str; 13] = [
         "extract",
         "build",
         "verify",
@@ -85,6 +90,7 @@ impl Operation {
         "decide",
         "comment",
         "audit",
+        "project-view",
     ];
 }
 
@@ -105,6 +111,13 @@ pub enum OperationArgs {
     Decide(DecideArgs),
     Comment(CommentArgs),
     Audit(AuditArgs),
+    ProjectView(ProjectViewArgs),
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectViewArgs {
+    /// The DOCX to render from. A template, or a built output.
+    pub input: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -674,6 +687,45 @@ impl Engine {
             Operation::Decide => self.decide_op(&context, args),
             Operation::Comment => self.comment_op(&context, args),
             Operation::Audit => self.audit_op(&context, args),
+            Operation::ProjectView => self.project_view_op(&context, args),
+        }
+    }
+
+    /// A1: render `typed.md` from a package's node tree. Read-only, no workdir,
+    /// no store, nothing written — it exists so the new projection route can be
+    /// run against the same state as the old one and compared, before anything
+    /// depends on it.
+    fn project_view_op(
+        &self,
+        context: &OperationContext,
+        args: OperationArgs,
+    ) -> Result<OperationOutcome, EngineFailure> {
+        let OperationArgs::ProjectView(args) = args else {
+            return Err(EngineFailure {
+                message: "operation/args mismatch".to_string(),
+            });
+        };
+        let package = match std::fs::read(&args.input) {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(self.domain_failure("project-view", &error.to_string())),
+        };
+        let source_name = args
+            .input
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let digest = docx2typed_core::prose::package_digest(&package);
+        match docx2typed_core::prose::project_current_typed(&digest, &source_name, &package) {
+            Ok(text) => Ok(OperationOutcome::success(
+                serde_json::json!({
+                    "typed_md": text,
+                    "source": source_name,
+                    "parts_sha256": digest,
+                    "operation_id": context.operation_id,
+                }),
+                Vec::new(),
+            )),
+            Err(error) => Ok(self.domain_failure("project-view", &error.to_string())),
         }
     }
 

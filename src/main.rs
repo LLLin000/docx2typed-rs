@@ -71,6 +71,7 @@ fn dispatch(argv: &[String], json_mode: bool, build_commit: &str) -> i32 {
         "decide" => cli::run(Operation::Decide, &argv[1..], json_mode, build_commit),
         "comment" => cli::run(Operation::Comment, &argv[1..], json_mode, build_commit),
         "audit" => cli::run(Operation::Audit, &argv[1..], json_mode, build_commit),
+        "project-view" => cli::run(Operation::ProjectView, &argv[1..], json_mode, build_commit),
         "mcp" => mcp::run(build_commit),
         "review" => review(build_commit),
         other => {
