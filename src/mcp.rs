@@ -317,7 +317,7 @@ impl McpSession {
             .and_then(Value::as_str)
             .map(str::to_string);
         let date = args.get("date").and_then(Value::as_str).map(str::to_string);
-        let track = args.get("track").and_then(Value::as_bool).unwrap_or(false);
+        let track = args.get("track").and_then(Value::as_bool);
         let contract_ranges = args.get("contract_ranges");
         let supported_features = args
             .get("supported_features")
@@ -402,7 +402,18 @@ impl McpSession {
         if let Some(count) = session.get_mut("paragraphs") {
             *count = json!(paragraphs);
         }
-        if track {
+        // The session's identity is STICKY: a field is updated when the call
+        // supplies it and left alone when it does not. Resetting `track` on
+        // every re-open meant a session that opened with `track: true` silently
+        // went back to untracked the moment any later call omitted it — the
+        // agent's edit then produced no revision at all, while `author` and
+        // `date` (which were already sticky) still looked set. Measured: an
+        // edit meant to be tracked wrote `<w:ins>`/`<w:del>` with an EMPTY date
+        // and no tracking mode reported.
+        if let Some(track) = track {
+            self.track = track;
+        }
+        if self.track {
             session["effective_mode"] = json!("track");
         }
         self.workdir = Some(workdir);
@@ -412,7 +423,6 @@ impl McpSession {
         if date.is_some() {
             self.date = date;
         }
-        self.track = track;
         self.success("workdir_open", json!({ "session": session }), build_commit)
     }
 
