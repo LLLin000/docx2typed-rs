@@ -1,6 +1,6 @@
 [package]
 name = "docx2typed"
-version = "0.1.0-rc1"
+version = "0.2.0"
 edition = "2021"
 readme = "README.md"
 repository = "https://github.com/LLLin000/docx2typed"
@@ -20,11 +20,11 @@ members = [
 resolver = "2"
 
 [dependencies]
-docx2typed-app = { version = "0.1.0-rc1", path = "crates/docx2typed-app" }
-docx2typed-core = { version = "0.1.0-rc1", path = "crates/docx2typed-core" }
-docx2typed-protocol = { version = "0.1.0-rc1", path = "crates/docx2typed-protocol" }
-docx2typed-review = { version = "0.1.0-rc1", path = "crates/docx2typed-review" }
-docx2typed-store = { version = "0.1.0-rc1", path = "crates/docx2typed-store" }
+docx2typed-app = { version = "0.2.0", path = "crates/docx2typed-app" }
+docx2typed-core = { version = "0.2.0", path = "crates/docx2typed-core" }
+docx2typed-protocol = { version = "0.2.0", path = "crates/docx2typed-protocol" }
+docx2typed-review = { version = "0.2.0", path = "crates/docx2typed-review" }
+docx2typed-store = { version = "0.2.0", path = "crates/docx2typed-store" }
 serde_json = "1"
 
 [features]

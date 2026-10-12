@@ -1,10 +1,10 @@
 # capabilities.md — Rust CLI and MCP atoms
 
 The production surface is the installed Rust binary. Install from crates.io
-(all seven crates published, `0.1.0-rc1`):
+(all seven crates published, `0.2.0`):
 
 ```text
-cargo install docx2typed --version 0.1.0-rc1
+cargo install docx2typed --version 0.2.0
 ```
 
 Commands:

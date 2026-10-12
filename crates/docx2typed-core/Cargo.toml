@@ -1,13 +1,13 @@
 [package]
 name = "docx2typed-core"
-version = "0.1.0-rc1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/LLLin000/docx2typed"
 description = "Deep module: package profiling, extract planning, workdir validation, no-op build planning (issue #55)"
 
 [dependencies]
-docx2typed-protocol = { version = "0.1.0-rc1", path = "../docx2typed-protocol" }
+docx2typed-protocol = { version = "0.2.0", path = "../docx2typed-protocol" }
 # deflate-only: DOCX parts are DEFLATE; the default feature set drags in
 # zstd/lzma/bzip2 C decoders whose stack frames overflow Windows' 1 MiB
 # main-thread stack.
