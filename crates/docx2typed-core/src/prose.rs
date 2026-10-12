@@ -2267,6 +2267,34 @@ pub fn serialize_typed(
     text
 }
 
+/// Paragraph id -> its `typed.md` body, rendered from a package's node tree.
+///
+/// The per-paragraph form of `project_current_typed`, for a caller that has to
+/// splice bodies into an existing file rather than write a whole one. Rendered
+/// through `typed_paragraph_block`, so a body produced here is spelled exactly
+/// as one produced for a full projection — two ways of asking for the same
+/// paragraph cannot give two answers.
+pub fn paragraph_markup_map(package: &[u8]) -> Result<BTreeMap<String, String>, CoreError> {
+    let trees = crate::token_table::paragraph_nodes(package)?;
+    let catalog = StyleCatalog::build(package)?;
+    let (prepared, _promoted) = prepare_paragraphs(&trees, &catalog);
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for entry in &prepared {
+        let block = typed_paragraph_block(entry);
+        // `typed_paragraph_block` includes the marker line; a map entry is the
+        // body that follows it.
+        let body = match block.split_once('\n') {
+            Some((first, rest)) if first.starts_with("<!--@p ") => match rest.split_once('\n') {
+                Some((second, tail)) if second.starts_with("<!--@mark ") => tail.to_string(),
+                _ => rest.to_string(),
+            },
+            _ => String::new(),
+        };
+        out.insert(entry.tree.paragraph_id.clone(), body);
+    }
+    Ok(out)
+}
+
 /// A stable digest of a package's members: names and per-member hashes, in
 /// order, hashed once.
 ///

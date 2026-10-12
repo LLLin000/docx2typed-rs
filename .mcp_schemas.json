@@ -351,6 +351,11 @@
       "author": {
         "title": "Author",
         "type": "string"
+      },
+      "date": {
+        "title": "Date",
+        "type": "string",
+        "description": "ISO-8601 stamp recorded on revisions written this call, e.g. 2026-10-12T09:30:00Z. A tracked change is identified by author AND date; without one the revision cannot be ordered against another pass."
       }
     },
     "required": [
@@ -415,6 +420,11 @@
       "author": {
         "title": "Author",
         "type": "string"
+      },
+      "date": {
+        "title": "Date",
+        "type": "string",
+        "description": "ISO-8601 stamp recorded on revisions written this call, e.g. 2026-10-12T09:30:00Z. A tracked change is identified by author AND date; without one the revision cannot be ordered against another pass."
       }
     },
     "required": [
@@ -1142,6 +1152,10 @@
   },
   "workdir_open": {
     "properties": {
+      "workdir": {
+        "title": "Workdir",
+        "type": "string"
+      },
       "author": {
         "anyOf": [
           {
@@ -1153,6 +1167,23 @@
         ],
         "default": null,
         "title": "Author"
+      },
+      "date": {
+        "title": "Date",
+        "type": "string",
+        "description": "ISO-8601 stamp recorded on revisions written this call, e.g. 2026-10-12T09:30:00Z. A tracked change is identified by author AND date; without one the revision cannot be ordered against another pass."
+      },
+      "track": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Track"
       },
       "contract_ranges": {
         "anyOf": [
@@ -1172,21 +1203,6 @@
         "default": null,
         "title": "Contract Ranges"
       },
-      "required_features": {
-        "anyOf": [
-          {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          {
-            "type": "null"
-          }
-        ],
-        "default": null,
-        "title": "Required Features"
-      },
       "supported_features": {
         "anyOf": [
           {
@@ -1202,21 +1218,20 @@
         "default": null,
         "title": "Supported Features"
       },
-      "track": {
+      "required_features": {
         "anyOf": [
           {
-            "type": "boolean"
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           {
             "type": "null"
           }
         ],
         "default": null,
-        "title": "Track"
-      },
-      "workdir": {
-        "title": "Workdir",
-        "type": "string"
+        "title": "Required Features"
       }
     },
     "required": [

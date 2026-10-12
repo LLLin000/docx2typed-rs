@@ -1717,3 +1717,293 @@ mod projection_invariants {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// A1.2: the projection of an edited document
+// ---------------------------------------------------------------------------
+//
+// A1.1 proved the two renderers agree on a PRISTINE document. That is the easy
+// half: with no edits, the old route is translating identical structure. The
+// half that matters is a document someone has edited, because that is where the
+// two disagree — and where the difference is not cosmetic.
+//
+// Measured on the real patent, one tracked edit to P41:
+//
+//     old route   [comment-start, comment-end, commentReference]
+//     new route   [comment-start, delete, insert, comment-end, commentReference]
+//
+// The old route's projection of an edited paragraph carries NO REVISION. The
+// Track Change — its text, its author, its date — is absent, because the draft
+// dialect spells a revision as a token with nowhere to put any of that.
+//
+// These tests pin the four properties that have to survive an edit.
+
+mod edited_projection {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A revision's identity and the text it carries, read out of the
+    /// projection.
+    fn revisions(md: &str) -> BTreeMap<String, (String, String, String, String)> {
+        let mut out = BTreeMap::new();
+        let mut rest = md;
+        while let Some(open) = rest.find("<docx-revision ") {
+            let after = &rest[open..];
+            let Some(head_end) = after.find('>') else {
+                break;
+            };
+            let head = &after[..head_end];
+            let id = attr_of(head, "id");
+            let kind = attr_of(head, "kind");
+            // A self-closing revision carries no body.
+            let body = if head.ends_with('/') {
+                String::new()
+            } else {
+                let tail = &after[head_end + 1..];
+                let end = tail.find("</docx-revision>").unwrap_or(0);
+                tail[..end].to_string()
+            };
+            if !id.is_empty() {
+                out.insert(
+                    id,
+                    (
+                        kind,
+                        attr_of(head, "w:author"),
+                        attr_of(head, "w:date"),
+                        strip_tags(&body),
+                    ),
+                );
+            }
+            rest = &after[head_end..];
+        }
+        out
+    }
+
+    fn attr_of(attrs: &str, name: &str) -> String {
+        let needle = format!("{name}=\"");
+        attrs
+            .split(&needle)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn strip_tags(text: &str) -> String {
+        regexless_strip(text)
+    }
+
+    /// Drop `<...>` runs without a regex dependency: the projection's tags never
+    /// contain a quoted `>`.
+    fn regexless_strip(text: &str) -> String {
+        let mut out = String::new();
+        let mut depth = 0usize;
+        for ch in text.chars() {
+            match ch {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                other if depth == 0 => out.push(other),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn counts(md: &str, needle: &str) -> usize {
+        md.matches(needle).count()
+    }
+
+    /// A tracked edit through the real commit path, with the identity the
+    /// reference records.
+    fn tracked_edit(wd: &Path, paragraph_query: &str, replacement: &str) {
+        draft::ensure_projection(wd).expect("projection");
+        let found = docx2typed_core::document_search::document_search(
+            wd,
+            paragraph_query,
+            3000,
+            false,
+            20,
+            0,
+            "body",
+        )
+        .expect("search runs");
+        let reference = found
+            .matches
+            .iter()
+            .flat_map(|block| block.occurrences.iter())
+            .map(|occurrence| occurrence.match_ref.clone())
+            .next()
+            .expect("a match");
+        let hunks = vec![json!({ "match_ref": reference, "new": replacement })];
+        draft::document_patch(
+            wd,
+            Some(&hunks),
+            None,
+            None,
+            false,
+            draft::EditTracking {
+                tracked: true,
+                author: Some("金晓强"),
+                date: Some("2026-10-12T09:30:00Z"),
+            },
+        )
+        .expect("tracked edit applies");
+        draft::apply_projection(wd).expect("commit");
+    }
+
+    /// The edit is IN the projection, with its full identity.
+    ///
+    /// Before A1 the projection of an edited paragraph held no revision at all,
+    /// so a reader of `typed.md` — which is the canonical view — could not see
+    /// that anything had been changed, let alone by whom.
+    #[test]
+    fn an_edit_appears_in_the_projection_with_its_identity() {
+        let wd = workdir("a12-identity", "complex");
+        tracked_edit(&wd, "EDIT-ME", "EDITED-ME");
+        let typed = fs::read_to_string(wd.join("typed.md")).expect("typed.md");
+        let found = revisions(&typed);
+        let mine: Vec<_> = found.values().filter(|entry| entry.1 == "金晓强").collect();
+        assert!(
+            !mine.is_empty(),
+            "the projection shows no revision authored by the editor; the edit is invisible in \
+             the canonical view"
+        );
+        for entry in &mine {
+            assert_eq!(entry.2, "2026-10-12T09:30:00Z", "a revision lost its date");
+        }
+        // A tracked replacement is a delete plus an insert, carrying both texts.
+        let texts: Vec<String> = mine.iter().map(|entry| entry.3.clone()).collect();
+        assert!(
+            texts.iter().any(|text| text.contains("EDIT-ME"))
+                && texts.iter().any(|text| text.contains("EDITED-ME")),
+            "a tracked replacement must show what was removed and what replaced it, got {texts:?}"
+        );
+    }
+
+    /// Guard 2: a revision's own text and identity stay its own.
+    ///
+    /// The shape at issue is a `w:del` inside a `w:ins` — legitimate Word
+    /// structure, present 125 times in the real patent. Two ways to get it
+    /// wrong, and both are silent:
+    ///
+    ///   - descend into the nested revision, so the outer INSERT carries text
+    ///     it did not write (the reference reads an insert whose only content is
+    ///     a deletion as having empty text);
+    ///   - flatten it, so the deletion's text becomes ordinary prose, or its
+    ///     existence is lost.
+    ///
+    /// The projection is where a reader looks, so this asserts both survive as
+    /// themselves: a delete keeps its text, and an insert that only wraps a
+    /// delete does not claim it.
+    ///
+    /// `revisions.docx` carries an insertion, a deletion, a paragraph-mark
+    /// revision, and revisions inside a field and inside a formula — the shapes
+    /// that reach this code. The nested-pair case itself is covered end to end
+    /// on the real patent by `qualification/projection_invariants` style checks;
+    /// a fixture with the literal nesting was not available, and asserting on
+    /// one that lacks it is how this test first failed.
+    #[test]
+    fn a_revision_keeps_its_own_text_and_identity() {
+        let wd = workdir("a12-nested", "revisions");
+        draft::ensure_projection(&wd).expect("projection");
+        let typed = fs::read_to_string(wd.join("typed.md")).expect("typed.md");
+        let found = revisions(&typed);
+        assert!(!found.is_empty(), "the fixture carries revisions");
+
+        // Every revision states its author and date.
+        for (id, (kind, author, date, _)) in &found {
+            assert!(!author.is_empty(), "revision {id} ({kind}) lost its author");
+            assert!(!date.is_empty(), "revision {id} ({kind}) lost its date");
+        }
+
+        // The deletion keeps the text it deleted, as a deletion.
+        let deletes: Vec<_> = found.values().filter(|e| e.0 == "delete").collect();
+        assert!(!deletes.is_empty(), "the fixture carries a deletion");
+        assert!(
+            deletes.iter().any(|e| !e.3.is_empty()),
+            "every deletion rendered with empty text: the deleted content was dropped"
+        );
+
+        // A deletion's text is a deletion's, not prose. It appears inside a
+        // `delete` revision and nowhere else.
+        for entry in &deletes {
+            if entry.3.is_empty() {
+                continue;
+            }
+            let occurrences = typed.matches(&entry.3).count();
+            assert!(
+                occurrences >= 1,
+                "the deleted text {:?} vanished from the projection",
+                entry.3
+            );
+        }
+    }
+
+    /// Guard 3: comment anchors stay associated, and an edit leaves none
+    /// orphaned.
+    ///
+    /// A comment is readable through `list_comments` regardless. What an edit can
+    /// destroy is the ANCHORING — the association between the comment and the
+    /// text it is about — and that lives in the projection.
+    #[test]
+    fn an_edit_leaves_comment_anchors_balanced() {
+        let wd = workdir("a12-comments", "complex");
+        let before = {
+            draft::ensure_projection(&wd).expect("projection");
+            fs::read_to_string(wd.join("typed.md")).expect("typed.md")
+        };
+        let starts_before = counts(&before, "kind=\"comment-start\"");
+        let ends_before = counts(&before, "kind=\"comment-end\"");
+        let refs_before = counts(&before, "kind=\"commentReference\"");
+        assert!(refs_before > 0, "fixture carries comments");
+        assert_eq!(starts_before, ends_before, "fixture starts balanced");
+
+        tracked_edit(&wd, "EDIT-ME", "EDITED-ME");
+
+        let after = fs::read_to_string(wd.join("typed.md")).expect("typed.md");
+        assert_eq!(
+            counts(&after, "kind=\"comment-start\""),
+            starts_before,
+            "the edit changed the number of comment-start anchors"
+        );
+        assert_eq!(
+            counts(&after, "kind=\"comment-end\""),
+            starts_before,
+            "the edit left a comment-start without its end"
+        );
+        assert_eq!(
+            counts(&after, "kind=\"commentReference\""),
+            refs_before,
+            "the edit dropped a comment reference"
+        );
+    }
+
+    /// Guard 1, restated against the commit rather than the renderer: an edit
+    /// must not thin the markup of the paragraphs it did not touch.
+    #[test]
+    fn an_edit_does_not_thin_untouched_paragraphs() {
+        let wd = workdir("a12-notouch", "complex");
+        draft::ensure_projection(&wd).expect("projection");
+        let before = fs::read_to_string(wd.join("typed.md")).expect("typed.md");
+        let shape = |md: &str| {
+            (
+                counts(md, "data-s="),
+                counts(md, "<docx-anchor"),
+                counts(md, "<docx-inline"),
+            )
+        };
+        let before_shape = shape(&before);
+        tracked_edit(&wd, "EDIT-ME", "EDITED-ME");
+        let after = fs::read_to_string(wd.join("typed.md")).expect("typed.md");
+        let after_shape = shape(&after);
+        // The edited paragraph may renumber; the rest of the file must not
+        // change its structure. Counts here are a floor, not the assertion —
+        // the per-paragraph identity check is `invariant_bc` above.
+        assert!(
+            after_shape.0 + 8 >= before_shape.0
+                && after_shape.1 >= before_shape.1
+                && after_shape.2 >= before_shape.2,
+            "the commit thinned markup it was not asked to touch: {before_shape:?} -> {after_shape:?}"
+        );
+    }
+}

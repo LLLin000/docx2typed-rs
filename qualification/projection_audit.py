@@ -364,9 +364,16 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.freeze:
+        # A fingerprint of an EXISTING workdir. Extracting over one that is
+        # already there would fingerprint the fresh extract instead of the state
+        # under test, which is not a baseline for anything.
         wd = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="proj-freeze-"))
-        wd.mkdir(parents=True, exist_ok=True)
-        rust_extract(Path(args.document), wd)
+        if args.workdir is None:
+            wd.mkdir(parents=True, exist_ok=True)
+            rust_extract(Path(args.document), wd)
+        if not (wd / "typed.md").is_file():
+            print(f"no workdir to freeze at {wd}", file=sys.stderr)
+            return 2
         fp = semantic_fingerprint(wd)
         Path(args.freeze).write_text(json.dumps(fp, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"frozen: {args.freeze}")

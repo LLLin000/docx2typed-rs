@@ -140,6 +140,11 @@ struct McpSession {
     engine: Engine,
     workdir: Option<String>,
     author: Option<String>,
+    /// ISO-8601 stamp for tracked revisions written this session. The
+    /// reference records author and date on every `w:ins`/`w:del`; without a
+    /// date the revision is still identifiable but not datable, and a reader
+    /// comparing two passes has no way to order them.
+    date: Option<String>,
     track: bool,
 }
 
@@ -149,6 +154,7 @@ impl McpSession {
             engine: Engine::new(),
             workdir: None,
             author: None,
+            date: None,
             track: false,
         }
     }
@@ -310,6 +316,7 @@ impl McpSession {
             .get("author")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let date = args.get("date").and_then(Value::as_str).map(str::to_string);
         let track = args.get("track").and_then(Value::as_bool).unwrap_or(false);
         let contract_ranges = args.get("contract_ranges");
         let supported_features = args
@@ -399,7 +406,12 @@ impl McpSession {
             session["effective_mode"] = json!("track");
         }
         self.workdir = Some(workdir);
-        self.author = author;
+        if author.is_some() {
+            self.author = author;
+        }
+        if date.is_some() {
+            self.date = date;
+        }
         self.track = track;
         self.success("workdir_open", json!({ "session": session }), build_commit)
     }
@@ -1849,6 +1861,11 @@ impl McpSession {
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| self.author.clone());
+        let date = args
+            .get("date")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.date.clone());
         match docx2typed_review::facade::edit(
             Path::new(&workdir),
             &edits,
@@ -1856,7 +1873,7 @@ impl McpSession {
             docx2typed_review::draft::EditTracking {
                 tracked,
                 author: author.as_deref(),
-                date: None,
+                date: date.as_deref(),
             },
         ) {
             Ok(data) => self.success("facade_edit", data, build_commit),
@@ -1902,6 +1919,11 @@ impl McpSession {
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| self.author.clone());
+        let date = args
+            .get("date")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.date.clone());
         match docx2typed_review::facade::resolve_and_edit(
             Path::new(&workdir),
             find,
@@ -1911,7 +1933,7 @@ impl McpSession {
             docx2typed_review::draft::EditTracking {
                 tracked,
                 author: author.as_deref(),
-                date: None,
+                date: date.as_deref(),
             },
         ) {
             Ok(data) => self.success("facade_resolve", data, build_commit),
