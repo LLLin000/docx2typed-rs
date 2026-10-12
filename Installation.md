@@ -66,10 +66,10 @@ and let them choose.
 ## Step 2 — Obtain the binary
 
 **A. From crates.io (preferred when the user has Rust).** The crate is published
-as `0.1.0-rc1`; this builds and installs in one step:
+as `0.2.0`; this builds and installs in one step:
 
 ```text
-cargo install docx2typed --version 0.1.0-rc1
+cargo install docx2typed --version 0.2.0
 ```
 
 Result: `~/.cargo/bin/docx2typed[.exe]`. Skip to Step 3 and pass that path.
