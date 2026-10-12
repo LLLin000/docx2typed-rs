@@ -70,8 +70,9 @@ reproducibility artifact, not a public release.
 
 ## Windows installation
 
-The receipt-safe installer is Windows-only. It accepts an already-built or
-already-verified binary; it does not download one.
+One command installs the binary **and** configures the agent's MCP entry. The
+installer is receipt-safe and Windows-only; it accepts an already-built or
+already-verified binary and does not download one.
 
 ```powershell
 $source = (Resolve-Path .\target\release\docx2typed.exe).Path
@@ -82,6 +83,40 @@ powershell -NoProfile -ExecutionPolicy Bypass `
   -Action install `
   -Bin $source
 ```
+
+That is the whole setup: the binary lands in `%LOCALAPPDATA%\docx2typed\bin\`
+and the `docx2typed` entry is merged into `~/.omp/agent/mcp.json`. Nothing else
+is needed — no PATH edit, no hand-copied JSON.
+
+### What the installer does to the agent config
+
+A binary MCP server has no `npx`/`uvx` one-liner, and omp offers no `mcp add`
+command, so the installer merges the host's own configuration. It is written to
+be a good citizen about a file it does not own:
+
+| Step | Behaviour |
+|---|---|
+| read | the host config, or a new one if absent |
+| back up | a timestamped `mcp.json.bak-<utc>` beside it, before any write |
+| merge | **only** `mcpServers.docx2typed`; every other server and every other key is preserved |
+| validate | the merged text is re-parsed; a bad merge restores the backup and fails |
+| publish | atomically (temp file in the same directory, then rename) |
+| record | the path goes in the receipt, so uninstall removes exactly what was added |
+| **verify** | the server is launched and `tools/list` counted — proof the entry works, not just that JSON was written |
+
+Idempotent: re-running replaces the entry, never duplicates it. A config that
+does not parse is **refused and left byte-identical** — it is the host's file,
+and a config that already fails to parse is the user's to fix.
+
+Options:
+
+| Flag | Effect |
+|---|---|
+| `-HostMcpConfig <path>` | configure a different host config instead of `~/.omp/agent/mcp.json` |
+| `-NoMcp` | install the binary only; configure later with `-Action configure-mcp` |
+
+Standalone actions: `-Action configure-mcp` and `-Action unconfigure-mcp` do
+just the config half, and `uninstall` removes both the binary and the entry.
 
 Default layout:
 
@@ -164,6 +199,17 @@ On Windows, the installer writes this object to
 Copy the object into the host's configuration only after authorization. Keep
 all existing MCP servers. Do not replace the command with `python`, `uvx`,
 `cargo run`, a relative path, or a repository import.
+
+## Test the installer
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\mcp_merge_tests.ps1
+```
+
+Sixteen checks over temp prefixes and temp host configs: other servers survive,
+re-running is idempotent, every "no entry yet" shape works, a corrupt config is
+refused untouched, uninstall removes only our entry, and `-NoMcp` touches
+nothing. It needs no signing key and never reads the real host configuration.
 
 ## Verify the installation
 

@@ -22,10 +22,19 @@
 #   Tests    : add -Prefix <temp prefix> to isolate (never touches %LOCALAPPDATA%)
 
 param(
-    [ValidateSet("install", "update", "rollback", "uninstall")]
+    [ValidateSet("install", "update", "rollback", "uninstall", "configure-mcp", "unconfigure-mcp")]
     [string]$Action = "install",
     [string]$Bin = "",
-    [string]$Prefix = ""
+    [string]$Prefix = "",
+    # The HOST config to merge the MCP entry into. Defaults to omp's agent
+    # config; pass another path for a different host, or "" with -NoMcp to
+    # install the binary alone. Named -HostMcpConfig because PowerShell
+    # variable names are case-INSENSITIVE: -McpConfigPath would be the SAME
+    # variable as this script's own $mcpConfigPath (the snippet it writes under
+    # the prefix), and the snippet would silently win.
+    [string]$HostMcpConfig = "",
+    # Install the binary without touching any host configuration.
+    [switch]$NoMcp
 )
 
 $ErrorActionPreference = "Stop"
@@ -218,9 +227,178 @@ function Invoke-Uninstall {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Host MCP configuration
+#
+# A binary MCP server has no `npx`/`uvx` one-liner and the host offers no
+# `mcp add` command, so the installer merges the entry itself. The contract
+# that makes that safe rather than a footgun:
+#
+#   1. read the host config (or start from {"mcpServers":{}});
+#   2. back it up, timestamped, before anything is written;
+#   3. merge exactly ONE key, mcpServers.docx2typed, leaving every other
+#      server untouched;
+#   4. re-parse the merged text - a host config that does not parse breaks the
+#      whole agent, so a bad merge restores the backup and fails;
+#   5. publish atomically (temp in the same directory, then rename);
+#   6. record what was added, so uninstall removes exactly that and nothing
+#      else;
+#   7. VERIFY by launching the server and listing its tools - proof the entry
+#      works, not merely that JSON was written.
+# ---------------------------------------------------------------------------
+
+function Get-DefaultMcpConfigPath {
+    # omp keeps its MCP servers in ~/.omp/agent/mcp.json. Honour an explicit
+    # -McpConfigPath first; this is only the default.
+    $ompHome = Join-Path $HOME ".omp"
+    return (Join-Path $ompHome "agent\mcp.json")
+}
+
+function Read-HostMcpConfig([string]$path) {
+    if (-not (Test-Path $path)) { return [pscustomobject]@{ mcpServers = [pscustomobject]@{} } }
+    $raw = Get-Content -Path $path -Raw
+    if ([string]::IsNullOrWhiteSpace($raw)) { return [pscustomobject]@{ mcpServers = [pscustomobject]@{} } }
+    try {
+        return ($raw | ConvertFrom-Json)
+    } catch {
+        # Refuse, and say so plainly. This file belongs to the host, not to us:
+        # a config that does not parse already breaks the agent, and rewriting
+        # it would discard whatever the user was editing. Nothing is touched.
+        throw ("the host config at '$path' is not valid JSON, so it was left exactly as it " +
+               "is (nothing was changed). Fix it, or point -HostMcpConfig at another file, or " +
+               "install the binary alone with -NoMcp. Parse error: $($_.Exception.Message)")
+    }
+}
+
+function Backup-HostConfig([string]$path) {
+    if (-not (Test-Path $path)) { return $null }
+    $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+    $backup = "$path.bak-$stamp"
+    Copy-Item -Path $path -Destination $backup -Force
+    return $backup
+}
+
+function Publish-HostConfig([string]$path, $config, [string]$backup) {
+    # Serialize, then PROVE the bytes parse before they reach the host. A host
+    # config that does not parse takes the whole agent down, so the merge is
+    # validated on the text, not on the object it came from.
+    $json = $config | ConvertTo-Json -Depth 20
+    $null = $json | ConvertFrom-Json
+    $dir = Split-Path -Parent $path
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $temp = Join-Path $dir (".mcp.json.tmp-" + [guid]::NewGuid().ToString("N"))
+    Write-Utf8NoBom $temp $json
+    try {
+        if (Test-Path $path) {
+            [System.IO.File]::Replace($temp, $path, "$path.prev")
+            Remove-Item "$path.prev" -Force -ErrorAction SilentlyContinue
+        } else {
+            [System.IO.File]::Move($temp, $path)
+        }
+    } catch {
+        if ($backup -and (Test-Path $backup)) { Copy-Item $backup $path -Force }
+        throw "could not publish the host config at '$path': $($_.Exception.Message). The previous file is intact."
+    }
+}
+
+function Test-McpEntryWorks([string]$binaryPath) {
+    # Launch the server and list its tools. An entry that is present but does
+    # not serve is worse than no entry: the host reports a dead server forever.
+    $request = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+    try {
+        $out = $request | & $binaryPath "mcp" 2>$null | Out-String
+    } catch {
+        return 0
+    }
+    $count = 0
+    foreach ($line in ($out -split "`n")) {
+        if ($line -match '"tools"') {
+            try { $count = ($line | ConvertFrom-Json).result.tools.Count } catch { $count = 0 }
+            break
+        }
+    }
+    return $count
+}
+
+function Invoke-ConfigureMcp {
+    $target = if ($HostMcpConfig) { $HostMcpConfig } else { Get-DefaultMcpConfigPath }
+    if (-not (Test-Path $binaryPath)) {
+        throw "no installed binary at $binaryPath - run install/update first"
+    }
+    $config = Read-HostMcpConfig $target
+    # `@(...)` around `.Name` is load-bearing, not style: on an object with NO
+    # properties `.Name` returns $null rather than an empty array, and calling
+    # `.Contains()` on that is an error. A host config that has an `mcpServers`
+    # key but no servers yet hits exactly that, which is the common case on a
+    # fresh install. `-contains` on a forced array is the safe form.
+    if (@($config.PSObject.Properties.Name) -notcontains "mcpServers") {
+        $config | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $backup = Backup-HostConfig $target
+    $entry = [pscustomobject]@{ command = $binaryPath; args = @("mcp") }
+    if (@($config.mcpServers.PSObject.Properties.Name) -contains "docx2typed") {
+        $config.mcpServers.docx2typed = $entry          # idempotent: replace, never duplicate
+    } else {
+        $config.mcpServers | Add-Member -NotePropertyName docx2typed -NotePropertyValue $entry -Force
+    }
+    Publish-HostConfig $target $config $backup
+
+    $tools = Test-McpEntryWorks $binaryPath
+    if ($tools -le 0) {
+        throw "configured '$target' but the server did not answer tools/list - the entry is present and dead. Restore from '$backup'."
+    }
+
+    # Record the path so uninstall removes exactly what this added.
+    if (Test-Path $receiptPath) {
+        $receipt = Read-Json $receiptPath
+        $receipt | Add-Member -NotePropertyName mcp_host_config_path -NotePropertyValue $target -Force
+        $receipt | Add-Member -NotePropertyName mcp_host_config_backup -NotePropertyValue $backup -Force
+        Write-Utf8NoBom $receiptPath ($receipt | ConvertTo-Json -Depth 5)
+    }
+    Write-Host "MCP: configured '$target' -> $binaryPath mcp ($tools tools served)"
+    if ($backup) { Write-Host "MCP: previous host config backed up at $backup" }
+}
+
+function Invoke-UnconfigureMcp {
+    $target = if ($HostMcpConfig) { $HostMcpConfig } else { Get-DefaultMcpConfigPath }
+    if (-not (Test-Path $target)) { Write-Host "MCP: no host config at '$target' - nothing to remove"; return }
+    $config = Read-HostMcpConfig $target
+    if (@($config.PSObject.Properties.Name) -notcontains "mcpServers" -or
+        @($config.mcpServers.PSObject.Properties.Name) -notcontains "docx2typed") {
+        Write-Host "MCP: '$target' has no docx2typed entry - nothing to remove"
+        return
+    }
+    $backup = Backup-HostConfig $target
+    $config.mcpServers.PSObject.Properties.Remove("docx2typed")
+    Publish-HostConfig $target $config $backup
+    Write-Host "MCP: removed the docx2typed entry from '$target' (other servers untouched)"
+}
+
 switch ($Action) {
-    "install" { Invoke-Install }
-    "update" { Invoke-Update }
+    "install" {
+        Invoke-Install
+        if (-not $NoMcp) {
+            try { Invoke-ConfigureMcp }
+            catch {
+                # The binary is already in place; only the host entry failed.
+                # Say which half landed so the user is not left guessing.
+                Write-Host "MCP: NOT configured - $($_.Exception.Message)"
+                Write-Host "MCP: the binary itself is installed and working; re-run with -Action configure-mcp once the config is usable."
+                throw
+            }
+        }
+        else { Write-Host "MCP: skipped (-NoMcp); configure later with -Action configure-mcp" }
+    }
+    "update" {
+        Invoke-Update
+        if (-not $NoMcp) { Invoke-ConfigureMcp }
+        else { Write-Host "MCP: skipped (-NoMcp)" }
+    }
     "rollback" { Invoke-Rollback }
-    "uninstall" { Invoke-Uninstall }
+    "uninstall" {
+        Invoke-UnconfigureMcp
+        Invoke-Uninstall
+    }
+    "configure-mcp" { Invoke-ConfigureMcp }
+    "unconfigure-mcp" { Invoke-UnconfigureMcp }
 }
