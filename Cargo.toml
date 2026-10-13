@@ -106,4 +106,7 @@ path = "rust-tests/descriptor_commands.rs"
 [[test]]
 name = "sync_guard"
 path = "rust-tests/sync_guard.rs"
+[[test]]
+name = "verify_protected"
+path = "rust-tests/verify_protected.rs"
 

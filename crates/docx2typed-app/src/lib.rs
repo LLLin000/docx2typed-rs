@@ -2193,11 +2193,17 @@ impl Engine {
             profile: context.profile.clone(),
         });
         if verification.verdict != "pass" {
+            // The failing check's own explanation, not just its name: a name
+            // says WHICH invariant broke and nothing about how, which left the
+            // one person who has to act on it reading the source.
             let detail = verification
                 .checks
                 .iter()
                 .find(|check| check.status != "pass")
-                .map(|check| check.name.clone())
+                .map(|check| match check.detail.as_deref() {
+                    Some(why) if !why.is_empty() => format!("{}: {why}", check.name),
+                    _ => check.name.clone(),
+                })
                 .unwrap_or_else(|| "verification".to_string());
             return Ok(OperationOutcome::failure(vec![Diagnostic::new(
                 "workdir-invalid",
