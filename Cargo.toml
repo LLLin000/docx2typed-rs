@@ -100,4 +100,7 @@ path = "rust-tests/facade.rs"
 [[test]]
 name = "cross_run_verify"
 path = "rust-tests/cross_run_verify.rs"
+[[test]]
+name = "descriptor_commands"
+path = "rust-tests/descriptor_commands.rs"
 

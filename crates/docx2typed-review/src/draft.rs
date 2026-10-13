@@ -4030,6 +4030,45 @@ pub fn discard_projection(workdir: &Path) -> Result<(), CollaborationError> {
     Ok(())
 }
 
+/// What the source document this workdir was extracted from looks like NOW.
+///
+/// A workdir records the source's file name and hash but not its path, and the
+/// file it came from normally sits beside the workdir. When a file of that name
+/// is there, this compares it — so a source that moved on since the extract is
+/// visible when the workdir opens, instead of being discovered by overwriting
+/// the newer file with a build from the older one.
+///
+/// `None` means "nothing to compare", NOT "no drift": no `format.json`, no
+/// recorded name, or no such file beside the workdir. Reporting `changed:
+/// false` in that case would be a green light nobody earned, which is the
+/// failure this exists to prevent.
+pub fn source_drift(workdir: &Path) -> Option<Value> {
+    let format: Value =
+        serde_json::from_str(&fs::read_to_string(workdir.join("format.json")).ok()?).ok()?;
+    let name = format.get("source")?.as_str()?;
+    let recorded = format.get("source_sha256")?.as_str()?;
+    let candidate = workdir.parent()?.join(name);
+    if !candidate.is_file() {
+        return None;
+    }
+    let current = file_sha256(&candidate).ok()?;
+    let changed = current != recorded;
+    Some(serde_json::json!({
+        "source": name,
+        "path": candidate.to_string_lossy(),
+        "recorded_sha256": recorded,
+        "current_sha256": current,
+        "changed": changed,
+        "remedy": if changed {
+            "the document moved on since this workdir was extracted; re-extract it over this \
+             workdir (extract <source.docx> -o <workdir>) before editing, or the build will \
+             overwrite the newer file with the older text"
+        } else {
+            "the workdir still matches its source"
+        },
+    }))
+}
+
 /// Read-only freshness of the opened workdir (`workdir_status`): state plus
 /// the edit body hash. A workdir without a projection reports clean with a
 /// null body hash (Rust-extracted workdirs have no edit.md until a draft

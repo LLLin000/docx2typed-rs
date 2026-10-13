@@ -2635,68 +2635,12 @@ fn diagnostic_from_value(value: &serde_json::Value) -> Diagnostic {
 }
 
 fn is_registered_code(code: &str) -> bool {
-    matches!(
-        code,
-        "input-not-found"
-            | "workdir-not-found"
-            | "workdir-invalid"
-            | "workdir-unreadable"
-            | "contract-incompatible"
-            | "required-feature-unsupported"
-            | "evidence-publish-failed"
-            | "resource-limit-exceeded"
-            | "invalid-arguments"
-            | "asset-closure"
-            | "schema-incompatible"
-            | "source-drift"
-            | "symlink-detected"
-            | "target-already-exists"
-            | "operation-id-required"
-            | "migrate-verification-failed"
-            | "edit-dirty"
-            | "edit-stale"
-            | "edit-conflict"
-            | "edit-state-missing"
-            | "edit-state-incompatible"
-            | "edit-binding-mismatch"
-            | "edit-header-tampered"
-            | "edit-grammar-invalid"
-            | "edit-header-missing"
-            // Issue #57 store diagnostics (frozen bundle registry).
-            | "writer-busy"
-            | "writer-timeout"
-            | "generation-conflict"
-            | "needs-recovery"
-            | "reserve-depleted"
-            | "unsupported-by-design"
-            | "store-invalid"
-            | "operation-id-reused"
-            | "operation-journal-conflict"
-            // Issue #58 prose diagnostics (frozen bundle registry).
-            | "invalid-edit"
-            | "opaque-paragraph-mutated"
-            | "prose-edit-ambiguous"
-            | "prose-edit-unsupported"
-            | "prose-xml-invalid"
-            // Issue #59 governed-workflow diagnostics (frozen bundle
-            // registry: revisions/decisions/comments/tables/audit).
-            | "invalid-action"
-            | "malformed-revision-key"
-            | "revision-fingerprint-mismatch"
-            | "revision-not-found"
-            | "revision-outside-editable-surface"
-            | "revision-text-fingerprint-mismatch"
-            | "invalid-table-reference"
-            | "merge-would-discard-content"
-            | "comment-not-found"
-            | "decided-output-already-exists"
-            | "decided-workdir-already-exists"
-            // Replace-lane diagnostics (document_replace): a cross-leaf span or
-            // a match with no sidecar record names a match the build cannot
-            // honour — refused loudly rather than dropped silently.
-            | "replace-cross-leaf-matches"
-            | "replace-unrecorded-match"
-    )
+    // Delegates to the ONE registry. This crate used to keep its own list of 52
+    // codes while the protocol declared 27, so the two disagreed about which
+    // codes exist: the CLI labelled failures correctly while `diagnostic_spec`
+    // answered the domain default — wrong severity, wrong category, and
+    // `retriable: false` for transient conditions — for half of them.
+    docx2typed_protocol::diagnostic_spec_opt(code).is_some()
 }
 
 // ---------------------------------------------------------------------------
