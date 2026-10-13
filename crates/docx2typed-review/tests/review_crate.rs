@@ -59,6 +59,7 @@ fn workdir(tag: &str, fixture_name: &str) -> PathBuf {
             OperationArgs::Extract(ExtractArgs {
                 input: fixture(fixture_name),
                 outdir: dir.clone(),
+                discard_committed_versions: false,
             }),
         )
         .expect("extraction engine runs");
@@ -990,6 +991,14 @@ fn document_patch_one_bad_hunk_leaves_the_draft_byte_identical() {
     assert!(error.detail.contains("2 of 3 hunks are invalid"));
     assert!(error.detail.contains("hunk #2 (P1): text-not-found"));
     assert!(error.detail.contains("hunk #3 (P0): patch-noop"));
+    // The bare code is not enough to act on: a caller holding a long batch needs
+    // to know WHY each hunk failed, or it re-derives every reason by hand. A
+    // real 50-hunk restructure stalled on `invalid-structure` reported this way.
+    assert!(
+        error.detail.contains("text-not-found — "),
+        "the per-hunk reason travels with the code: {}",
+        error.detail
+    );
     assert_eq!(
         fs::read(wd.join("edit.md")).expect("edit.md"),
         before,
@@ -2006,4 +2015,69 @@ mod edited_projection {
             "the commit thinned markup it was not asked to touch: {before_shape:?} -> {after_shape:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// source drift
+// ---------------------------------------------------------------------------
+
+/// `workdir_open` used to answer `freshness: clean` for a workdir whose source
+/// document had moved on, because freshness only compares the workdir against
+/// its own store. A session asked to "sync first" therefore saw a green light
+/// and never synced. The drift check is deliberately conservative: no recorded
+/// name or no file to compare is `None`, not `changed: false`.
+#[test]
+fn source_drift_reports_a_source_that_moved_on_and_stays_quiet_otherwise() {
+    use docx2typed_review::draft::source_drift;
+
+    let wd = workdir("drift", "complex");
+    // A Rust workdir records the file name it came from; point that name at a
+    // copy sitting beside the workdir, which is where a source normally lives.
+    let beside = wd.parent().expect("parent").join("complex.docx");
+    fs::copy(fixture("complex"), &beside).expect("place the source beside the workdir");
+    let format_path = wd.join("format.json");
+    let mut format: Value =
+        serde_json::from_str(&fs::read_to_string(&format_path).expect("format.json"))
+            .expect("format json");
+    format["source"] = json!("complex.docx");
+    fs::write(
+        &format_path,
+        serde_json::to_vec_pretty(&format).expect("serialize"),
+    )
+    .expect("write format.json");
+
+    let drift = source_drift(&wd).expect("a comparable source");
+    assert_eq!(drift["source"], json!("complex.docx"));
+    assert_eq!(
+        drift["changed"],
+        json!(false),
+        "an unchanged source is not drift: {drift}"
+    );
+
+    // The source moves on — what a human saving it in Word does.
+    let mut bytes = fs::read(&beside).expect("read source");
+    bytes.push(b' ');
+    fs::write(&beside, bytes).expect("rewrite source");
+
+    let drift = source_drift(&wd).expect("a comparable source");
+    assert_eq!(
+        drift["changed"],
+        json!(true),
+        "the change is reported: {drift}"
+    );
+    assert!(
+        drift["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.contains("re-extract")),
+        "the report says what to do about it: {drift}"
+    );
+
+    // No file of that name beside the workdir: nothing to compare, which must
+    // never be reported as "still matches".
+    fs::remove_file(&beside).expect("remove the source");
+    assert!(
+        source_drift(&wd).is_none(),
+        "an uncomparable source reports nothing rather than a false clean"
+    );
+    let _ = fs::remove_dir_all(wd.parent().expect("parent"));
 }

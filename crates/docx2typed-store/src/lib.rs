@@ -34,7 +34,7 @@ pub use versions::{
 
 pub use store::{
     has_store, pending_recovery, read_root, state, MutateRun, PinnedGeneration, RecoverySummary,
-    RunOutcome, Store, StoreMutateRequest, Transaction,
+    RunOutcome, Store, StoreMutateRequest, Transaction, STORE_DIR_NAME,
 };
 
 /// Workdir asset set from the Python Reference (`_WORKDIR_ASSETS`).
@@ -138,6 +138,23 @@ impl WorkdirStore {
                 Asset::CopySource { source, .. } => {
                     // byte copy: the template is the source package verbatim
                     fs::copy(source, &target)?;
+                }
+                Asset::Remove(_) => {
+                    // Already absent is the ordinary case: a workdir at its
+                    // baseline has none of these, and the plan only lists the
+                    // ones it found. A lane is a DIRECTORY (the store's), and
+                    // `remove_file` on a directory is an access-denied error on
+                    // Windows rather than a clear "wrong call".
+                    let result = if target.is_dir() {
+                        fs::remove_dir_all(&target)
+                    } else {
+                        fs::remove_file(&target)
+                    };
+                    match result {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             }
         }
@@ -346,5 +363,6 @@ fn asset_path(asset: &Asset) -> String {
     match asset {
         Asset::Bytes(path, _) => path.clone(),
         Asset::CopySource { path, .. } => path.clone(),
+        Asset::Remove(path) => path.clone(),
     }
 }

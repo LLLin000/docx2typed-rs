@@ -1809,6 +1809,7 @@ impl McpSession {
             docx2typed_app::OperationArgs::Extract(docx2typed_app::ExtractArgs {
                 input: source.to_path_buf(),
                 outdir: target.to_path_buf(),
+                discard_committed_versions: false,
             }),
         ) {
             Ok(outcome) => outcome,

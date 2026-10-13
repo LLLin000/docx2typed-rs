@@ -14,7 +14,7 @@ pub mod embedded;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use docx2typed_core::{plan_build, plan_extract, validate_workdir, Asset, BuildPlan, ChangeSet};
+use docx2typed_core::{plan_build, validate_workdir, Asset, BuildPlan, ChangeSet};
 use docx2typed_protocol::{
     base_evidence_payload, canonical_operation_input, file_sha256, resolve_path, run_evidence,
     typed_path_value, Diagnostic, ResultEnvelope, RunEvidence,
@@ -107,6 +107,11 @@ pub struct ProjectViewArgs {
 pub struct ExtractArgs {
     pub input: PathBuf,
     pub outdir: PathBuf,
+    /// Declare that the incoming file becomes the current state even when the
+    /// workdir has committed versions the source does not carry. Off by
+    /// default: that discard has to be someone's decision, and a workdir at its
+    /// baseline needs no switch at all.
+    pub discard_committed_versions: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -457,6 +462,9 @@ impl StorePort for MemoryStore {
                     let bytes = std::fs::read(source).map_err(StoreError::Io)?;
                     assets.insert(path.clone(), bytes);
                 }
+                Asset::Remove(path) => {
+                    assets.remove(path);
+                }
             }
         }
         self.workdirs.borrow_mut().insert(resolve_path(dir), assets);
@@ -738,10 +746,30 @@ impl Engine {
                 )]))
             }
         };
-        let change_set = match plan_extract(&source, &args.outdir) {
+        let reset = if args.discard_committed_versions {
+            docx2typed_core::BaselineReset::AllowCommitted
+        } else {
+            docx2typed_core::BaselineReset::Refuse
+        };
+        // A reset also clears the STORE lane, which only this layer knows about:
+        // leaving `.docx2typed-store/` behind without the pointer that goes with
+        // it produces a workdir the store refuses to open ("store pointer is
+        // missing or corrupt") — a store-backed workdir with no current version.
+        // Same change set, so the publish stays one step.
+        let replacing = docx2typed_core::replaces_existing_baseline(&args.outdir);
+        let change_set = match docx2typed_core::plan_extract_with(&source, &args.outdir, reset) {
             Ok(change_set) => change_set,
             Err(error) => return Ok(self.domain_failure("extract", &error.to_string())),
         };
+        let mut change_set = change_set;
+        if replacing {
+            let store_dir = args.outdir.join(docx2typed_store::STORE_DIR_NAME);
+            if store_dir.is_dir() {
+                change_set.assets.push(docx2typed_core::Asset::Remove(
+                    docx2typed_store::STORE_DIR_NAME.to_string(),
+                ));
+            }
+        }
         if let Err(error) = self.store.commit_workdir(&args.outdir, &change_set) {
             return Ok(self.domain_failure("extract", &error.to_string()));
         }

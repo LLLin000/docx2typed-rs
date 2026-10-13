@@ -152,6 +152,25 @@ fn empty_staged(current: &Value) -> Value {
     })
 }
 
+/// The hash of the baseline a session belongs to, when the workdir has one.
+///
+/// `_template.docx` is the one file only `extract` replaces, so it is the only
+/// honest anchor for "which document is this session about". The typed
+/// projection's hash cannot serve: it advances on every commit, and
+/// `publish_current` gates on it HAVING advanced, so treating a difference as
+/// staleness would make that gate a tautology and refuse every commit with
+/// `current-not-changed`.
+fn baseline_sha256(workdir: &Path) -> Option<String> {
+    sha256_file(&workdir.join("_template.docx")).ok()
+}
+
+/// A session reopened on a document that replaced the one it knew.
+fn rebase_session(typed_sha256: String, baseline_sha256: &str) -> Value {
+    let mut fresh = new_session(typed_sha256);
+    fresh["baseline_sha256"] = json!(baseline_sha256);
+    fresh
+}
+
 fn new_session(typed_sha256: String) -> Value {
     let now = now();
     let current = json!({
@@ -224,9 +243,57 @@ pub fn ensure_session(workdir: &Path) -> Result<Value, CollaborationError> {
     let typed_sha256 = sha256_file(&typed_path)
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     let state = match read_session(workdir) {
-        Some(state) => validate_session(&state)?,
+        Some(state) => {
+            let state = validate_session(&state)?;
+            let current_baseline = baseline_sha256(workdir);
+            match (
+                state.get("baseline_sha256").and_then(Value::as_str),
+                current_baseline.as_deref(),
+            ) {
+                // The workdir's baseline is not the one this session was
+                // bootstrapped against: extraction replaced it (ADR 0048). The
+                // session then describes a document that is not here any more,
+                // and it used to be reused verbatim — measured: after a reset it
+                // still reported the old origin and a changed paragraph the new
+                // document does not have, and the next edit was refused with
+                // `agent-preflight-required`, leaving the workdir uneditable
+                // with nothing explaining why. Re-bootstrap, and say so.
+                (Some(bound), Some(current)) if bound != current => {
+                    let rebased = rebase_session(typed_sha256.clone(), current);
+                    atomic_json(&session_path(workdir), &rebased)
+                        .map_err(|error| CollaborationError::new("workdir-unreadable", error))?;
+                    persist_snapshot(workdir, &rebased["current_snapshot"])
+                        .map_err(|error| CollaborationError::new("workdir-unreadable", error))?;
+                    append_history(
+                        workdir,
+                        &json!({
+                            "event": "session-rebound",
+                            "previous_baseline_sha256": bound,
+                            "baseline_sha256": current,
+                        }),
+                    );
+                    return Ok(rebased);
+                }
+                // A session recorded before this anchor existed: stamp it and
+                // keep its chain, so the migration costs nothing and only a real
+                // replacement rebinds.
+                (None, Some(current)) => {
+                    let mut stamped = state.clone();
+                    stamped["baseline_sha256"] = json!(current);
+                    atomic_json(&session_path(workdir), &stamped)
+                        .map_err(|error| CollaborationError::new("workdir-unreadable", error))?;
+                    stamped
+                }
+                _ => state,
+            }
+        }
         None => {
-            let state = new_session(typed_sha256);
+            // Anchor a fresh session immediately, so the very first commit does
+            // not have to stamp it on a later touch.
+            let state = match baseline_sha256(workdir) {
+                Some(current) => rebase_session(typed_sha256, &current),
+                None => new_session(typed_sha256),
+            };
             atomic_json(&session_path(workdir), &state)
                 .map_err(|error| CollaborationError::new("workdir-unreadable", error))?;
             persist_snapshot(workdir, &state["current_snapshot"])
