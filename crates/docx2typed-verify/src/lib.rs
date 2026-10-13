@@ -828,11 +828,7 @@ fn verify_tracked_part(output_part: &[u8], edits: &[&IslandEdit]) -> Result<(), 
         if !xml.contains("<w:del") || !xml.contains("<w:ins") {
             return Err("tracked output is missing w:del/w:ins containers".to_string());
         }
-        if !xml.contains(&format!("<w:delText>{old}</w:delText>"))
-            && !xml.contains(&format!(
-                "<w:delText xml:space=\"preserve\">{old}</w:delText>"
-            ))
-        {
+        if !deletion_covers(&xml, &old) {
             return Err(format!("tracked deletion text {:?} is missing", edit.old));
         }
         if !xml.contains(&format!("<w:t>{new}</w:t>"))
@@ -842,6 +838,36 @@ fn verify_tracked_part(output_part: &[u8], edits: &[&IslandEdit]) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// true when the deletion markup carries `escaped_old`.
+///
+/// A deletion that crosses runs is emitted as one `w:del` per run — wrapping
+/// each run is what keeps whatever sits BETWEEN runs (bookmarks, comment
+/// anchors) intact — so the recorded text is the JOIN of their `delText`, not
+/// one element. Reading them in document order and joining is the same
+/// assertion the single-element form made.
+fn deletion_covers(xml: &str, escaped_old: &str) -> bool {
+    if xml.contains(&format!("<w:delText>{escaped_old}</w:delText>"))
+        || xml.contains(&format!(
+            "<w:delText xml:space=\"preserve\">{escaped_old}</w:delText>"
+        ))
+    {
+        return true;
+    }
+    let mut joined = String::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find("<w:delText") {
+        let after = &rest[open..];
+        let Some(gt) = after.find('>') else { break };
+        let body_start = open + gt + 1;
+        let Some(close) = rest[body_start..].find("</w:delText>") else {
+            break;
+        };
+        joined.push_str(&rest[body_start..body_start + close]);
+        rest = &rest[body_start + close + "</w:delText>".len()..];
+    }
+    joined.contains(escaped_old)
 }
 
 fn part_key_from_path(path: &str) -> Option<String> {
@@ -874,12 +900,22 @@ fn recompute_edited_part(template_part: &[u8], edits: &[&IslandEdit]) -> Result<
                 edit.paragraph_id, edit.leaf_index
             ));
         }
-        let (start, end) = find_old(template_part, leaf.text_start, leaf.text_end, &edit.old)?;
-        let replacement = xml_escape(&edit.new).into_bytes();
-        spans.push((start, end, replacement));
-        if needs_xml_space(&edit.new) {
-            if let Some(tag_span) = inject_xml_space(template_part, leaf.open_end) {
-                spans.push(tag_span);
+        // The new text takes the first covered run's place; every later covered
+        // run is emptied. One run covered is the ordinary case, and produces the
+        // single span this always produced.
+        let new_bytes = xml_escape(&edit.new).into_bytes();
+        let mut covered = edit_run_ranges(template_part, &edit.part, edit)?;
+        covered.sort_by_key(|(start, _)| *start);
+        for (position, (start, end)) in covered.into_iter().enumerate() {
+            if position == 0 {
+                spans.push((start, end, new_bytes.clone()));
+                if needs_xml_space(&edit.new) {
+                    if let Some(tag_span) = inject_xml_space(template_part, leaf.open_end) {
+                        spans.push(tag_span);
+                    }
+                }
+            } else {
+                spans.push((start, end, Vec::new()));
             }
         }
     }
@@ -905,14 +941,19 @@ fn check_opaque_replay(
     // Shifts contributed by edits at or before a byte position.
     let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
     for edit in edits {
-        let (leaf, _) = locate_leaf(
-            template_part,
-            &edit.part,
-            &edit.paragraph_id,
-            edit.leaf_index,
-        )?;
-        let (start, end) = find_old(template_part, leaf.text_start, leaf.text_end, &edit.old)?;
-        spans.push((start, end, xml_escape(&edit.new).into_bytes()));
+        // The shift walk needs the same runs the applier touched, or the
+        // recorded shift is computed against a different edit.
+        let new_bytes = xml_escape(&edit.new).into_bytes();
+        for (position, (start, end)) in edit_run_ranges(template_part, &edit.part, edit)?
+            .into_iter()
+            .enumerate()
+        {
+            if position == 0 {
+                spans.push((start, end, new_bytes.clone()));
+            } else {
+                spans.push((start, end, Vec::new()));
+            }
+        }
     }
     spans.sort_by_key(|(start, _, _)| *start);
     replay_opaque_blocks(template_part, output_part, part_key, &spans)
@@ -978,14 +1019,16 @@ struct LocatedLeaf {
     open_end: usize,
 }
 
-/// Locate a paragraph's leaf in one part's bytes (independent port of the
+/// Locate EVERY leaf of one paragraph, in order (independent port of the
 /// locator discipline: paragraph ids, box/sdt/cell paths, leaf ordinals).
-fn locate_leaf(
+///
+/// `locate_leaf` picks one by ordinal; an edit that crosses runs needs the whole
+/// list, because which runs it covers is exactly what has to be resolved.
+fn locate_paragraph_leaves(
     part: &[u8],
     part_key: &str,
     paragraph_id: &str,
-    leaf_index: usize,
-) -> Result<(LocatedLeaf, ()), String> {
+) -> Result<Vec<LocatedLeaf>, String> {
     let paragraphs = locate_paragraphs(part, part_key)?;
     let Some((start, end)) = paragraphs
         .iter()
@@ -1001,7 +1044,7 @@ fn locate_leaf(
     let _in_run = false;
     let mut rpr_ok = true;
     let _leaves: Vec<LocatedLeaf> = Vec::new();
-    let mut found: Option<LocatedLeaf> = None;
+    let mut leaves: Vec<LocatedLeaf> = Vec::new();
     let _index = 0usize;
     let opaque_children = false;
     // Reuse the tree walk: build a light element list for the paragraph.
@@ -1013,7 +1056,6 @@ fn locate_leaf(
     let mut opaque_ranges: Vec<(usize, usize)> = Vec::new();
     collect_opaque_ranges(root, &nodes, &mut opaque_ranges, &mut rpr_ok);
     // walk runs
-    let mut leaf_cursor = 0usize;
     for node in nodes.iter() {
         if node.name != "r" {
             continue;
@@ -1038,19 +1080,28 @@ fn locate_leaf(
                     && !opaque_ranges.iter().any(|(start, end)| {
                         child_node.open_start >= *start && child_node.end <= *end
                     });
-                if leaf_cursor == leaf_index {
-                    found = Some(LocatedLeaf {
-                        editable,
-                        text_start: start + text_start,
-                        text_end: start + text_end,
-                        open_end: start + child_node.open_end,
-                    });
-                }
-                leaf_cursor += 1;
+                leaves.push(LocatedLeaf {
+                    editable,
+                    text_start: start + text_start,
+                    text_end: start + text_end,
+                    open_end: start + child_node.open_end,
+                });
             }
         }
     }
-    found
+    Ok(leaves)
+}
+
+/// Locate one paragraph's leaf by ordinal.
+fn locate_leaf(
+    part: &[u8],
+    part_key: &str,
+    paragraph_id: &str,
+    leaf_index: usize,
+) -> Result<(LocatedLeaf, ()), String> {
+    locate_paragraph_leaves(part, part_key, paragraph_id)?
+        .into_iter()
+        .nth(leaf_index)
         .map(|leaf| (leaf, ()))
         .ok_or_else(|| format!("leaf {leaf_index} not found in {paragraph_id}"))
 }
@@ -1628,30 +1679,87 @@ fn inject_xml_space(part: &[u8], open_end: usize) -> Option<(usize, usize, Vec<u
     Some((tag_start, open_end, out))
 }
 
-/// Entity-aware old-text search inside a leaf's byte range.
-fn find_old(
+/// The byte range of every run one recorded edit covers, in order.
+///
+/// `old` may start in one run and end in another: a Word paragraph splits its
+/// text at every formatting change, so a phrase a human typed in Word routinely
+/// crosses runs, and the recorded `leaf_index` is the run it starts in. The
+/// covered texts concatenated equal `old`.
+///
+/// This is the verifier's own walk — it must reach the same runs Core's applier
+/// did, or the byte-exact check compares against a different edit than the one
+/// that was applied.
+fn edit_run_ranges(
     part: &[u8],
-    text_start: usize,
-    text_end: usize,
-    old: &str,
-) -> Result<(usize, usize), String> {
-    if old.is_empty() {
+    part_key: &str,
+    edit: &IslandEdit,
+) -> Result<Vec<(usize, usize)>, String> {
+    if edit.old.is_empty() {
         return Err("empty old text".to_string());
     }
-    let (decoded, char_bytes) = decode_text(&part[text_start..text_end])?;
-    // `match_indices` yields BYTE indices; translate to decoded char index
-    // (CJK text is multi-byte).
-    let mut matches = decoded.match_indices(old);
-    let Some((byte_index, _)) = matches.next() else {
-        return Err(format!("old text {:?} not found in leaf", old));
-    };
-    if matches.next().is_some() {
-        return Err("old text occurs more than once in the leaf".to_string());
+    let leaves = locate_paragraph_leaves(part, part_key, &edit.paragraph_id)?;
+    if edit.leaf_index >= leaves.len() {
+        return Err(format!(
+            "leaf {} not found in {}",
+            edit.leaf_index, edit.paragraph_id
+        ));
     }
-    let char_index = decoded[..byte_index].chars().count();
-    let byte_start = char_bytes[char_index].0 + text_start;
-    let byte_end = char_bytes[char_index + old.chars().count() - 1].1 + text_start;
-    Ok((byte_start, byte_end))
+    let mut found: Option<Vec<(usize, usize)>> = None;
+    for start in edit.leaf_index..leaves.len() {
+        let first = &leaves[start];
+        let (_, first_chars) = decode_text(&part[first.text_start..first.text_end])?;
+        let first_len = first_chars.len();
+        let mut accumulated = String::new();
+        let mut before_last = 0usize;
+        for end in start..leaves.len() {
+            if end > start {
+                let previous = &leaves[end - 1];
+                let (text, _) = decode_text(&part[previous.text_start..previous.text_end])?;
+                before_last += text.chars().count();
+            }
+            let (text, _) = decode_text(&part[leaves[end].text_start..leaves[end].text_end])?;
+            accumulated.push_str(&text);
+            let Some(byte_pos) = accumulated.find(&edit.old) else {
+                continue;
+            };
+            let head = accumulated[..byte_pos].chars().count();
+            let covered = edit.old.chars().count();
+            // The match must start inside the FIRST run and finish inside the
+            // LAST one; anything else belongs to a later start.
+            if head >= first_len || head + covered <= before_last {
+                break;
+            }
+            if found.is_some() {
+                return Err(
+                    "old text occurs more than once across the runs of this paragraph".to_string(),
+                );
+            }
+            let tail = head + covered - before_last;
+            let mut ranges = Vec::new();
+            for (offset, leaf) in leaves[start..=end].iter().enumerate() {
+                let is_first = offset == 0;
+                let is_last = offset == end - start;
+                let (text, char_bytes) = decode_text(&part[leaf.text_start..leaf.text_end])?;
+                let len = text.chars().count();
+                let from = if is_first { head } else { 0 };
+                let to = if is_last { tail } else { len };
+                if to <= from {
+                    continue;
+                }
+                let byte_start = char_bytes[from].0 + leaf.text_start;
+                let byte_end = char_bytes[to - 1].1 + leaf.text_start;
+                ranges.push((byte_start, byte_end));
+            }
+            found = Some(ranges);
+            break;
+        }
+    }
+    found.ok_or_else(|| {
+        format!(
+            "old text {:?} not found in paragraph {}",
+            edit.old, edit.paragraph_id
+        )
+    })
 }
 
 fn decode_text(raw: &[u8]) -> Result<(String, Vec<(usize, usize)>), String> {
