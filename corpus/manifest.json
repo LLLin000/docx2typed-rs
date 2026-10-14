@@ -1,7 +1,7 @@
 {
   "schema": "docx2typed-fixture-manifest-2",
   "version": 2,
-  "generated": "2026-08-17",
+  "generated": "2026-08-13",
   "tiers": {
     "public": "deterministic synthetic fixtures, committed, redistributable, public-CI blocking",
     "private": "authorized/minimized documents on controlled runners; never in public artifacts",
@@ -1232,112 +1232,6 @@
       },
       "mutation_lineage": [
         "baseline: deterministic synthetic generation by scripts/release_fixtures.py"
-      ]
-    },
-    {
-      "anonymous_id": "fx-patent-shaped",
-      "tier": "public",
-      "path": "release/patent-shaped.docx",
-      "sha256": "44f29d55376a2936609a493105e718e30ae69e44d6d025756ab6a9a40cb06170",
-      "size_bytes": 829093,
-      "provenance": {
-        "kind": "derived-real-world-shaped",
-        "base": "release/plain.docx",
-        "derivation": "Rust tracer chain (extract -> edit text x6 -> build -> independent verify) on the committed corpus base; derivation commands and per-op evidence recorded in qualification/evidence/rust_tracer62_evidence.json",
-        "license": "CC0-1.0",
-        "consent": "n/a synthetic",
-        "origin_url": null
-      },
-      "toolchain": {
-        "generator": "target/release/docx2typed.exe (docx2typed-rust)",
-        "toolchain": "Rust tracer: extract -> island-local prose edits -> build -> independent verify",
-        "zip": "replays untouched package parts byte-identically from the base fixture",
-        "reproducibility": "deterministic given the committed base fixture and the recorded edit operations"
-      },
-      "dialect": {
-        "features": [
-          "iso-classic",
-          "patent-shaped"
-        ],
-        "notes": "Chinese patent-shaped prose: abstract, claims 1-2, embodiment, comparison, disclaimer"
-      },
-      "expected_signatures": {
-        "package_sha256": "44f29d55376a2936609a493105e718e30ae69e44d6d025756ab6a9a40cb06170",
-        "typed_model_sha256_prefix": null
-      },
-      "eligible_cells": [
-        "cli.extract",
-        "cli.inspect",
-        "cli.migrate",
-        "cli.build",
-        "cli.validate",
-        "cli.verify",
-        "cli.edit",
-        "cli.revisions",
-        "cli.comment",
-        "mcp.*"
-      ],
-      "privacy": {
-        "class": "public-synthetic",
-        "owner": "LLLin000",
-        "retention": "release-eol-plus-2y"
-      },
-      "mutation_lineage": [
-        "base: committed synthetic fixture release/plain.docx (deterministic generation by scripts/release_fixtures.py)",
-        "issue-62: 6 island-local prose edits + build + independent verify via the Rust tracer produce the real-world-shaped document"
-      ]
-    },
-    {
-      "anonymous_id": "fx-paper-shaped",
-      "tier": "public",
-      "path": "release/paper-shaped.docx",
-      "sha256": "a871e3cfb5c3227b6231886fe8b2431a1bb033f69c97aa3eafaf2842e52a3241",
-      "size_bytes": 831100,
-      "provenance": {
-        "kind": "derived-real-world-shaped",
-        "base": "release/comments.docx",
-        "derivation": "Rust tracer chain (extract -> edit text x6 -> build -> independent verify) on the committed corpus base; derivation commands and per-op evidence recorded in qualification/evidence/rust_tracer62_evidence.json",
-        "license": "CC0-1.0",
-        "consent": "n/a synthetic",
-        "origin_url": null
-      },
-      "toolchain": {
-        "generator": "target/release/docx2typed.exe (docx2typed-rust)",
-        "toolchain": "Rust tracer: extract -> island-local prose edits -> build -> independent verify",
-        "zip": "replays untouched package parts byte-identically from the base fixture",
-        "reproducibility": "deterministic given the committed base fixture and the recorded edit operations"
-      },
-      "dialect": {
-        "features": [
-          "iso-classic",
-          "paper-shaped"
-        ],
-        "notes": "paper-shaped prose with reviewer/editor comments: abstract, methods, results, three comments"
-      },
-      "expected_signatures": {
-        "package_sha256": "a871e3cfb5c3227b6231886fe8b2431a1bb033f69c97aa3eafaf2842e52a3241",
-        "typed_model_sha256_prefix": null
-      },
-      "eligible_cells": [
-        "cli.extract",
-        "cli.inspect",
-        "cli.migrate",
-        "cli.build",
-        "cli.validate",
-        "cli.verify",
-        "cli.edit",
-        "cli.revisions",
-        "cli.comment",
-        "mcp.*"
-      ],
-      "privacy": {
-        "class": "public-synthetic",
-        "owner": "LLLin000",
-        "retention": "release-eol-plus-2y"
-      },
-      "mutation_lineage": [
-        "base: committed synthetic fixture release/comments.docx (deterministic generation by scripts/release_fixtures.py)",
-        "issue-62: 6 island-local prose edits + build + independent verify via the Rust tracer produce the real-world-shaped document"
       ]
     }
   ],
