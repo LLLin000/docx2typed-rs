@@ -141,9 +141,9 @@ impl McpSession {
         match self.workdir.as_deref() {
             Some(workdir) => Ok(workdir),
             None => Err(self.failure(
+                "workdir_open",
                 "workdir-not-open",
-                "no workdir open; call workdir_open first",
-                "",
+                "no workdir open; call document_open first",
                 "",
             )),
         }
@@ -176,10 +176,16 @@ impl McpSession {
         message: &str,
         build_commit: &str,
     ) -> Value {
+        // Every refusal carries the recovery payload: the action to take and the
+        // agent-surface tools that carry it out. The Python reference has this
+        // table and the rewrite carried the field with nothing producing it, so
+        // an agent got a code and no way forward -- measured, a session spent
+        // calls discovering that `workdir_open` comes first.
+        let recovery = docx2typed_protocol::filtered_recovery_for(operation, code, None);
         self.tool_result(
             operation,
             "failure",
-            Value::Object(Default::default()),
+            json!({ "recovery": recovery }),
             vec![Diagnostic::new(code, message.to_string())],
             true,
             build_commit,
