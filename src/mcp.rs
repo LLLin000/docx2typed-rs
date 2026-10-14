@@ -58,8 +58,28 @@ fn frozen_mcp_schemas() -> &'static serde_json::Map<String, Value> {
     &SCHEMAS
 }
 
+/// The embedded description table: one sentence-set per tool name.
+///
+/// Loaded once, like the schemas. A name with no entry yields an empty string,
+/// and the surface test refuses that — a tool an agent cannot understand is a
+/// tool it will call wrongly.
+fn frozen_tool_descriptions() -> &'static serde_json::Map<String, Value> {
+    static DESCRIPTIONS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
+        let value: Value = serde_json::from_str(docx2typed_app::embedded::TOOL_DESCRIPTIONS_JSON)
+            .expect("embedded tool_descriptions.json must be valid JSON");
+        value
+            .as_object()
+            .cloned()
+            .expect("embedded tool_descriptions.json must be an object")
+    });
+    &DESCRIPTIONS
+}
+
 /// Return the exact frozen input JSON Schema for a tool.
 pub fn tool_schema(name: &str) -> Value {
+    if let Some(schema) = crate::surface::schema(name) {
+        return schema;
+    }
     frozen_mcp_schemas()
         .get(name)
         .cloned()
@@ -68,11 +88,22 @@ pub fn tool_schema(name: &str) -> Value {
 
 /// `tools/list` payload: every frozen tool with its inputSchema.
 fn tools_list_payload() -> Value {
-    let tools: Vec<Value> = TOOL_NAMES
+    // The five, not the fifty-three: see src/surface/mod.rs for why the count is
+    // the defect and docs/specs/08_agent_surface.md for the evidence. The other
+    // forty-eight stay callable by name for the CLI and the suites.
+    let tools: Vec<Value> = crate::surface::AGENT_TOOLS
         .iter()
         .map(|name| {
+            // The description is not decoration: an agent that has only names to
+            // go on guesses, and 89.1% of tool-interface failures are exactly
+            // that -- tool misselection (ToolRobustBench, arXiv 2608.23635).
+            let description = frozen_tool_descriptions()
+                .get(*name)
+                .and_then(Value::as_str)
+                .unwrap_or("");
             json!({
                 "name": name,
+                "description": description,
                 "inputSchema": tool_schema(name),
             })
         })
@@ -84,7 +115,7 @@ fn tools_list_payload() -> Value {
 // Session
 // ---------------------------------------------------------------------------
 
-struct McpSession {
+pub(crate) struct McpSession {
     engine: Engine,
     workdir: Option<String>,
     author: Option<String>,
@@ -138,7 +169,7 @@ impl McpSession {
     }
 
     /// A failure envelope with one frozen diagnostic.
-    fn failure(&self, operation: &str, code: &str, message: &str, build_commit: &str) -> Value {
+    pub(crate) fn failure(&self, operation: &str, code: &str, message: &str, build_commit: &str) -> Value {
         self.tool_result(
             operation,
             "failure",
@@ -150,7 +181,7 @@ impl McpSession {
     }
 
     /// A success envelope carrying `data`.
-    fn success(&self, operation: &str, data: Value, build_commit: &str) -> Value {
+    pub(crate) fn success(&self, operation: &str, data: Value, build_commit: &str) -> Value {
         self.tool_result(operation, "success", data, vec![], false, build_commit)
     }
 
@@ -436,7 +467,7 @@ impl McpSession {
         self.success("workdir_open", json!({ "session": session }), build_commit)
     }
 
-    fn workdir_status(&self, build_commit: &str) -> Value {
+    pub(crate) fn workdir_status(&self, build_commit: &str) -> Value {
         let workdir = match self.require_workdir() {
             Ok(workdir) => workdir.to_string(),
             Err(failure) => return failure,
@@ -1059,7 +1090,7 @@ impl McpSession {
         )
     }
 
-    fn review_state(&self, build_commit: &str) -> Value {
+    pub(crate) fn review_state(&self, build_commit: &str) -> Value {
         let workdir = match self.require_workdir() {
             Ok(workdir) => workdir.to_string(),
             Err(failure) => return failure,
@@ -1468,7 +1499,7 @@ impl McpSession {
     /// `history_list`: the version timeline from HEAD backwards, newest
     /// first. Read-only. Python's wrapper reports the draft freshness beside
     /// the store's `version_dirty`, so both ride in the same payload.
-    fn history_list(&self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn history_list(&self, args: &Value, build_commit: &str) -> Value {
         let Some(workdir) = self.workdir.as_deref() else {
             return self.failure(
                 "history_list",
@@ -2398,6 +2429,14 @@ fn reject_unknown_arguments(tool: &str, args: &Value) -> Result<(), (String, Str
     Err(("invalid-arguments".to_string(), message))
 }
 
+/// Is this a name the server will dispatch?
+///
+/// The agent surface plus every tool the engine serves: the five are what an
+/// agent may call, the rest are what the CLI and the suites call by name.
+fn is_known_tool(name: &str) -> bool {
+    crate::surface::is_agent_tool(name) || TOOL_NAMES.contains(&name)
+}
+
 fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commit: &str) -> Value {
     let args = if args.is_null() {
         Value::Object(Default::default())
@@ -2406,6 +2445,9 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
     };
     if let Err((code, message)) = reject_unknown_arguments(tool, &args) {
         return session.failure(tool, &code, &message, build_commit);
+    }
+    if crate::surface::is_agent_tool(tool) {
+        return crate::surface::dispatch(session, tool, &args, build_commit);
     }
     let reply = match tool {
         "tools/list" => {
@@ -2879,7 +2921,7 @@ pub fn run(build_commit: &str) -> i32 {
                             "structuredContent": result,
                             "isError": false,
                         }})
-                    } else if TOOL_NAMES.iter().any(|known| *known == name) {
+                    } else if is_known_tool(&name) {
                         let result = dispatch_tool(&mut session, &name, &arguments, build_commit);
                         json!({"jsonrpc": "2.0", "id": id, "result": result})
                     } else {
@@ -2909,7 +2951,7 @@ pub fn run(build_commit: &str) -> i32 {
             .unwrap_or("")
             .to_string();
         let args = request.get("args").cloned().unwrap_or(Value::Null);
-        let reply = if TOOL_NAMES.contains(&tool.as_str()) || tool == "tools/list" {
+        let reply = if is_known_tool(&tool) || tool == "tools/list" {
             let result = dispatch_tool(&mut session, &tool, &args, build_commit);
             let mut json = serde_json::to_string(&result).expect("serializes");
             json.insert_str(0, "OK ");

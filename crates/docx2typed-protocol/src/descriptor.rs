@@ -98,6 +98,27 @@ pub const PROTOCOL_COMMANDS: [&str; 13] = [
 /// (a bare `["engine_info", "workdir_open"]`) while the server served fifty-
 /// three tools, which is the difference between "how do I use this" and
 /// "this cannot do my task".
+/// The five tools an agent sees.
+///
+/// The engine serves every name in [`PROTOCOL_TOOLS`]; this is the subset it
+/// ADVERTISES. The distinction is deliberate and it is the fix for a measured
+/// defect: fifty-three exposed tools reach 32.1% task success (ToolMenuBench),
+/// a four-tool interface is the measured optimum (+16.4% completion, argument
+/// accuracy 0.20 -> 0.40, MCP-GRANITE), and 89.1% of tool-interface failures
+/// are tool misselection (ToolRobustBench).
+///
+/// One question, one answer: `tools/list`, the descriptor's `tools`, and a
+/// session's `supported_tools` all report THIS list, because all three are
+/// asked "what may the agent call". Reporting a different number in each is
+/// how an agent concludes it cannot do its task.
+pub const AGENT_TOOLS: [&str; 5] = [
+    "document_open",
+    "document_find",
+    "document_edit",
+    "document_save",
+    "document_status",
+];
+
 pub const PROTOCOL_TOOLS: [&str; 53] = [
     "engine_info",
     "workdir_open",
@@ -211,7 +232,7 @@ pub fn engine_descriptor(build_commit: &str) -> EngineDescriptor {
             "finite": PROTOCOL_COMMANDS,
             "launchers": ["mcp"],
         }),
-        tools: PROTOCOL_TOOLS.to_vec(),
+        tools: AGENT_TOOLS.to_vec(),
         features: FEATURES.to_vec(),
         required_features: REQUIRED_FEATURES.to_vec(),
     }
