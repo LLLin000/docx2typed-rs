@@ -5,20 +5,20 @@
 //! negotiation + result/diagnostic/evidence shapes only). No DOCX AST, no
 //! store, no orchestration, no transport lives here.
 
-pub mod recovery;
 pub mod canonical;
 pub mod descriptor;
 pub mod dto;
 pub mod evidence;
 pub mod negotiate;
+pub mod recovery;
 
 pub use canonical::{
     bytes_sha256, canonical_json, canonical_operation_input, file_sha256, new_operation_id,
     resolve_path, semantic_sha256, typed_path_value, utc_now_iso,
 };
 pub use descriptor::{
-    engine_descriptor, EngineDescriptor, CONTRACT_RANGES, FEATURES, PACKAGE_VERSION,
-    AGENT_TOOLS, PROTOCOL_COMMANDS, PROTOCOL_TOOLS, REQUIRED_FEATURES,
+    engine_descriptor, EngineDescriptor, AGENT_TOOLS, CONTRACT_RANGES, FEATURES, PACKAGE_VERSION,
+    PROTOCOL_COMMANDS, PROTOCOL_TOOLS, REQUIRED_FEATURES,
 };
 pub use dto::{diagnostic_spec, diagnostic_spec_opt, Diagnostic, DiagnosticSpec, ResultEnvelope};
 pub use evidence::{base_evidence_payload, run_evidence, RunEvidence};

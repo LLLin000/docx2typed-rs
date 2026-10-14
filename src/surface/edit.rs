@@ -166,7 +166,10 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
         &json!({ "operation_id": format!("{operation_id}-sync") }),
         build_commit,
     );
-    let sync_envelope = synced.get("structuredContent").cloned().unwrap_or(Value::Null);
+    let sync_envelope = synced
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or(Value::Null);
     let sync_outcome = sync_envelope
         .get("outcome")
         .and_then(Value::as_str)
@@ -179,8 +182,7 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
         // second edit to the same paragraph: `edit.md` read
         // `前缀中文区块甲区块区域内容后缀` while `typed.md` still read
         // `前缀中文区块区域内容`, and the caller was told "success".
-        if sync_refused_because_unchanged(&sync_envelope)
-            && draft_differs_from_canonical(&workdir)
+        if sync_refused_because_unchanged(&sync_envelope) && draft_differs_from_canonical(&workdir)
         {
             return session.failure(
                 "document_edit",

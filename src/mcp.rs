@@ -169,7 +169,13 @@ impl McpSession {
     }
 
     /// A failure envelope with one frozen diagnostic.
-    pub(crate) fn failure(&self, operation: &str, code: &str, message: &str, build_commit: &str) -> Value {
+    pub(crate) fn failure(
+        &self,
+        operation: &str,
+        code: &str,
+        message: &str,
+        build_commit: &str,
+    ) -> Value {
         self.tool_result(
             operation,
             "failure",
@@ -1367,7 +1373,7 @@ impl McpSession {
         )
     }
 
-    fn build_docx(&self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn build_docx(&self, args: &Value, build_commit: &str) -> Value {
         let operation_id = match self.require_operation_id("build_docx", args, build_commit) {
             Ok(id) => id,
             Err(failure) => return failure,
@@ -1505,7 +1511,7 @@ impl McpSession {
         }
     }
 
-    fn verify_output(&self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn verify_output(&self, args: &Value, build_commit: &str) -> Value {
         let workdir = match self.require_workdir() {
             Ok(workdir) => workdir.to_string(),
             Err(failure) => return failure,

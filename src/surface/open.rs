@@ -42,7 +42,11 @@ fn is_workdir(path: &Path) -> bool {
 }
 
 /// Extract `source` into a workdir beside it, then report where it went.
-fn extract_beside(session: &McpSession, source: &Path, build_commit: &str) -> Result<PathBuf, Value> {
+fn extract_beside(
+    session: &McpSession,
+    source: &Path,
+    build_commit: &str,
+) -> Result<PathBuf, Value> {
     let outdir = workdir_for(source);
     let outcome = session
         .engine()

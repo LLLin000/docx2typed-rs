@@ -29,7 +29,10 @@ impl Recovery {
     }
 
     pub fn next_actions(&self) -> Vec<String> {
-        self.tool_list().into_iter().map(|t| format!("call {}", t)).collect()
+        self.tool_list()
+            .into_iter()
+            .map(|t| format!("call {}", t))
+            .collect()
     }
 }
 
@@ -93,7 +96,11 @@ pub fn recovery_for(operation: &str, code: &str) -> Recovery {
         );
     }
     if code == "edit-mode-ambiguous" {
-        return rt("choose-edit-mode", "workdir_open", &["track=true", "track=false"]);
+        return rt(
+            "choose-edit-mode",
+            "workdir_open",
+            &["track=true", "track=false"],
+        );
     }
     if code == "generation-conflict"
         || code == "current-parent-mismatch"
@@ -104,10 +111,7 @@ pub fn recovery_for(operation: &str, code: &str) -> Recovery {
     if code == "edit-dirty" || code == "edit-stale" || code == "edit-conflict" {
         return r("reconcile-edit", &["diff_preview", "commit_sync", "revert"]);
     }
-    if code == "stale-document-view"
-        || code == "patch-context-mismatch"
-        || code == "patch-empty"
-    {
+    if code == "stale-document-view" || code == "patch-context-mismatch" || code == "patch-empty" {
         return r("re-read-document", &["document_read", "document_search"]);
     }
     if code == "patch-invalid"
@@ -124,7 +128,10 @@ pub fn recovery_for(operation: &str, code: &str) -> Recovery {
         return r("re-extract-from-trusted-source", &["workdir_open"]);
     }
     if code == "comment-text-requires-opt-in" {
-        return r("confirm-comment-edit-intent", &["document_read", "delete_comment"]);
+        return r(
+            "confirm-comment-edit-intent",
+            &["document_read", "delete_comment"],
+        );
     }
     if code == "format-style-unavailable" {
         return r("reuse-existing-variant", &["document_read", "format_span"]);
@@ -140,16 +147,28 @@ pub fn recovery_for(operation: &str, code: &str) -> Recovery {
         return r("apply-listed-fixes", &["document_patch"]);
     }
     if code == "ambiguous-alignment" {
-        return r("disambiguate-insert-anchor", &["get_paragraph", "batch_edit"]);
+        return r(
+            "disambiguate-insert-anchor",
+            &["get_paragraph", "batch_edit"],
+        );
     }
     if code == "edit-span-crosses-revision-boundary" {
-        return r("replan-within-revision-regions", &["document_read", "document_search"]);
+        return r(
+            "replan-within-revision-regions",
+            &["document_read", "document_search"],
+        );
     }
     if code == "edit-span-crosses-protected-marker" {
-        return r("replan-within-one-span", &["document_read", "document_search"]);
+        return r(
+            "replan-within-one-span",
+            &["document_read", "document_search"],
+        );
     }
     if code == "placeholder-in-edit-span" {
-        return r("choose-editable-span", &["document_read", "document_search"]);
+        return r(
+            "choose-editable-span",
+            &["document_read", "document_search"],
+        );
     }
     if code == "text-not-found" || code == "text-ambiguous" {
         return r("re-read-document", &["document_search", "document_read"]);
@@ -209,7 +228,10 @@ pub fn profile_recovery(entry: Recovery, active: Option<&[String]>) -> Recovery 
     if tools.is_empty() && entry.tool.is_none() {
         // still filter empty list; keep same
     }
-    let kept: Vec<String> = tools.into_iter().filter(|n| active.iter().any(|a| a == n)).collect();
+    let kept: Vec<String> = tools
+        .into_iter()
+        .filter(|n| active.iter().any(|a| a == n))
+        .collect();
     if kept == entry.tools.clone().unwrap_or_default() {
         return entry;
     }
@@ -237,7 +259,11 @@ mod tests {
     fn representative_failures() {
         let r = recovery_for("document_patch", "agent-preflight-required");
         assert_eq!(r.action, "resolve-review");
-        assert!(r.tools.as_ref().unwrap().contains(&"review_preflight".to_string()));
+        assert!(r
+            .tools
+            .as_ref()
+            .unwrap()
+            .contains(&"review_preflight".to_string()));
 
         let r = recovery_for("workdir_open", "workdir-not-open");
         assert_eq!(r.action, "open-workdir");
@@ -256,27 +282,51 @@ mod tests {
     fn unknown_code_gets_default() {
         let r = recovery_for("document_patch", "no-such-code");
         assert_eq!(r.action, "inspect-diagnostic");
-        assert_eq!(r.tools, Some(vec!["workdir_status".to_string(), "review_state".to_string()]));
+        assert_eq!(
+            r.tools,
+            Some(vec![
+                "workdir_status".to_string(),
+                "review_state".to_string()
+            ])
+        );
     }
 
     #[test]
     fn all_table_tool_names_are_protocol_tools() {
         let codes = [
-            "operation-id-reused", "workdir-not-open", "agent-preflight-required",
-            "edit-mode-ambiguous", "generation-conflict", "edit-dirty",
-            "stale-document-view", "patch-invalid", "source-modified-outside-engine",
-            "comment-text-requires-opt-in", "format-style-unavailable", "format-noop",
-            "text-inside-tracked-deletion", "patch-hunks-invalid", "ambiguous-alignment",
-            "edit-span-crosses-revision-boundary", "edit-span-crosses-protected-marker",
-            "placeholder-in-edit-span", "text-not-found", "cross-region-text",
-            "paragraph-not-found", "evidence-publish-failed", "writer-busy",
-            "output-docx-not-found", "bogus",
+            "operation-id-reused",
+            "workdir-not-open",
+            "agent-preflight-required",
+            "edit-mode-ambiguous",
+            "generation-conflict",
+            "edit-dirty",
+            "stale-document-view",
+            "patch-invalid",
+            "source-modified-outside-engine",
+            "comment-text-requires-opt-in",
+            "format-style-unavailable",
+            "format-noop",
+            "text-inside-tracked-deletion",
+            "patch-hunks-invalid",
+            "ambiguous-alignment",
+            "edit-span-crosses-revision-boundary",
+            "edit-span-crosses-protected-marker",
+            "placeholder-in-edit-span",
+            "text-not-found",
+            "cross-region-text",
+            "paragraph-not-found",
+            "evidence-publish-failed",
+            "writer-busy",
+            "output-docx-not-found",
+            "bogus",
         ];
         for code in codes {
             for tool in recovery_for("document_patch", code).tool_list() {
                 assert!(
                     PROTOCOL_TOOLS.contains(&tool.as_str()),
-                    "unknown tool {} for code {}", tool, code
+                    "unknown tool {} for code {}",
+                    tool,
+                    code
                 );
             }
         }

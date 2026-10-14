@@ -33,7 +33,7 @@ pub const UNICODE_VERTICAL_CATALOG_JSON: &str =
 /// Embedded frozen MCP input schemas. This is the sole runtime source for
 /// `tools/list`; the checked-in file is the frozen MCP contract artifact.
 pub const MCP_SCHEMAS_JSON: &str = include_str!("../assets/mcp_schemas.json");
- 
+
 /// Embedded flat tool-name -> description map. This is the sole runtime
 /// source for the MCP `description` field in `tools/list`.
 pub const TOOL_DESCRIPTIONS_JSON: &str = include_str!("../assets/tool_descriptions.json");

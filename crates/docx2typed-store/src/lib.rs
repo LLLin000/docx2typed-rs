@@ -133,8 +133,9 @@ impl WorkdirStore {
     ///   * a ChangeSet that fails partway through leaves the previous workdir
     ///     untouched, because nothing is published until the whole apply
     ///     succeeds.
-    /// Choose copy-over-empty for this reason: the empty-staging alternative
-    /// forces every caller to pass a COMPLETE set or risk wiping the workdir.
+    ///
+    /// Copy-over-empty is deliberate: the empty-staging alternative would force
+    /// every caller to pass a COMPLETE set or risk wiping the workdir.
     pub fn commit_workdir(
         &self,
         dir: &Path,
