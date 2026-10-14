@@ -229,6 +229,19 @@ pub fn arm_faults_from_env(spec: &str) {
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// An I/O error that names the path it failed on.
+///
+/// `io::Error` alone reports "No such file or directory" with nothing to say
+/// WHICH file. That turned an intermittent CI-only failure into an afternoon of
+/// guessing: the message identified neither the file nor the operation, and the
+/// path was known at every call site that produced it.
+fn at(path: &Path, error: io::Error) -> StoreError {
+    StoreError::Io(io::Error::new(
+        error.kind(),
+        format!("{}: {error}", path.display()),
+    ))
+}
+
 fn temp_path(parent: &Path, name: &str) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     parent.join(format!(".{name}.{}-{n}.tmp", std::process::id()))
@@ -834,7 +847,7 @@ fn generation_manifest(
         assets.push(json!({
             "path": rel,
             "bytes": fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
-            "sha256": file_sha256(&path)?,
+            "sha256": file_sha256(&path).map_err(|e| at(&path, e))?,
         }));
     }
     let assets_value = Value::Array(assets);
@@ -1249,12 +1262,12 @@ impl Store {
         }
         fs::create_dir_all(&store.root)?;
         let result = (|| -> Result<(), StoreError> {
-            fs::create_dir_all(&store.store_dir)?;
+            fs::create_dir_all(&store.store_dir).map_err(|e| at(&store.store_dir, e))?;
             probe_or_reuse(&store.store_dir)?;
             store.write_reserve()?;
             let generation = new_operation_id();
             let gen_dir = store.generations_dir.join(&generation);
-            fs::create_dir_all(&gen_dir)?;
+            fs::create_dir_all(&gen_dir).map_err(|e| at(&gen_dir, e))?;
             copy_root_assets(&store.root, &gen_dir)?;
             let manifest =
                 generation_manifest(&gen_dir, &generation, None, operation_id, input_sha256)?;
@@ -3231,7 +3244,7 @@ fn copy_root_assets(root: &Path, gen_dir: &Path) -> Result<(), StoreError> {
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(&file, &dst)?;
+        fs::copy(&file, &dst).map_err(|e| at(&file, e))?;
     }
     Ok(())
 }
