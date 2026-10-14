@@ -521,3 +521,95 @@ fn a_review_session_does_not_survive_a_baseline_replacement() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A reset to the SAME bytes is not detected, and this pins what still holds.
+///
+/// The session anchors to `_template.docx`, so it recognises a baseline whose
+/// CONTENT changed. A reset that restores the identical document is invisible to
+/// that anchor — and it is invisible to every other signal too, because the reset
+/// clears exactly the state that would have distinguished it: the store lane,
+/// the pointer, the edit sidecars. The template is the only thing left, and it is
+/// identical by construction.
+///
+/// So the boundary is real and needs a persisted epoch that extraction
+/// increments and a reset does not clear. What this test locks in is the part
+/// that must not regress in the meantime: the stale session makes the workdir
+/// REFUSE the next edit rather than mis-apply it.
+#[test]
+fn a_reset_to_the_same_bytes_is_refused_rather_than_mis_applied() {
+    let dir = scratch("same-hash");
+    let source = dir.join("source.docx");
+    std::fs::copy(fixture("styled"), &source).expect("copy fixture");
+    let workdir = dir.join("wd");
+    assert_eq!(extract(&source, &workdir)["outcome"], "success");
+
+    let mut session = vec![json!({
+        "name": "workdir_open",
+        "arguments": { "workdir": workdir.to_str().expect("utf8"), "track": true, "author": "A" },
+    })];
+    let patch = call(
+        "document_patch",
+        json!({
+            "operation_id": "op_same_patch",
+            "hunks": [{ "paragraph_id": "P4", "old": "智能响应材料与 ABC", "new": "智能响应材料与 A版" }],
+        }),
+        &session,
+    );
+    assert_eq!(patch["outcome"], "success", "the draft: {patch}");
+    session.push(json!({
+        "name": "document_patch",
+        "arguments": {
+            "operation_id": "op_same_patch",
+            "hunks": [{ "paragraph_id": "P4", "old": "智能响应材料与 ABC", "new": "智能响应材料与 A版" }],
+        },
+    }));
+    assert_eq!(
+        call(
+            "commit_sync",
+            json!({ "operation_id": "op_same_commit" }),
+            &session
+        )["outcome"],
+        "success"
+    );
+
+    // Reset to the SAME document: the source is untouched.
+    assert_eq!(
+        extract_with(&source, &workdir, true)["outcome"],
+        "success",
+        "the declared reset"
+    );
+
+    // A fresh connection edits the baseline that is back.
+    let after = vec![json!({
+        "name": "workdir_open",
+        "arguments": { "workdir": workdir.to_str().expect("utf8"), "track": true, "author": "A2" },
+    })];
+    let edit = call(
+        "document_patch",
+        json!({
+            "operation_id": "op_same_patch_2",
+            "hunks": [{ "paragraph_id": "P4", "old": "智能响应材料与 ABC", "new": "智能响应材料与 A2版" }],
+        }),
+        &after,
+    );
+    let codes: Vec<String> = edit["diagnostics"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| entry["code"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_ne!(
+        edit["outcome"], "success",
+        "KNOWN BOUNDARY: a same-bytes reset is not detected, so the edit must be \
+         refused rather than applied against a session that describes a state the \
+         workdir no longer has: {edit}"
+    );
+    assert!(
+        codes.iter().any(|code| code == "agent-preflight-required"),
+        "and it refuses for the session reason, not by accident: {codes:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

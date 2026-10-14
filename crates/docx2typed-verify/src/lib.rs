@@ -342,8 +342,20 @@ impl IndependentVerifier {
             } else {
                 Ok(template_part.clone())
             };
+            // The edits' byte spans, in the baseline's coordinates: they decide
+            // which opaque interiors are containers of an edit rather than
+            // locked bytes beside it.
+            let spans: Vec<(usize, usize)> = {
+                let mut collected = Vec::new();
+                for edit in &edits {
+                    if let Ok(ranges) = edit_run_ranges(&template_part, &part_key, edit) {
+                        collected.extend(ranges);
+                    }
+                }
+                collected
+            };
             let replay = baseline.and_then(|baseline| {
-                check_protected_structure(&baseline, &output_part, &part_key, &targeted)
+                check_protected_structure(&baseline, &output_part, &part_key, &targeted, &spans)
             });
             match replay {
                 Ok(()) => {}
@@ -365,7 +377,7 @@ impl IndependentVerifier {
                 Ok(template_part.clone())
             };
             let untouched = untouched.and_then(|baseline| {
-                check_non_target_preserved(&baseline, &output_part, &part_key, &targeted)
+                check_non_target_preserved(&baseline, &output_part, &part_key, &spans)
             });
             match untouched {
                 Ok(()) => {}
@@ -1053,15 +1065,14 @@ fn attribute(tag: &str, key: &str) -> Option<String> {
 struct ParagraphShape {
     text: String,
     run_properties: Vec<String>,
+    start: usize,
+    end: usize,
 }
 
 /// Every paragraph's shape, keyed by id.
-fn paragraph_shapes(
-    part: &[u8],
-    part_key: &str,
-) -> Result<std::collections::BTreeMap<String, ParagraphShape>, String> {
-    let mut shapes = std::collections::BTreeMap::new();
-    for (paragraph_id, start, end) in locate_paragraphs(part, part_key)? {
+fn paragraph_shapes(part: &[u8], part_key: &str) -> Result<Vec<ParagraphShape>, String> {
+    let mut shapes = Vec::new();
+    for (_paragraph_id, start, end) in locate_paragraphs(part, part_key)? {
         let paragraph = &part[start..end];
         let tags = scan_tags(paragraph);
         let tree = build_light_tree(&tags)?;
@@ -1072,13 +1083,12 @@ fn paragraph_shapes(
         let mut text = String::new();
         let mut run_properties = Vec::new();
         collect_shape(part, start, root, &tree, &mut text, &mut run_properties);
-        shapes.insert(
-            paragraph_id,
-            ParagraphShape {
-                text,
-                run_properties,
-            },
-        );
+        shapes.push(ParagraphShape {
+            text,
+            run_properties,
+            start,
+            end,
+        });
     }
     Ok(shapes)
 }
@@ -1128,30 +1138,45 @@ fn collect_shape(
 /// the insertion, so their property MULTISET changes while the document's
 /// meaning does not.
 fn check_non_target_preserved(
-    template_part: &[u8],
+    baseline: &[u8],
     output_part: &[u8],
     part_key: &str,
-    targeted: &[String],
+    spans: &[(usize, usize)],
 ) -> Result<(), String> {
-    let before = paragraph_shapes(template_part, part_key)?;
+    let before = paragraph_shapes(baseline, part_key)?;
     let after = paragraph_shapes(output_part, part_key)?;
-    let exempt = |id: &String| id.starts_with('N') || targeted.contains(id);
-    for (id, shape) in &before {
-        if exempt(id) {
+    // The baseline here is the part with every edit already applied, so the two
+    // sides walk the same paragraphs in the same order. Pairing by ORDER is
+    // deliberate: the ids this walker assigns are its own (`P1` for a text box
+    // the engine calls `B0.P0`), so an id-keyed comparison exempts the wrong
+    // paragraph and reports the edit itself as a change — measured on
+    // `boxes.docx`.
+    if before.len() != after.len() {
+        return Err(format!(
+            "paragraph count changed outside the edit ({} before, {} after)",
+            before.len(),
+            after.len()
+        ));
+    }
+    for (index, shape) in before.iter().enumerate() {
+        // An edit inside this paragraph — containment, which is what decides it,
+        // not the id.
+        if spans
+            .iter()
+            .any(|(start, end)| shape.start <= *start && *end <= shape.end)
+        {
             continue;
         }
-        let Some(actual) = after.get(id) else {
-            return Err(format!("{id} disappeared"));
-        };
+        let actual = &after[index];
         if actual.text != shape.text {
             return Err(format!(
-                "{id}: text outside the edit changed ({:?} -> {:?})",
+                "paragraph {index}: text outside the edit changed ({:?} -> {:?})",
                 shape.text, actual.text
             ));
         }
         if actual.run_properties != shape.run_properties {
             return Err(format!(
-                "{id}: run properties outside the edit changed ({} before, {} after)",
+                "paragraph {index}: run properties outside the edit changed ({} before, {} after)",
                 shape.run_properties.len(),
                 actual.run_properties.len()
             ));
@@ -1251,7 +1276,7 @@ fn recompute_edited_part(template_part: &[u8], edits: &[&IslandEdit]) -> Result<
 /// run into `w:del` + `w:ins`, so every byte after it moves by an amount that
 /// depends on the WRAPPING, and estimating that from `xml_escape(new)` is wrong
 /// by construction. Identity survives re-wrapping; position does not.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct ProtectedNode {
     paragraph_id: String,
     /// Element name for an anchor, `opaque` for a locked interior.
@@ -1259,7 +1284,27 @@ struct ProtectedNode {
     /// The attributes that make this node that node (`w:id`, `w:name`, the
     /// hyperlink's `r:id`), or the bytes' digest for an opaque interior.
     identity: String,
+    /// Byte range in the part it was read from. Used only to ask whether an
+    /// edit lies INSIDE this node — a containment test, not a shift estimate.
+    /// Deliberately NOT part of equality: the range moves when the edit re-wraps
+    /// the text around this node, and comparing it would report every node as
+    /// having changed. Measured: it made the check reject its own clean output.
+    start: usize,
+    end: usize,
 }
+
+/// Two protected nodes are the same node when they ARE the same node — same
+/// paragraph, same kind, same identifying attributes. Where they sit is not
+/// part of that.
+impl PartialEq for ProtectedNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.paragraph_id == other.paragraph_id
+            && self.kind == other.kind
+            && self.identity == other.identity
+    }
+}
+
+impl Eq for ProtectedNode {}
 
 /// Every protected node of one part, in document order.
 ///
@@ -1308,6 +1353,8 @@ fn collect_protected(
                             ..paragraph_start + child_node.open_end],
                         name,
                     ),
+                    start: paragraph_start + child_node.open_start,
+                    end: paragraph_start + child_node.end,
                 });
             }
             // A hyperlink is a range whose target is a relationship: the r:id
@@ -1321,6 +1368,8 @@ fn collect_protected(
                             ..paragraph_start + child_node.open_end],
                         name,
                     ),
+                    start: paragraph_start + child_node.open_start,
+                    end: paragraph_start + child_node.end,
                 });
                 collect_protected(part, paragraph_start, child, tree, paragraph_id, out)?;
             }
@@ -1367,6 +1416,8 @@ fn opaque_identity(
         paragraph_id: paragraph_id.to_string(),
         kind: "opaque".to_string(),
         identity: format!("{}:{}", node.name, bytes_sha256(bytes)),
+        start: paragraph_start + node.open_start,
+        end: paragraph_start + node.end,
     }
 }
 
@@ -1410,11 +1461,31 @@ fn check_protected_structure(
     output_part: &[u8],
     part_key: &str,
     targeted: &[String],
+    spans: &[(usize, usize)],
 ) -> Result<(), String> {
     let before = protected_nodes(template_part, part_key)?;
     let after = protected_nodes(output_part, part_key)?;
+    // An edit INSIDE an opaque interior rewrites that interior's bytes: a text
+    // box's paragraph (`B0.P0`) lives inside the `w:pict` run of the paragraph
+    // that owns it, so editing the box legitimately changes the drawing. The
+    // proof for such an edit is the leaf range, not byte identity of the
+    // container — this is a containment test, not the shift estimate the rest of
+    // this check exists to avoid.
+    let containers_of_edits: Vec<&ProtectedNode> = before
+        .iter()
+        .filter(|node| {
+            node.kind == "opaque"
+                && spans
+                    .iter()
+                    .any(|(start, end)| node.start <= *start && *end <= node.end)
+        })
+        .collect();
     let is_targeted = |node: &ProtectedNode| {
-        node.paragraph_id.starts_with('N') || targeted.contains(&node.paragraph_id)
+        node.paragraph_id.starts_with('N')
+            || targeted.contains(&node.paragraph_id)
+            || containers_of_edits
+                .iter()
+                .any(|container| container.paragraph_id == node.paragraph_id)
     };
 
     // Untouched paragraphs, compared ONE PARAGRAPH AT A TIME.
