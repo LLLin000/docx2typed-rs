@@ -166,38 +166,39 @@ def main():
     envelope = json.loads(proc.stdout)
     check("extract-revisions", proc.returncode == 0 and envelope["outcome"] == "success", envelope.get("diagnostics"))
 
-    # -- tool-surface parity ------------------------------------------------
+    # -- tool surface: two questions, two answers ---------------------------
+    # What an AGENT may call is the five-tool surface (docs/specs/08_agent_surface.md,
+    # divergence #5). What the ENGINE serves is the frozen 53-name contract. These
+    # used to be one list, which is why this gate asked both through `tools/list`;
+    # they are not one list any more, and asking the wrong question is how a gate
+    # reports a defect that is not there.
     schema_asset = json.load(open(os.path.join(ROOT, ".mcp_schemas.json"), encoding="utf-8"))
     asset_names = list(schema_asset.keys())
     python_names = python_tool_names()
     envelopes, raw, _ = mcp_session(bin_path, [("tools/list", {})])
     published = envelopes[0]["data"]["tools"]
     published_names = [tool["name"] for tool in published]
-    # The expected surface comes from the FROZEN CONTRACT, never a literal. A
-    # hardcoded 36 made this gate red on main for every tool added since (#46),
-    # and a gate that is red by construction stops being read.
+
+    # Question 1: what an agent sees.
+    agent_surface = [
+        "document_open",
+        "document_find",
+        "document_edit",
+        "document_save",
+        "document_status",
+    ]
     check(
-        "tool-surface-frozen",
-        sorted(published_names) == sorted(asset_names),
-        f"live={len(published_names)} frozen={len(asset_names)}",
-    )
-    # Rust must COVER the Python reference, never merely equal it. The in-repo
-    # scripts/ copy is a stale snapshot (36 tools against the external
-    # reference's 49), so equality was unsatisfiable by design: Rust passed it
-    # long ago and the check could only ever report the copy's staleness.
-    missing = sorted(set(python_names) - set(published_names))
-    check(
-        "tool-coverage-of-python",
-        not missing,
-        f"rust={len(published_names)} python_snapshot={len(python_names)} missing={missing}",
+        "agent-surface-advertised",
+        published_names == agent_surface,
+        f"live={published_names}",
     )
     check(
-        "tool-parity-asset",
-        sorted(published_names) == sorted(asset_names),
-        f"{len(asset_names)} schemas in .mcp_schemas.json",
+        "agent-surface-described",
+        all((tool.get("description") or "").strip() for tool in published),
+        "every advertised tool explains itself; an agent with only names guesses",
     )
     check(
-        "tool-schemas-frozen",
+        "agent-surface-schemas",
         all(
             tool["inputSchema"].get("type") == "object"
             and tool["inputSchema"].get("additionalProperties") is False
@@ -206,6 +207,33 @@ def main():
         ),
         "inputSchema object/additionalProperties=false/properties",
     )
+
+    # Question 2: what the engine serves. Read from the frozen contract, which is
+    # the artifact that defines it -- not from the agent's view of it.
+    check(
+        "engine-surface-frozen",
+        len(asset_names) == 53,
+        f"{len(asset_names)} schemas in .mcp_schemas.json",
+    )
+    # Rust must COVER the Python reference, never merely equal it. The in-repo
+    # scripts/ copy is a stale snapshot (36 tools against the external
+    # reference's 49), so equality was unsatisfiable by design.
+    missing = sorted(set(python_names) - set(asset_names))
+    check(
+        "engine-coverage-of-python",
+        not missing,
+        f"asset={len(asset_names)} python_snapshot={len(python_names)} missing={missing}",
+    )
+    check(
+        "engine-schemas-frozen",
+        all(
+            schema.get("type") == "object"
+            and schema.get("additionalProperties") is False
+            and isinstance(schema.get("properties"), dict)
+            for schema in schema_asset.values()
+        ),
+        "every frozen inputSchema is object/additionalProperties=false/properties",
+    )
     spot = {
         "workdir_open": ["workdir"],
         "replace_text": ["paragraph_id", "old", "new", "operation_id"],
@@ -213,8 +241,7 @@ def main():
         "verify_output": ["output"],
     }
     for name, required in spot.items():
-        tool = next(t for t in published if t["name"] == name)
-        got = tool["inputSchema"].get("required", [])
+        got = schema_asset[name].get("required", [])
         check(f"schema-required-{name}", got == required, got)
 
     # -- MCP stdio / one-workdir / draft lifecycle --------------------------
@@ -229,17 +256,46 @@ def main():
         ("replace_text", {"paragraph_id": "P0", "old": "本发明", "new": "我们发明", "operation_id": "gate-replace-1"}),
         ("replace_text", {"paragraph_id": "P0", "old": "本发明", "new": "改", "operation_id": "gate-replace-1"}),
         ("no_such_tool", {}),
+        # A DIFFERENT workdir on the same connection: the half of "one workdir"
+        # that is not relaxed (divergence #4).
+        ("workdir_open", {"workdir": workdir + "-other"}),
     ]
     envelopes, raw, mcp_proc = mcp_session(bin_path, requests)
     check("stdio-purity", all(line.startswith("OK ") or line.startswith("ERR ") for line in raw), f"{len(raw)} lines")
-    check("one-workdir", envelopes[1]["outcome"] == "failure" and envelopes[1]["diagnostics"][0]["code"] == "workdir-already-open", envelopes[1].get("diagnostics"))
+    # Re-opening the SAME workdir succeeds: it is a retry, and a retry after a
+    # dropped connection is the ordinary case. The reference refuses it, and
+    # that refusal is recorded as divergence #4 in
+    # docs/specs/06_reference_divergences.md -- the reference's stated rule is
+    # "one connection drives one workdir", which re-opening the one it already
+    # drives does not violate. A real session read the refusal as a transient
+    # block and moved directories around on disk to get past it.
+    check(
+        "reopen-same-workdir",
+        envelopes[1]["outcome"] == "success"
+        and isinstance(envelopes[1]["data"]["session"], dict),
+        envelopes[1].get("diagnostics"),
+    )
+    # What the rule actually protects, and what is NOT relaxed.
+    check(
+        "one-workdir",
+        envelopes[-1]["outcome"] == "failure"
+        and envelopes[-1]["diagnostics"][0]["code"] == "workdir-already-open",
+        envelopes[-1].get("diagnostics"),
+    )
     diff = envelopes[4]["data"]
     check("diff-changed-set", diff["state"] == "dirty" and diff["changed_paragraph_ids"] == ["P0"], diff)
     commit = envelopes[5]["data"]
     check("commit-changed-set", commit["changed_paragraph_ids"] == ["P0"] and commit["current_snapshot"]["id"] == "C1" and commit["state"] == "clean", commit)
     check("replay-byte-exact-mcp", envelopes[6] == envelopes[3], "same op id + args -> original envelope")
     check("op-id-reused-mcp", envelopes[7]["outcome"] == "failure" and envelopes[7]["diagnostics"][0]["code"] == "operation-id-reused", envelopes[7].get("diagnostics"))
-    check("unknown-tool-err", raw[-1].startswith("ERR unknown tool"), raw[-1])
+    # Asked of the whole stream, not of the last line: the last line is whatever
+    # request happened to be appended last, which is not a property worth
+    # pinning. The property is that an unknown tool is refused at all.
+    check(
+        "unknown-tool-err",
+        any(line.startswith("ERR unknown tool") for line in raw),
+        [line for line in raw if line.startswith("ERR")],
+    )
 
     # -- HTTP adversarial ----------------------------------------------------
     port = free_port()

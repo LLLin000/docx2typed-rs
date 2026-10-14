@@ -238,7 +238,14 @@ jobs:
           done
           # The engine's own tools stay callable even though they are not
           # advertised: the CLI and the suites call them by name.
-          echo "$OUT" | grep -q 'ERR unknown tool' && { echo "a legacy tool name stopped dispatching"; exit 1; }
+          # `if`, not `grep -q && {...}`: under `bash -e` a bare `&&` compound
+          # returns the grep's status, so the GOOD case (no unknown tool) aborts
+          # the step. That is how this check failed the packaging job on the
+          # first attempt.
+          if echo "$OUT" | grep -q 'ERR unknown tool'; then
+            echo "a legacy tool name stopped dispatching"
+            exit 1
+          fi
       - name: Package release bundle
         shell: pwsh
         run: ./scripts/package_release.ps1 -Bin target/release/${{ matrix.bin }} -OutDir dist/release -Target ${{ matrix.target }} -Channel stable -Coverage ci-only
