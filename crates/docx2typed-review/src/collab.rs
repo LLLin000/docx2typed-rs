@@ -165,9 +165,10 @@ fn baseline_sha256(workdir: &Path) -> Option<String> {
 }
 
 /// A session reopened on a document that replaced the one it knew.
-fn rebase_session(typed_sha256: String, baseline_sha256: &str) -> Value {
+fn rebase_session(typed_sha256: String, baseline_sha256: &str, epoch: Option<u64>) -> Value {
     let mut fresh = new_session(typed_sha256);
     fresh["baseline_sha256"] = json!(baseline_sha256);
+    fresh["baseline_epoch"] = json!(epoch);
     fresh
 }
 
@@ -246,6 +247,34 @@ pub fn ensure_session(workdir: &Path) -> Result<Value, CollaborationError> {
         Some(state) => {
             let state = validate_session(&state)?;
             let current_baseline = baseline_sha256(workdir);
+            // The epoch catches what the hash cannot: a reset that restores the
+            // IDENTICAL document leaves the template byte-identical and clears
+            // every other file that would have distinguished it, so the session
+            // would be reused against a lifecycle it no longer belongs to.
+            let current_epoch = docx2typed_core::read_baseline_epoch(workdir);
+            let epoch_changed = match (state.get("baseline_epoch"), &current_epoch) {
+                (Some(Value::Number(recorded)), Some(now)) => {
+                    recorded.as_u64().unwrap_or(0) != *now
+                }
+                _ => false,
+            };
+            if epoch_changed {
+                let current = current_baseline.clone().unwrap_or_default();
+                let rebased = rebase_session(typed_sha256.clone(), &current, current_epoch);
+                atomic_json(&session_path(workdir), &rebased)
+                    .map_err(|error| CollaborationError::new("workdir-unreadable", error))?;
+                persist_snapshot(workdir, &rebased["current_snapshot"])
+                    .map_err(|error| CollaborationError::new("workdir-unreadable", error))?;
+                append_history(
+                    workdir,
+                    &json!({
+                        "event": "session-rebound",
+                        "reason": "baseline-epoch",
+                        "baseline_epoch": current_epoch,
+                    }),
+                );
+                return Ok(rebased);
+            }
             match (
                 state.get("baseline_sha256").and_then(Value::as_str),
                 current_baseline.as_deref(),
@@ -259,7 +288,7 @@ pub fn ensure_session(workdir: &Path) -> Result<Value, CollaborationError> {
                 // `agent-preflight-required`, leaving the workdir uneditable
                 // with nothing explaining why. Re-bootstrap, and say so.
                 (Some(bound), Some(current)) if bound != current => {
-                    let rebased = rebase_session(typed_sha256.clone(), current);
+                    let rebased = rebase_session(typed_sha256.clone(), current, current_epoch);
                     atomic_json(&session_path(workdir), &rebased)
                         .map_err(|error| CollaborationError::new("workdir-unreadable", error))?;
                     persist_snapshot(workdir, &rebased["current_snapshot"])
@@ -280,6 +309,7 @@ pub fn ensure_session(workdir: &Path) -> Result<Value, CollaborationError> {
                 (None, Some(current)) => {
                     let mut stamped = state.clone();
                     stamped["baseline_sha256"] = json!(current);
+                    stamped["baseline_epoch"] = json!(current_epoch);
                     atomic_json(&session_path(workdir), &stamped)
                         .map_err(|error| CollaborationError::new("workdir-unreadable", error))?;
                     stamped
@@ -291,7 +321,11 @@ pub fn ensure_session(workdir: &Path) -> Result<Value, CollaborationError> {
             // Anchor a fresh session immediately, so the very first commit does
             // not have to stamp it on a later touch.
             let state = match baseline_sha256(workdir) {
-                Some(current) => rebase_session(typed_sha256, &current),
+                Some(current) => rebase_session(
+                    typed_sha256,
+                    &current,
+                    docx2typed_core::read_baseline_epoch(workdir),
+                ),
                 None => new_session(typed_sha256),
             };
             atomic_json(&session_path(workdir), &state)

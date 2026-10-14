@@ -522,26 +522,29 @@ fn a_review_session_does_not_survive_a_baseline_replacement() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A reset to the SAME bytes is not detected, and this pins what still holds.
+/// A reset to the SAME bytes is still a reset.
 ///
 /// The session anchors to `_template.docx`, so it recognises a baseline whose
 /// CONTENT changed. A reset that restores the identical document is invisible to
-/// that anchor — and it is invisible to every other signal too, because the reset
-/// clears exactly the state that would have distinguished it: the store lane,
-/// the pointer, the edit sidecars. The template is the only thing left, and it is
-/// identical by construction.
+/// that anchor — and to every other signal, because the reset clears exactly the
+/// state that would have distinguished it: the store lane, the pointer, the edit
+/// sidecars. The template is the only thing left, and it is identical by
+/// construction.
 ///
-/// So the boundary is real and needs a persisted epoch that extraction
-/// increments and a reset does not clear. What this test locks in is the part
-/// that must not regress in the meantime: the stale session makes the workdir
-/// REFUSE the next edit rather than mis-apply it.
+/// Measured before the epoch existed: the session was reused, still claimed the
+/// old document's changed paragraph, and the next edit was refused with
+/// `agent-preflight-required` — a workdir that had been reset on purpose was
+/// simply uneditable. `extract` now writes a `baseline.json` generation that a
+/// reset does NOT clear, and the session rebinds when it moves.
 #[test]
-fn a_reset_to_the_same_bytes_is_refused_rather_than_mis_applied() {
+fn a_reset_to_the_same_bytes_is_detected_and_stays_editable() {
     let dir = scratch("same-hash");
     let source = dir.join("source.docx");
     std::fs::copy(fixture("styled"), &source).expect("copy fixture");
     let workdir = dir.join("wd");
     assert_eq!(extract(&source, &workdir)["outcome"], "success");
+    let first_epoch = read_epoch(&workdir);
+    assert_eq!(first_epoch, Some(1), "the first extraction is generation 1");
 
     let mut session = vec![json!({
         "name": "workdir_open",
@@ -572,15 +575,21 @@ fn a_reset_to_the_same_bytes_is_refused_rather_than_mis_applied() {
         "success"
     );
 
-    // Reset to the SAME document: the source is untouched.
+    // Reset to the SAME document: the source is untouched, so the template hash
+    // is identical and only the generation moves.
     assert_eq!(
         extract_with(&source, &workdir, true)["outcome"],
         "success",
         "the declared reset"
     );
+    assert_eq!(
+        read_epoch(&workdir),
+        Some(2),
+        "the reset is a new baseline generation even though the bytes match"
+    );
 
     // A fresh connection edits the baseline that is back.
-    let after = vec![json!({
+    let mut after = vec![json!({
         "name": "workdir_open",
         "arguments": { "workdir": workdir.to_str().expect("utf8"), "track": true, "author": "A2" },
     })];
@@ -592,24 +601,45 @@ fn a_reset_to_the_same_bytes_is_refused_rather_than_mis_applied() {
         }),
         &after,
     );
-    let codes: Vec<String> = edit["diagnostics"]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|entry| entry["code"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    assert_ne!(
+    assert_eq!(
         edit["outcome"], "success",
-        "KNOWN BOUNDARY: a same-bytes reset is not detected, so the edit must be \
-         refused rather than applied against a session that describes a state the \
-         workdir no longer has: {edit}"
+        "a reset workdir must be editable whatever the reset did to the bytes: {edit}"
+    );
+    after.push(json!({
+        "name": "document_patch",
+        "arguments": {
+            "operation_id": "op_same_patch_2",
+            "hunks": [{ "paragraph_id": "P4", "old": "智能响应材料与 ABC", "new": "智能响应材料与 A2版" }],
+        },
+    }));
+    assert_eq!(
+        call(
+            "commit_sync",
+            json!({ "operation_id": "op_same_commit_2" }),
+            &after
+        )["outcome"],
+        "success"
+    );
+
+    // The session was rebound, and said so — with the reason, so a reader can
+    // tell this apart from a content change.
+    let history =
+        std::fs::read_to_string(workdir.join(".review").join("history.jsonl")).expect("history");
+    assert!(
+        history.contains("session-rebound"),
+        "the rebinding is recorded: {history}"
     );
     assert!(
-        codes.iter().any(|code| code == "agent-preflight-required"),
-        "and it refuses for the session reason, not by accident: {codes:?}"
+        history.contains("baseline-epoch"),
+        "and it names the generation as the reason: {history}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The baseline generation the workdir is on.
+fn read_epoch(workdir: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(workdir.join("baseline.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("epoch").and_then(serde_json::Value::as_u64)
 }
