@@ -5,6 +5,7 @@
 //! negotiation + result/diagnostic/evidence shapes only). No DOCX AST, no
 //! store, no orchestration, no transport lives here.
 
+pub mod recovery;
 pub mod canonical;
 pub mod descriptor;
 pub mod dto;
@@ -22,7 +23,7 @@ pub use descriptor::{
 pub use dto::{diagnostic_spec, diagnostic_spec_opt, Diagnostic, DiagnosticSpec, ResultEnvelope};
 pub use evidence::{base_evidence_payload, run_evidence, RunEvidence};
 pub use negotiate::{negotiate, NegotiationError};
-
+pub use recovery::{filtered_recovery_for, profile_recovery, recovery_for, Recovery};
 /// Frozen identity of the Protocol-major-1 schema bundle (semantic SHA-256 of
 /// `scripts/protocol_schema_bundle.json`, pinned by reference/bundle-1
 /// plan.identities.contract.schema_bundle_sha256).
