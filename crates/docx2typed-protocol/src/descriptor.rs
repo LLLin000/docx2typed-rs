@@ -179,7 +179,7 @@ pub const PROTOCOL_TOOLS: [&str; 53] = [
 /// hyphen, so `0.2.0` rather than a Cargo-style `0.2.0-rc1`. The descriptor is
 /// read by both the Python and the Rust side, and the Python spelling is the
 /// one both parse.
-pub const PACKAGE_VERSION: &str = "0.2.0";
+pub const PACKAGE_VERSION: &str = "0.2.1";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContractRange {
