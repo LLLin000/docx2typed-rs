@@ -279,7 +279,7 @@ impl McpSession {
         value
     }
 
-    fn workdir_open(&mut self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn workdir_open(&mut self, args: &Value, build_commit: &str) -> Value {
         let workdir = match args.get("workdir").and_then(Value::as_str) {
             Some(workdir) => workdir.to_string(),
             None => {
@@ -355,11 +355,19 @@ impl McpSession {
                 build_commit,
             );
         }
-        if let Some(open) = self.workdir.clone() {
-            // One connection drives one workdir. Saying only "already open" left
-            // a session believing the block was transient — it retried with a
-            // forked copy, then moved the directories around on disk to get
-            // past it. Name the workdir that is open and the way forward.
+        // One connection drives one workdir — but re-opening the SAME one is
+        // not a conflict, and refusing it made an agent believe the block was
+        // transient: it retried with a forked copy and moved directories around
+        // on disk to get past it. A retry after a dropped connection is the
+        // common case, and it must simply work. A DIFFERENT workdir is a real
+        // conflict, and the refusal below names it.
+        let same = self.workdir.as_deref().is_some_and(|open| {
+            let normalize = |path: &str| {
+                std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
+            };
+            normalize(open) == normalize(&workdir)
+        });
+        if let Some(open) = self.workdir.clone().filter(|_| !same) {
             return self.tool_result(
                 "workdir_open",
                 "failure",
@@ -465,6 +473,16 @@ impl McpSession {
             self.date = date;
         }
         self.success("workdir_open", json!({ "session": session }), build_commit)
+    }
+
+    /// The workdir this connection has open, if any.
+    pub(crate) fn open_workdir(&self) -> Option<&str> {
+        self.workdir.as_deref()
+    }
+
+    /// The operation engine, for the surface to run one op without a tool hop.
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     pub(crate) fn workdir_status(&self, build_commit: &str) -> Value {

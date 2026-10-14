@@ -628,7 +628,7 @@ fn mcp_stdio_is_clean_and_one_workdir_is_enforced() {
     assert_eq!(
         results.len(),
         6,
-        "6 OK replies (engine_info + open + open-fail + status + list + review_state): {raw:?}"
+        "6 OK replies (engine_info + open + open-again + status + list + review_state): {raw:?}"
     );
     for line in &raw {
         assert!(
@@ -636,12 +636,14 @@ fn mcp_stdio_is_clean_and_one_workdir_is_enforced() {
             "stdio purity: every stdout line is OK/ERR: {line:?}"
         );
     }
+    // Re-opening the SAME workdir succeeds and returns the session: a retry
+    // after a dropped connection is the common case, and refusing it made an
+    // agent think the block was transient -- it retried with a forked copy and
+    // moved directories around on disk to get past it. What stays enforced is
+    // that a connection drives ONE workdir, which the conflict test below pins.
     let second_open = envelope(&results[2]);
-    assert_eq!(second_open["outcome"], "failure");
-    assert_eq!(
-        second_open["diagnostics"][0]["code"],
-        "workdir-already-open"
-    );
+    assert_eq!(second_open["outcome"], "success");
+    assert!(second_open["data"]["session"].is_object());
     let status = &envelope(&results[3])["data"];
     assert_eq!(status["state"], "clean");
     let paragraphs = &envelope(&results[4])["data"]["paragraphs"];
@@ -1701,4 +1703,35 @@ fn document_replace_atomic_scope_and_dry_run() {
     assert_eq!(none["matches"], 0);
     assert_eq!(none["changed"], 0);
     assert_eq!(none["noop_reason"], "no-match");
+}
+
+#[test]
+fn a_connection_still_drives_exactly_one_workdir() {
+    // The half of "one workdir" that must NOT be relaxed: a second, DIFFERENT
+    // workdir on the same connection is a real conflict, because the session
+    // state, the draft, and the store all belong to the first one.
+    let first = scratch("one-a");
+    let second = scratch("one-b");
+    extract(&fixture("plain"), &first);
+    extract(&fixture("plain"), &second);
+    let (results, _) = mcp(&[
+        (
+            "workdir_open",
+            json!({ "workdir": first.to_string_lossy() }),
+        ),
+        (
+            "workdir_open",
+            json!({ "workdir": second.to_string_lossy() }),
+        ),
+    ]);
+    let conflict = envelope(&results[1]);
+    assert_eq!(conflict["outcome"], "failure");
+    assert_eq!(conflict["diagnostics"][0]["code"], "workdir-already-open");
+    assert!(
+        conflict["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("one workdir"),
+        "the refusal must say WHY one workdir: {conflict}"
+    );
 }
