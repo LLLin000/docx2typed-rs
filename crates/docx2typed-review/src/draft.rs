@@ -1136,6 +1136,22 @@ fn leaf_index_for_span(
 ///
 /// Read-only: the batch path resolves every hunk's runs before anything is
 /// written.
+/// Can `old` be replaced inside this paragraph as ONE span?
+///
+/// The same resolution `plan_patch` performs before it applies anything, exposed
+/// so the staging phase can reach the same verdict instead of a weaker one.
+/// Staging used to resolve the handle and stop there, which is why a span could
+/// be reported as editable and then refused `cross-leaf-edit` at commit — the
+/// search promised what the edit would not do, and the caller paid for the
+/// difference in retries. One question, one implementation.
+pub fn check_editable_span(
+    workdir: &Path,
+    paragraph_id: &str,
+    old: &str,
+) -> Result<(), CollaborationError> {
+    island_leaf_for(workdir, paragraph_id, old, None).map(|_| ())
+}
+
 fn island_leaf_for(
     workdir: &Path,
     paragraph_id: &str,

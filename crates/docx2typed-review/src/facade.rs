@@ -220,7 +220,17 @@ pub fn stage_edits(
             Ok(resolved) => {
                 let old_text = resolved.text.clone();
                 let new_text = replace_once(&old_text, &edit.replace_with);
-                let capability = if old_text == new_text {
+                // A no-op is blocked; so is a span the commit path cannot apply
+                // as one edit. Asking the commit path itself, rather than a
+                // second opinion about it, is what keeps this phase from
+                // promising an edit that the next phase refuses.
+                let span_problem = draft::check_editable_span(
+                    workdir,
+                    &resolved.paragraph_id,
+                    &old_text,
+                )
+                .err();
+                let capability = if old_text == new_text || span_problem.is_some() {
                     Capability::Unsupported
                 } else {
                     Capability::Supported
@@ -234,7 +244,10 @@ pub fn stage_edits(
                     reason: if capability.is_ok() {
                         None
                     } else {
-                        Some("replace-is-a-noop".to_string())
+                        match span_problem {
+                            Some(error) => Some(format!("{}: {}", error.code, error.detail)),
+                            None => Some("replace-is-a-noop".to_string()),
+                        }
                     },
                 };
                 if capability.is_ok() {

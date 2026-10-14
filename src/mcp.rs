@@ -485,6 +485,19 @@ impl McpSession {
         &self.engine
     }
 
+    /// The session's revision-tracking choices, for the surface to pass through.
+    pub(crate) fn tracking(&self) -> bool {
+        self.track
+    }
+
+    pub(crate) fn authoring(&self) -> Option<&str> {
+        self.author.as_deref()
+    }
+
+    pub(crate) fn stamp(&self) -> Option<&str> {
+        self.date.as_deref()
+    }
+
     pub(crate) fn workdir_status(&self, build_commit: &str) -> Value {
         let workdir = match self.require_workdir() {
             Ok(workdir) => workdir.to_string(),
@@ -672,7 +685,7 @@ impl McpSession {
         }
     }
 
-    fn commit_sync(&self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn commit_sync(&self, args: &Value, build_commit: &str) -> Value {
         let tracked = self.track;
         let author = self.author.clone();
         let date = self.date.clone();
@@ -1597,7 +1610,7 @@ impl McpSession {
     /// the enclosing paragraph block plus its `match_ref`, so the caller can
     /// hand that ref straight to `document_patch`/`format_span` — search is
     /// where the addressing layer comes from.
-    fn document_search(&self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn document_search(&self, args: &Value, build_commit: &str) -> Value {
         let Some(workdir) = self.workdir.as_deref() else {
             return self.failure(
                 "document_search",
