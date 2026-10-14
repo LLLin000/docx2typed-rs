@@ -40,7 +40,17 @@ pub enum Asset {
     Bytes(String, Vec<u8>),
     /// path, source file to byte-copy verbatim
     CopySource { path: String, source: PathBuf },
+    /// path to remove. Extraction is a BASELINE CONSTRUCTOR: when it replaces a
+    /// workdir's baseline it has to clear what was applied on top of the old
+    /// one, and removing it in the SAME published set as the writes is what
+    /// keeps the workdir from being left half-reset.
+    Remove(String),
 }
+
+/// The workdir's version pointer. The Store owns its CONTENTS; the layout
+/// constant lives here because extraction has to clear it when it replaces a
+/// baseline, and a literal in two crates is a literal that drifts.
+pub const POINTER_FILE: &str = "workdir.json";
 
 /// Declarative extract result: the assets a Store commits into a workdir.
 #[derive(Clone, Debug)]
@@ -226,7 +236,100 @@ fn part_digests(package: &[u8]) -> Result<BTreeMap<String, String>, CoreError> {
     Ok(out)
 }
 
+/// How many edits the workdir currently carries on top of its baseline.
+///
+/// `_template.docx` stays the file `extract` wrote — a commit does not fold
+/// edits into it, and `build` does not touch the workdir at all — so the current
+/// logical state differs from the baseline by exactly what the sidecars hold.
+/// That is the condition for "this workdir has moved past its baseline", and
+/// unlike a version counter it cannot be fooled by history: a workdir whose
+/// edits were all undone reads as zero.
+///
+/// Measured on a real workdir: after `extract` → edit → `commit_sync`, the
+/// template still hashed equal to the source while `islands.json` held the edit,
+/// and `build_docx` left every one of those files alone.
+fn applied_edit_count(workdir: &Path) -> usize {
+    let islands = crate::prose::load_islands(workdir)
+        .map(|edits| edits.len())
+        .unwrap_or(0);
+    let structure = crate::prose::load_structure(workdir)
+        .map(|edits| edits.new_paragraphs.len() + edits.deleted_paragraphs.len())
+        .unwrap_or(0);
+    let rpr = crate::prose::load_rpr_edits(workdir)
+        .map(|edits| edits.len())
+        .unwrap_or(0);
+    islands + structure + rpr
+}
+
+/// What `plan_extract` does when the target workdir has already moved past its
+/// baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaselineReset {
+    /// Refuse. The default, because a workdir that carries work the source does
+    /// not have is not a workdir the incoming file may silently replace.
+    Refuse,
+    /// Allow the reset: the caller has declared that the incoming file becomes
+    /// the current state and that the applied edits stay only in history. A
+    /// pending draft is still refused — discarding uncommitted work needs its
+    /// own explicit act, not the same switch.
+    AllowCommitted,
+}
+
 pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError> {
+    plan_extract_with(source, outdir, BaselineReset::Refuse)
+}
+
+pub fn plan_extract_with(
+    source: &Path,
+    outdir: &Path,
+    reset: BaselineReset,
+) -> Result<ChangeSet, CoreError> {
+    // Taking in a document that changed outside the tool is `extract` over the
+    // SAME workdir: a workdir is its document's permanent editing home and is
+    // never replaced to follow a change (ADR 0048, CONTEXT.md "Baseline drift
+    // policy").
+    //
+    // `extract` is a BASELINE CONSTRUCTOR, not a merge: it re-derives
+    // `_template.docx` and the typed projection from the source. Running it over
+    // a workdir that has moved past its baseline therefore resets that baseline,
+    // and it does so whether or not the source changed — measured: a workdir
+    // with one committed version, re-extracted with a byte-identical source,
+    // lost the committed text from its current state.
+    //
+    // So the precondition is not "the source did not change", it is "the workdir
+    // is AT its baseline". Two conditions say it is not, and each names a
+    // different way out:
+    if outdir.join(crate::edit_state::STATE_FILE).exists() {
+        if let Ok(state) = crate::edit_state::classify_edit_state(outdir) {
+            if state.state != "clean" {
+                return Err(CoreError::Domain(format!(
+                    "workdir-has-pending-edit: {} carries a `{}` draft; commit it first \
+                     (`commit_sync`), then sync the source in — syncing now would discard the \
+                     pending edit",
+                    outdir.to_string_lossy(),
+                    state.state
+                )));
+            }
+        }
+    }
+    // An applied edit is work the source does not have. Comparing the CURRENT
+    // state against the baseline — rather than counting history — is what keeps
+    // a workdir whose edits were all undone from being refused: history keeps
+    // the version either way, and "history still has it" is not the same claim
+    // as "this is still the current version".
+    if reset == BaselineReset::Refuse {
+        let applied = applied_edit_count(outdir);
+        if applied > 0 {
+            return Err(CoreError::Domain(format!(
+                "workdir-not-at-baseline: {} carries {applied} edit(s) on top of its baseline \
+                 that the source does not have; exporting keeps them but does not put the \
+                 workdir back on its baseline, so either reset the workdir to the source on \
+                 purpose (`--discard-committed-versions`) or start the incoming file in a \
+                 workdir of its own",
+                outdir.to_string_lossy()
+            )));
+        }
+    }
     let source_path = resolve_path(source);
     if !source_path.is_file() {
         return Err(CoreError::Domain(format!(
@@ -341,22 +444,60 @@ pub fn plan_extract(source: &Path, outdir: &Path) -> Result<ChangeSet, CoreError
         text.into_bytes()
     };
 
-    Ok(ChangeSet {
-        assets: vec![
-            Asset::CopySource {
-                path: template_name,
-                source: source_path,
-            },
-            Asset::Bytes("format.json".to_string(), format_bytes),
-            Asset::Bytes("styles.json".to_string(), styles_bytes),
-            Asset::Bytes("typed.md".to_string(), typed_md.into_bytes()),
-            Asset::Bytes("revisions.json".to_string(), revisions_bytes),
-            Asset::Bytes(
-                "revisions.md".to_string(),
-                crate::govern::revisions_md(&revisions).into_bytes(),
-            ),
-        ],
-    })
+    let mut assets = vec![
+        Asset::CopySource {
+            path: template_name,
+            source: source_path,
+        },
+        Asset::Bytes("format.json".to_string(), format_bytes),
+        Asset::Bytes("styles.json".to_string(), styles_bytes),
+        Asset::Bytes("typed.md".to_string(), typed_md.into_bytes()),
+        Asset::Bytes("revisions.json".to_string(), revisions_bytes),
+        Asset::Bytes(
+            "revisions.md".to_string(),
+            crate::govern::revisions_md(&revisions).into_bytes(),
+        ),
+    ];
+    // Replacing an existing baseline clears what was applied on top of the old
+    // one, in this same published set — an extract that writes the new baseline
+    // and then deletes the stale sidecars in a second step is not atomic, and a
+    // crash between the two leaves exactly the tear this removes.
+    if replaces_existing_baseline(outdir) {
+        assets.extend(stale_baseline_assets(outdir));
+    }
+    Ok(ChangeSet { assets })
+}
+
+/// Whether this extraction replaces an existing baseline rather than creating
+/// one. A workdir that already has a template is being rebuilt, so whatever was
+/// applied on top of the old baseline has to go with it.
+pub fn replaces_existing_baseline(outdir: &Path) -> bool {
+    outdir.join("_template.docx").is_file()
+}
+
+/// The files a baseline replacement has to clear, in the SAME published set as
+/// the writes that replace the baseline.
+///
+/// Everything here was expressed against the OLD template: the edit sidecars
+/// address its runs, and the projection pins its hash. Leaving them behind
+/// produces a worked example of the tear — measured: after an allowed reset the
+/// template was the incoming document while `islands.json` still held an edit
+/// against the old one and `workdir.json` still pointed at the old version, and
+/// the next build refused with `edit-stale` whose only offered escape was to
+/// accept the tear.
+fn stale_baseline_assets(outdir: &Path) -> Vec<Asset> {
+    [
+        crate::prose::ISLANDS_FILE,
+        crate::prose::STRUCTURE_FILE,
+        crate::prose::RPR_EDITS_FILE,
+        crate::edit_state::PROJECTION_FILE,
+        crate::edit_state::STATE_FILE,
+        POINTER_FILE,
+    ]
+    .into_iter()
+    .filter(|name| outdir.join(name).is_file())
+    .map(|name| Asset::Remove(name.to_string()))
+    .collect()
 }
 
 /// Validate a typed workdir and report its metadata. Mirrors the

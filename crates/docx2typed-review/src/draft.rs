@@ -1122,12 +1122,20 @@ fn leaf_index_for_span(
     None
 }
 
-/// The template leaf one island edit lands in, or None for a synthesised
+/// The first template run one island edit lands in, or None for a synthesised
 /// paragraph: it has no baseline leaf to replace (it is rendered from the
 /// inherit paragraph at build time and rewritten in the structure sidecar at
-/// commit instead — PR 3). Fails closed with `cross-leaf-edit` when no single
-/// leaf carries `old`. Read-only: the batch path resolves every hunk's leaf
-/// before anything is written.
+/// commit instead — PR 3).
+///
+/// A Word paragraph splits its text into one run per formatting change — 65 of
+/// them in one paragraph of a real patent we measured — so an edit a human typed
+/// in Word routinely crosses runs. `match_leaf_span` resolves that: the recorded
+/// `leaf_index` is the run the match STARTS in, and the applier re-derives the
+/// same run range from `(leaf_index, old)`. Validation and application therefore
+/// cannot disagree about which runs an edit covers.
+///
+/// Read-only: the batch path resolves every hunk's runs before anything is
+/// written.
 fn island_leaf_for(
     workdir: &Path,
     paragraph_id: &str,
@@ -1157,21 +1165,43 @@ fn island_leaf_for(
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)
         .ok_or_else(|| CollaborationError::new("invalid-edit", "unknown paragraph part"))?;
-    let leaf = inventory
+    let runs = inventory
         .leaves
         .iter()
-        .find(|leaf| {
-            leaf.part_key == part
-                && leaf.paragraph_id == paragraph_id
-                && leaf_index.map_or(leaf.text.contains(old), |index| leaf.leaf_index == index)
-        })
-        .ok_or_else(|| {
-            CollaborationError::new(
-                "cross-leaf-edit",
-                format!("{paragraph_id}: replacement must stay within one text leaf"),
-            )
-        })?;
-    Ok(Some((part, leaf.leaf_index)))
+        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
+        .count();
+    // An explicit ordinal is the caller's address; without one the search starts
+    // at the paragraph's first run.
+    let from_leaf = leaf_index.unwrap_or(0);
+    let span =
+        docx2typed_core::prose::match_leaf_span(&inventory, &part, paragraph_id, from_leaf, old)
+            .map_err(|error| CollaborationError::new("prose-edit-ambiguous", error.to_string()))?;
+    let Some(span) = span else {
+        return Err(CollaborationError::new(
+            "cross-leaf-edit",
+            format!(
+                "{paragraph_id}: {old:?} is not carried by this paragraph's text runs \
+                 ({runs} run(s)). Word splits a paragraph's text at every formatting \
+                 change, so a phrase copied out of Word can differ from the stored \
+                 text by whitespace or punctuation inside a run. Read the paragraph \
+                 with document_read and copy the exact characters, or replace the \
+                 whole paragraph with delete + insert_after, which needs no run match."
+            ),
+        ));
+    };
+    if let Some(index) = leaf_index {
+        if index != span.first_leaf {
+            return Err(CollaborationError::new(
+                "invalid-edit",
+                format!(
+                    "{paragraph_id}: leaf {index} was addressed but the text starts in \
+                     run {}; omit leaf_index to let the search find it",
+                    span.first_leaf
+                ),
+            ));
+        }
+    }
+    Ok(Some((part, span.first_leaf)))
 }
 
 fn record_island_operation(
@@ -2151,9 +2181,14 @@ fn plan_patch(
         let listed = problems
             .iter()
             .map(|problem| {
+                // The reason, not just the code. `invalid-structure` alone says
+                // nothing about which dependency blocks the hunk, so a caller
+                // holding a 50-hunk restructure has to re-derive it for every
+                // paragraph — the code is carried in `problem.message`, and
+                // dropping it here threw away the only actionable part.
                 format!(
-                    "hunk #{} ({}): {}",
-                    problem.hunk, problem.paragraph_id, problem.code
+                    "hunk #{} ({}): {} — {}",
+                    problem.hunk, problem.paragraph_id, problem.code, problem.message
                 )
             })
             .collect::<Vec<_>>()
@@ -2328,35 +2363,83 @@ fn paragraph_lengths_differ(workdir: &Path, paragraph_id: &str) -> bool {
     draft_len != template_len
 }
 
-/// The whole-leaf form of one island edit, carrying every replacement that
-/// lands in that leaf (offsets are char positions inside the paragraph's
-/// visible text, applied right-to-left so earlier anchors never shift).
+/// One run of the paragraph an edit targets: its leaf ordinal, its text, and the
+/// paragraph-character offset its text starts at.
+type RunSlice = (usize, String, usize);
+
+/// The paragraph's runs in order, with the character offset each starts at.
+fn run_offsets(workdir: &Path, paragraph_id: &str) -> Option<(String, Vec<RunSlice>)> {
+    let package = fs::read(workdir.join("_template.docx")).ok()?;
+    let inventory = docx2typed_core::prose::enumerate_package_bytes(&package).ok()?;
+    let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)?;
+    let mut leaves: Vec<&docx2typed_core::prose::ProseLeaf> = inventory
+        .leaves
+        .iter()
+        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
+        .collect();
+    leaves.sort_by_key(|leaf| leaf.leaf_index);
+    let mut runs = Vec::with_capacity(leaves.len());
+    let mut offset = 0usize;
+    for leaf in &leaves {
+        let len = leaf.text.chars().count();
+        runs.push((leaf.leaf_index, leaf.text.clone(), offset));
+        offset += len;
+    }
+    Some((part, runs))
+}
+
+/// The island record for one run-group: the template text its spans cover, and
+/// what replaces them.
+///
+/// The draft addresses spans by PARAGRAPH-global character offsets, while the
+/// island must address the template's runs. Those are two coordinate spaces and
+/// they only meet while the paragraph's visible text and its runs still agree —
+/// `paragraph_lengths_differ` is the caller's guard for the case where they do
+/// not, and `None` here is the second one.
+///
+/// A region that stays inside ONE run keeps the long-standing record: that run
+/// as it stands, and that run as it should read. Only a region that crosses
+/// runs is recorded as the covered range itself, because the applier has to
+/// rebuild every run it touched and `old` is how it finds them.
 fn merged_leaf_island(
     workdir: &Path,
     paragraph_id: &str,
     leaf_index: usize,
     spans: &[LeafReplacement],
 ) -> Option<(String, String)> {
-    let package = fs::read(workdir.join("_template.docx")).ok()?;
-    let inventory = docx2typed_core::prose::enumerate_package_bytes(&package).ok()?;
-    let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)?;
-    let mut cursor = 0usize;
-    for leaf in inventory
-        .leaves
-        .iter()
-        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
-    {
-        let mut chars: Vec<char> = leaf.text.chars().collect();
-        let leaf_start = cursor;
-        cursor += chars.len();
-        if leaf.leaf_index != leaf_index {
-            continue;
+    let (_part, runs) = run_offsets(workdir, paragraph_id)?;
+    let mut ordered: Vec<&LeafReplacement> = spans.iter().collect();
+    ordered.sort_by_key(|(start, _, _)| *start);
+    let first = ordered.first().map(|(start, _, _)| *start)?;
+
+    // The group key is the run the region starts in. A mismatch means the
+    // draft's offsets and the template's runs have drifted apart, and recording
+    // the edit anyway would land it in the wrong run.
+    let owner = run_covering(&runs, first)?.0;
+    if owner != leaf_index {
+        return None;
+    }
+
+    let mut cursor = first;
+    for (start, len, _) in &ordered {
+        let end = start.checked_add(*len)?;
+        if *start < cursor {
+            return None;
         }
-        let mut ordered: Vec<&LeafReplacement> = spans.iter().collect();
-        ordered.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
-        for (start, len, replacement) in ordered {
-            let local = start.checked_sub(leaf_start)?;
-            let end = local + len;
+        cursor = end;
+    }
+    let last_char = cursor.checked_sub(1)?;
+
+    if run_covering(&runs, last_char)?.0 == owner {
+        // One run only: rewrite that run's text with the spans applied, and
+        // record it the way every batch inside one run has always been recorded.
+        let (_, run_text, run_start) = run_covering(&runs, first)?;
+        let mut chars: Vec<char> = run_text.chars().collect();
+        let mut descending: Vec<&LeafReplacement> = ordered.clone();
+        descending.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+        for (start, len, replacement) in descending {
+            let local = start.checked_sub(run_start)?;
+            let end = local.checked_add(*len)?;
             if end > chars.len() {
                 return None;
             }
@@ -2366,7 +2449,45 @@ fn merged_leaf_island(
             next.extend_from_slice(&chars[end..]);
             chars = next;
         }
-        return Some((leaf.text.clone(), chars.into_iter().collect()));
+        return Some((run_text, chars.into_iter().collect()));
+    }
+
+    // More than one run: record the covered region itself. Text between two
+    // hunks rides along unchanged on BOTH sides, because the island replaces one
+    // contiguous region and whatever it does not edit has to read the same
+    // before and after.
+    let paragraph_text: String = runs.iter().map(|(_, text, _)| text.as_str()).collect();
+    let chars: Vec<char> = paragraph_text.chars().collect();
+    let mut old = String::new();
+    let mut new = String::new();
+    let mut cursor = first;
+    for (start, len, replacement) in ordered {
+        let end = start.checked_add(*len)?;
+        if end > chars.len() {
+            return None;
+        }
+        if *start > cursor {
+            old.extend(&chars[cursor..*start]);
+            new.extend(&chars[cursor..*start]);
+        }
+        old.extend(&chars[*start..end]);
+        new.push_str(replacement);
+        cursor = end;
+    }
+    if old.is_empty() && new.is_empty() {
+        return None;
+    }
+    Some((old, new))
+}
+
+/// The run carrying the character at paragraph offset `offset`: its ordinal,
+/// its text, and the offset its text starts at.
+fn run_covering(runs: &[RunSlice], offset: usize) -> Option<(usize, String, usize)> {
+    for (index, text, start) in runs {
+        let len = text.chars().count();
+        if offset < start + len {
+            return Some((*index, text.clone(), *start));
+        }
     }
     None
 }
@@ -3907,6 +4028,45 @@ pub fn discard_projection(workdir: &Path) -> Result<(), CollaborationError> {
     )
     .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     Ok(())
+}
+
+/// What the source document this workdir was extracted from looks like NOW.
+///
+/// A workdir records the source's file name and hash but not its path, and the
+/// file it came from normally sits beside the workdir. When a file of that name
+/// is there, this compares it — so a source that moved on since the extract is
+/// visible when the workdir opens, instead of being discovered by overwriting
+/// the newer file with a build from the older one.
+///
+/// `None` means "nothing to compare", NOT "no drift": no `format.json`, no
+/// recorded name, or no such file beside the workdir. Reporting `changed:
+/// false` in that case would be a green light nobody earned, which is the
+/// failure this exists to prevent.
+pub fn source_drift(workdir: &Path) -> Option<Value> {
+    let format: Value =
+        serde_json::from_str(&fs::read_to_string(workdir.join("format.json")).ok()?).ok()?;
+    let name = format.get("source")?.as_str()?;
+    let recorded = format.get("source_sha256")?.as_str()?;
+    let candidate = workdir.parent()?.join(name);
+    if !candidate.is_file() {
+        return None;
+    }
+    let current = file_sha256(&candidate).ok()?;
+    let changed = current != recorded;
+    Some(serde_json::json!({
+        "source": name,
+        "path": candidate.to_string_lossy(),
+        "recorded_sha256": recorded,
+        "current_sha256": current,
+        "changed": changed,
+        "remedy": if changed {
+            "the document moved on since this workdir was extracted; re-extract it over this \
+             workdir (extract <source.docx> -o <workdir>) before editing, or the build will \
+             overwrite the newer file with the older text"
+        } else {
+            "the workdir still matches its source"
+        },
+    }))
 }
 
 /// Read-only freshness of the opened workdir (`workdir_status`): state plus

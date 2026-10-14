@@ -26,3 +26,9 @@ roxmltree = "0.21"
 # re-encode of the touched member only; both already in the tree via zip).
 crc32fast = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[dev-dependencies]
+# The cross-run span test asserts the tracked revision marks, which means
+# reading a package member; the test links against the crate, so the crate's own
+# `zip` is not in scope without this.
+zip = { version = "2", default-features = false, features = ["deflate"] }

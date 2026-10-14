@@ -14,7 +14,7 @@ pub mod embedded;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use docx2typed_core::{plan_build, plan_extract, validate_workdir, Asset, BuildPlan, ChangeSet};
+use docx2typed_core::{plan_build, validate_workdir, Asset, BuildPlan, ChangeSet};
 use docx2typed_protocol::{
     base_evidence_payload, canonical_operation_input, file_sha256, resolve_path, run_evidence,
     typed_path_value, Diagnostic, ResultEnvelope, RunEvidence,
@@ -107,6 +107,11 @@ pub struct ProjectViewArgs {
 pub struct ExtractArgs {
     pub input: PathBuf,
     pub outdir: PathBuf,
+    /// Declare that the incoming file becomes the current state even when the
+    /// workdir has committed versions the source does not carry. Off by
+    /// default: that discard has to be someone's decision, and a workdir at its
+    /// baseline needs no switch at all.
+    pub discard_committed_versions: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -457,6 +462,9 @@ impl StorePort for MemoryStore {
                     let bytes = std::fs::read(source).map_err(StoreError::Io)?;
                     assets.insert(path.clone(), bytes);
                 }
+                Asset::Remove(path) => {
+                    assets.remove(path);
+                }
             }
         }
         self.workdirs.borrow_mut().insert(resolve_path(dir), assets);
@@ -738,10 +746,30 @@ impl Engine {
                 )]))
             }
         };
-        let change_set = match plan_extract(&source, &args.outdir) {
+        let reset = if args.discard_committed_versions {
+            docx2typed_core::BaselineReset::AllowCommitted
+        } else {
+            docx2typed_core::BaselineReset::Refuse
+        };
+        // A reset also clears the STORE lane, which only this layer knows about:
+        // leaving `.docx2typed-store/` behind without the pointer that goes with
+        // it produces a workdir the store refuses to open ("store pointer is
+        // missing or corrupt") — a store-backed workdir with no current version.
+        // Same change set, so the publish stays one step.
+        let replacing = docx2typed_core::replaces_existing_baseline(&args.outdir);
+        let change_set = match docx2typed_core::plan_extract_with(&source, &args.outdir, reset) {
             Ok(change_set) => change_set,
             Err(error) => return Ok(self.domain_failure("extract", &error.to_string())),
         };
+        let mut change_set = change_set;
+        if replacing {
+            let store_dir = args.outdir.join(docx2typed_store::STORE_DIR_NAME);
+            if store_dir.is_dir() {
+                change_set.assets.push(docx2typed_core::Asset::Remove(
+                    docx2typed_store::STORE_DIR_NAME.to_string(),
+                ));
+            }
+        }
         if let Err(error) = self.store.commit_workdir(&args.outdir, &change_set) {
             return Ok(self.domain_failure("extract", &error.to_string()));
         }
@@ -2165,11 +2193,17 @@ impl Engine {
             profile: context.profile.clone(),
         });
         if verification.verdict != "pass" {
+            // The failing check's own explanation, not just its name: a name
+            // says WHICH invariant broke and nothing about how, which left the
+            // one person who has to act on it reading the source.
             let detail = verification
                 .checks
                 .iter()
                 .find(|check| check.status != "pass")
-                .map(|check| check.name.clone())
+                .map(|check| match check.detail.as_deref() {
+                    Some(why) if !why.is_empty() => format!("{}: {why}", check.name),
+                    _ => check.name.clone(),
+                })
                 .unwrap_or_else(|| "verification".to_string());
             return Ok(OperationOutcome::failure(vec![Diagnostic::new(
                 "workdir-invalid",
@@ -2635,68 +2669,12 @@ fn diagnostic_from_value(value: &serde_json::Value) -> Diagnostic {
 }
 
 fn is_registered_code(code: &str) -> bool {
-    matches!(
-        code,
-        "input-not-found"
-            | "workdir-not-found"
-            | "workdir-invalid"
-            | "workdir-unreadable"
-            | "contract-incompatible"
-            | "required-feature-unsupported"
-            | "evidence-publish-failed"
-            | "resource-limit-exceeded"
-            | "invalid-arguments"
-            | "asset-closure"
-            | "schema-incompatible"
-            | "source-drift"
-            | "symlink-detected"
-            | "target-already-exists"
-            | "operation-id-required"
-            | "migrate-verification-failed"
-            | "edit-dirty"
-            | "edit-stale"
-            | "edit-conflict"
-            | "edit-state-missing"
-            | "edit-state-incompatible"
-            | "edit-binding-mismatch"
-            | "edit-header-tampered"
-            | "edit-grammar-invalid"
-            | "edit-header-missing"
-            // Issue #57 store diagnostics (frozen bundle registry).
-            | "writer-busy"
-            | "writer-timeout"
-            | "generation-conflict"
-            | "needs-recovery"
-            | "reserve-depleted"
-            | "unsupported-by-design"
-            | "store-invalid"
-            | "operation-id-reused"
-            | "operation-journal-conflict"
-            // Issue #58 prose diagnostics (frozen bundle registry).
-            | "invalid-edit"
-            | "opaque-paragraph-mutated"
-            | "prose-edit-ambiguous"
-            | "prose-edit-unsupported"
-            | "prose-xml-invalid"
-            // Issue #59 governed-workflow diagnostics (frozen bundle
-            // registry: revisions/decisions/comments/tables/audit).
-            | "invalid-action"
-            | "malformed-revision-key"
-            | "revision-fingerprint-mismatch"
-            | "revision-not-found"
-            | "revision-outside-editable-surface"
-            | "revision-text-fingerprint-mismatch"
-            | "invalid-table-reference"
-            | "merge-would-discard-content"
-            | "comment-not-found"
-            | "decided-output-already-exists"
-            | "decided-workdir-already-exists"
-            // Replace-lane diagnostics (document_replace): a cross-leaf span or
-            // a match with no sidecar record names a match the build cannot
-            // honour — refused loudly rather than dropped silently.
-            | "replace-cross-leaf-matches"
-            | "replace-unrecorded-match"
-    )
+    // Delegates to the ONE registry. This crate used to keep its own list of 52
+    // codes while the protocol declared 27, so the two disagreed about which
+    // codes exist: the CLI labelled failures correctly while `diagnostic_spec`
+    // answered the domain default — wrong severity, wrong category, and
+    // `retriable: false` for transient conditions — for half of them.
+    docx2typed_protocol::diagnostic_spec_opt(code).is_some()
 }
 
 // ---------------------------------------------------------------------------

@@ -305,7 +305,7 @@ fn island_edit_build_verify_full_chain() {
         "package-openable",
         "parts-match-template-except-edited",
         "edited-part-exact",
-        "opaque-interiors-replayed",
+        "protected-structure-preserved",
     ] {
         assert!(
             names.iter().any(|name| name == required),

@@ -37,14 +37,43 @@ fn run_main() -> i32 {
     dispatch(&argv, json_mode, &build_commit)
 }
 
+/// The usage banner. `commands` comes from `PROTOCOL_COMMANDS`, so the help
+/// cannot advertise a command the dispatcher does not have (or hide one it
+/// does) — the same rule `engine_info` follows.
+fn usage_text() -> String {
+    let commands = docx2typed_protocol::PROTOCOL_COMMANDS.join(" | ");
+    format!(
+        "docx2typed — typed-mode DOCX text editing with locked structure.\n\
+         \n\
+         usage: docx2typed <command> [--json] [options]\n\
+         \n\
+         commands: {commands}\n\
+         \n\
+         --json      machine-readable result envelope on stdout\n\
+         --version   engine descriptor (name, version, build commit, commands)\n\
+         --help      this text\n\
+         \n\
+         Each command takes its own --help. Set DOCX2TYPED_BUILD_COMMIT to\n\
+         override the commit reported by --version."
+    )
+}
+
 fn dispatch(argv: &[String], json_mode: bool, build_commit: &str) -> i32 {
     if argv.is_empty() {
         if json_mode {
             cli::print_invocation_failure("", "no command given", argv);
         } else {
-            eprintln!("usage: docx2typed <command> [--json] [options]");
+            eprintln!("{}", usage_text());
         }
         return 1;
+    }
+    // `--help` is the first thing anyone tries on an unfamiliar CLI. It used to
+    // fall through to the unknown-command arm and exit 1, which reads as "this
+    // tool is broken" rather than "here is how to use it" — and sends the
+    // reader off to grep the source instead of running the command.
+    if argv[0] == "--help" || argv[0] == "-h" || argv[0] == "help" {
+        println!("{}", usage_text());
+        return 0;
     }
     if argv == ["--version"] {
         let descriptor = docx2typed_protocol::engine_descriptor(build_commit);
@@ -90,6 +119,7 @@ fn dispatch(argv: &[String], json_mode: bool, build_commit: &str) -> i32 {
                 );
             } else {
                 eprintln!("Unknown command: {other}");
+                eprintln!("run `docx2typed --help` for the command list");
             }
             1
         }

@@ -151,3 +151,54 @@ fn the_binary_knows_its_build_commit() {
         "an empty override must not erase the compiled commit"
     );
 }
+
+/// `--help` is the first thing anyone tries on an unfamiliar CLI.
+///
+/// It used to fall through to the unknown-command arm: `Unknown command:
+/// --help`, exit 1, no command list. An agent that probes a CLI that way reads
+/// exit 1 as "this tool is broken" and goes looking for the answer in the
+/// source instead — which is exactly what happened in a real session, and it
+/// spent six probes getting a usage string the binary already had.
+#[test]
+fn help_prints_the_command_list_and_succeeds() {
+    for invocation in [vec!["--help"], vec!["-h"], vec!["help"]] {
+        let out = Command::new(bin())
+            .args(&invocation)
+            .output()
+            .expect("the binary runs");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{invocation:?} must succeed, got {:?}",
+            out.status.code()
+        );
+        assert!(
+            !text.is_empty(),
+            "{invocation:?} writes usage to stdout, not stderr"
+        );
+        // Every dispatched command is named, so the list cannot go stale
+        // against the dispatcher.
+        for command in advertised_commands() {
+            assert!(
+                text.contains(&command),
+                "{invocation:?} does not mention {command:?}:\n{text}"
+            );
+        }
+    }
+}
+
+/// A command that does not exist still fails, and now says where to look.
+#[test]
+fn an_unknown_command_points_at_help() {
+    let out = Command::new(bin())
+        .arg("definitely-not-a-command")
+        .output()
+        .expect("the binary runs");
+    assert!(!out.status.success(), "an unknown command must fail");
+    let text = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(text.contains("Unknown command"), "got: {text}");
+    assert!(
+        text.contains("--help"),
+        "the refusal must name the way out: {text}"
+    );
+}

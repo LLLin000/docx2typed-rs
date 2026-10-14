@@ -43,6 +43,7 @@ fn extract_build_verify_chain_reproduces_python_reference_hash() {
             OperationArgs::Extract(ExtractArgs {
                 input: fixture(),
                 outdir: workdir.clone(),
+                discard_committed_versions: false,
             }),
         )
         .expect("engine runs");
@@ -108,6 +109,7 @@ fn tampered_output_fails_independent_verification() {
             OperationArgs::Extract(ExtractArgs {
                 input: fixture(),
                 outdir: workdir.clone(),
+                discard_committed_versions: false,
             }),
         )
         .expect("extract");
@@ -166,6 +168,7 @@ fn edited_typed_md_fails_noop_build() {
             OperationArgs::Extract(ExtractArgs {
                 input: fixture(),
                 outdir: workdir.clone(),
+                discard_committed_versions: false,
             }),
         )
         .expect("extract");

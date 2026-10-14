@@ -144,6 +144,11 @@ fn parse(operation: Operation, argv: &[String]) -> Result<ParseResult, String> {
                             .ok_or("expected value for -o/--outdir")?
                             .clone();
                     }
+                    // The explicit declaration that the incoming file becomes
+                    // the current state even when the workdir has committed
+                    // versions. A workdir at its baseline needs no switch and
+                    // extracts without one.
+                    "--discard-committed-versions" => {}
                     "--operation-id" => {
                         index += 1;
                         operation_id = Some(
@@ -170,6 +175,9 @@ fn parse(operation: Operation, argv: &[String]) -> Result<ParseResult, String> {
                 args: OperationArgs::Extract(ExtractArgs {
                     input: PathBuf::from(input),
                     outdir: PathBuf::from(outdir),
+                    discard_committed_versions: argv
+                        .iter()
+                        .any(|a| a == "--discard-committed-versions"),
                 }),
                 operation_id: operation_id.unwrap_or_else(docx2typed_protocol::new_operation_id),
             })

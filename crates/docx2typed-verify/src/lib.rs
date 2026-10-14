@@ -299,6 +299,8 @@ impl IndependentVerifier {
         // position (the edit never touches locked bytes).
         let mut opaque_locked = true;
         let mut opaque_detail = String::new();
+        let mut untouched_preserved = true;
+        let mut untouched_detail = String::new();
         for part_path in &edited_part_paths {
             let Some(part_key) = part_key_from_path(part_path) else {
                 continue;
@@ -311,16 +313,50 @@ impl IndependentVerifier {
             let output_part =
                 read_member_bytes(&std::fs::read(output).unwrap_or_default(), part_path)
                     .unwrap_or_default();
-            // With structural edits the base for the shift walk is the
-            // island-applied part: the structural spans live in that space.
-            let replay = if part_key == "document" && !structure.is_empty() {
+            // The protected structure must survive, compared by IDENTITY rather
+            // than by position. A tracked edit re-wraps every run it touches, so
+            // a byte offset after it moves by an amount that depends on the
+            // WRAPPING; estimating that from the replacement's length is wrong by
+            // construction, which is what this check used to do and why it
+            // rejected correct output.
+            let mut targeted: Vec<String> =
+                edits.iter().map(|edit| edit.paragraph_id.clone()).collect();
+            // Synthesised paragraphs have no baseline to compare against, and
+            // the engine marks them with an `N` id; deleted ones legitimately
+            // take their protected nodes with them.
+            if part_key == "document" {
+                targeted.extend(structure.deleted.iter().cloned());
+            }
+            // With structural edits the baseline for the comparison is the part
+            // with BOTH the island and the structural edits applied, not the raw
+            // template. Inserting a paragraph renumbers the ones after it —
+            // measured: the same protected node reads as `P1` before and `P2`
+            // after — so comparing against the template would call every shifted
+            // paragraph changed. This is the base the byte-range check used, kept
+            // for the same reason.
+            let baseline = if part_key == "document" && !structure.is_empty() {
                 recompute_edited_part(&template_part, &edits).and_then(|applied| {
                     let spans = structure_spans(&applied, structure)?;
-                    replay_opaque_blocks(&applied, &output_part, "document", &spans)
+                    apply_spans(&applied, &spans)
                 })
             } else {
-                check_opaque_replay(&template_part, &output_part, &edits)
+                Ok(template_part.clone())
             };
+            // The edits' byte spans, in the baseline's coordinates: they decide
+            // which opaque interiors are containers of an edit rather than
+            // locked bytes beside it.
+            let spans: Vec<(usize, usize)> = {
+                let mut collected = Vec::new();
+                for edit in &edits {
+                    if let Ok(ranges) = edit_run_ranges(&template_part, &part_key, edit) {
+                        collected.extend(ranges);
+                    }
+                }
+                collected
+            };
+            let replay = baseline.and_then(|baseline| {
+                check_protected_structure(&baseline, &output_part, &part_key, &targeted, &spans)
+            });
             match replay {
                 Ok(()) => {}
                 Err(message) => {
@@ -329,14 +365,46 @@ impl IndependentVerifier {
                     break;
                 }
             }
+            // Nothing outside the edit's own paragraphs may change. Same
+            // structural baseline: a structural edit renumbers the paragraphs
+            // after it, and this compares by id.
+            let untouched = if part_key == "document" && !structure.is_empty() {
+                recompute_edited_part(&template_part, &edits).and_then(|applied| {
+                    let spans = structure_spans(&applied, structure)?;
+                    apply_spans(&applied, &spans)
+                })
+            } else {
+                Ok(template_part.clone())
+            };
+            let untouched = untouched.and_then(|baseline| {
+                check_non_target_preserved(&baseline, &output_part, &part_key, &spans)
+            });
+            match untouched {
+                Ok(()) => {}
+                Err(message) => {
+                    untouched_preserved = false;
+                    untouched_detail = format!("part {part_path}: {message}");
+                    break;
+                }
+            }
         }
         checks.push(VerificationCheck {
-            name: "opaque-interiors-replayed".to_string(),
+            name: "protected-structure-preserved".to_string(),
             status: if opaque_locked { "pass" } else { "fail" }.to_string(),
             detail: Some(if opaque_detail.is_empty() {
-                "all opaque field/math/drawing interiors byte-replayed".to_string()
+                "anchors, hyperlink targets and locked interiors all survived the edit".to_string()
             } else {
                 opaque_detail
+            }),
+        });
+
+        checks.push(VerificationCheck {
+            name: "non-target-preserved".to_string(),
+            status: if untouched_preserved { "pass" } else { "fail" }.to_string(),
+            detail: Some(if untouched_detail.is_empty() {
+                "text and run properties outside the edited paragraphs are unchanged".to_string()
+            } else {
+                untouched_detail
             }),
         });
 
@@ -453,6 +521,10 @@ pub struct IslandEdit {
     pub old: String,
     pub new: String,
     pub tracked: bool,
+    /// Who the revision says made it, and when. Part of the edit's claim, so the
+    /// verifier has to see them to check them.
+    pub author: String,
+    pub date: String,
 }
 
 const ISLANDS_SCHEMA: &str = "docx2typed-islands-1";
@@ -485,6 +557,16 @@ fn load_islands(workdir: &Path) -> Option<Vec<IslandEdit>> {
                 old,
                 new,
                 tracked,
+                author: edit
+                    .get("author")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                date: edit
+                    .get("date")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
             });
         }
     }
@@ -828,12 +910,26 @@ fn verify_tracked_part(output_part: &[u8], edits: &[&IslandEdit]) -> Result<(), 
         if !xml.contains("<w:del") || !xml.contains("<w:ins") {
             return Err("tracked output is missing w:del/w:ins containers".to_string());
         }
-        if !xml.contains(&format!("<w:delText>{old}</w:delText>"))
-            && !xml.contains(&format!(
-                "<w:delText xml:space=\"preserve\">{old}</w:delText>"
-            ))
-        {
+        if !deletion_covers(&xml, &old) {
             return Err(format!("tracked deletion text {:?} is missing", edit.old));
+        }
+        // The revision's IDENTITY is part of the claim, and it is checked on the
+        // revision THIS edit produced — the `del` carrying its old text and the
+        // `ins` carrying its new one. A document-wide search for the author
+        // would accept a tampered revision whenever any other revision still
+        // carried the value: measured, changing one `w:author` passed.
+        let revision = revision_for(&xml, &old, &new)?;
+        if !edit.author.is_empty() && revision.author != xml_escape(&edit.author) {
+            return Err(format!(
+                "tracked revision says author {:?}, the edit recorded {:?}",
+                revision.author, edit.author
+            ));
+        }
+        if !edit.date.is_empty() && revision.date != xml_escape(&edit.date) {
+            return Err(format!(
+                "tracked revision says date {:?}, the edit recorded {:?}",
+                revision.date, edit.date
+            ));
         }
         if !xml.contains(&format!("<w:t>{new}</w:t>"))
             && !xml.contains(&format!("<w:t xml:space=\"preserve\">{new}</w:t>"))
@@ -842,6 +938,281 @@ fn verify_tracked_part(output_part: &[u8], edits: &[&IslandEdit]) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// The revision an edit produced, and the identity it claims.
+struct ProducedRevision {
+    author: String,
+    date: String,
+}
+
+/// Read the identity off the revision THIS edit produced.
+///
+/// A deletion that crosses runs is one `w:del` PER RUN — wrapping each run is
+/// what keeps whatever sits between runs intact — so the deletion is a run of
+/// elements whose `delText` bodies join to `old`, not one element. All of them
+/// belong to the same edit and must agree about who made it.
+fn revision_for(xml: &str, old: &str, new: &str) -> Result<ProducedRevision, String> {
+    let deleted = xml_escape(old);
+    let mut joined = String::new();
+    let mut identity: Option<ProducedRevision> = None;
+    let mut rest = xml;
+    while let Some(start) = rest.find("<w:del ") {
+        let Some(tag_end) = rest[start..].find('>') else {
+            break;
+        };
+        let tag = &rest[start..start + tag_end + 1];
+        let Some(body_end) = rest[start..].find("</w:del>") else {
+            break;
+        };
+        let body = &rest[start + tag_end + 1..start + body_end];
+        let text = inner_text(body, "w:delText");
+        let found = ProducedRevision {
+            author: attribute(tag, "w:author").unwrap_or_default(),
+            date: attribute(tag, "w:date").unwrap_or_default(),
+        };
+        match &identity {
+            Some(seen)
+                if (seen.author.as_str(), seen.date.as_str())
+                    != (found.author.as_str(), found.date.as_str()) =>
+            {
+                return Err("the runs of one deletion disagree about who made it".to_string())
+            }
+            _ => identity = Some(found),
+        }
+        joined.push_str(&text);
+        if joined == deleted {
+            break;
+        }
+        rest = &rest[start + body_end + "</w:del>".len()..];
+    }
+    let deleted_identity =
+        identity.ok_or_else(|| format!("no w:del carries the deleted text {old:?}"))?;
+    if joined != deleted {
+        return Err(format!(
+            "the deletion markup reads {joined:?}, the edit recorded {old:?}"
+        ));
+    }
+
+    // The insertion is one element: the new text is written once, in the run
+    // that carries the match's style.
+    let inserted = xml_escape(new);
+    let mut rest = xml;
+    while let Some(start) = rest.find("<w:ins ") {
+        let Some(tag_end) = rest[start..].find('>') else {
+            break;
+        };
+        let tag = &rest[start..start + tag_end + 1];
+        let Some(body_end) = rest[start..].find("</w:ins>") else {
+            break;
+        };
+        let body = &rest[start + tag_end + 1..start + body_end];
+        if inner_text(body, "w:t") == inserted {
+            let ins = ProducedRevision {
+                author: attribute(tag, "w:author").unwrap_or_default(),
+                date: attribute(tag, "w:date").unwrap_or_default(),
+            };
+            if (
+                deleted_identity.author.as_str(),
+                deleted_identity.date.as_str(),
+            ) != (ins.author.as_str(), ins.date.as_str())
+            {
+                return Err(format!(
+                    "the deletion and the insertion disagree about who made the edit \
+                     ({:?}/{:?} vs {:?}/{:?})",
+                    deleted_identity.author, deleted_identity.date, ins.author, ins.date
+                ));
+            }
+            return Ok(deleted_identity);
+        }
+        rest = &rest[start + body_end + "</w:ins>".len()..];
+    }
+    Err(format!("no w:ins carries the inserted text {new:?}"))
+}
+
+/// The text bodies of one tag inside a fragment, joined.
+fn inner_text(fragment: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut collected = String::new();
+    let mut cursor = fragment;
+    while let Some(inner) = cursor.find(&open) {
+        let Some(gt) = cursor[inner..].find('>') else {
+            break;
+        };
+        let from = inner + gt + 1;
+        let Some(end) = cursor[from..].find(&close) else {
+            break;
+        };
+        collected.push_str(&cursor[from..from + end]);
+        cursor = &cursor[from + end + close.len()..];
+    }
+    collected
+}
+
+/// One attribute's value from an element's opening tag.
+fn attribute(tag: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// One paragraph as the untouched zone sees it: its text and the run properties
+/// it carries, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParagraphShape {
+    text: String,
+    run_properties: Vec<String>,
+    start: usize,
+    end: usize,
+}
+
+/// Every paragraph's shape, keyed by id.
+fn paragraph_shapes(part: &[u8], part_key: &str) -> Result<Vec<ParagraphShape>, String> {
+    let mut shapes = Vec::new();
+    for (_paragraph_id, start, end) in locate_paragraphs(part, part_key)? {
+        let paragraph = &part[start..end];
+        let tags = scan_tags(paragraph);
+        let tree = build_light_tree(&tags)?;
+        let root = tree
+            .iter()
+            .position(|node| node.parent.is_none())
+            .ok_or("no root")?;
+        let mut text = String::new();
+        let mut run_properties = Vec::new();
+        collect_shape(part, start, root, &tree, &mut text, &mut run_properties);
+        shapes.push(ParagraphShape {
+            text,
+            run_properties,
+            start,
+            end,
+        });
+    }
+    Ok(shapes)
+}
+
+fn collect_shape(
+    part: &[u8],
+    paragraph_start: usize,
+    node: usize,
+    tree: &[LightNode],
+    text: &mut String,
+    run_properties: &mut Vec<String>,
+) {
+    let current = &tree[node];
+    for &child in &current.children {
+        let child_node = &tree[child];
+        match child_node.name.as_str() {
+            // The text a reader sees: a deletion revision's `delText` is not it.
+            "t" => {
+                text.push_str(&String::from_utf8_lossy(
+                    &part[paragraph_start + child_node.open_end..paragraph_start + child_node.end],
+                ));
+            }
+            "rPr" => {
+                run_properties.push(
+                    String::from_utf8_lossy(
+                        &part[paragraph_start + child_node.open_start
+                            ..paragraph_start + child_node.end],
+                    )
+                    .into_owned(),
+                );
+            }
+            _ => collect_shape(part, paragraph_start, child, tree, text, run_properties),
+        }
+    }
+}
+
+/// Nothing outside the edit's own paragraphs may change: not the text a reader
+/// sees, not the run properties a run carries.
+///
+/// This is the invariant no other check covered. `parts-match-template-except-
+/// edited` compares the OTHER parts, and the edited part is the whole of
+/// `document.xml`, so a run property changed three paragraphs away was invisible
+/// — measured: adding `<w:u w:val="double"/>` to an untouched run verified clean.
+///
+/// The edited paragraphs are exempt on purpose: a tracked edit legitimately
+/// re-wraps them, carrying each covered run's properties into the `w:del` and
+/// the insertion, so their property MULTISET changes while the document's
+/// meaning does not.
+fn check_non_target_preserved(
+    baseline: &[u8],
+    output_part: &[u8],
+    part_key: &str,
+    spans: &[(usize, usize)],
+) -> Result<(), String> {
+    let before = paragraph_shapes(baseline, part_key)?;
+    let after = paragraph_shapes(output_part, part_key)?;
+    // The baseline here is the part with every edit already applied, so the two
+    // sides walk the same paragraphs in the same order. Pairing by ORDER is
+    // deliberate: the ids this walker assigns are its own (`P1` for a text box
+    // the engine calls `B0.P0`), so an id-keyed comparison exempts the wrong
+    // paragraph and reports the edit itself as a change — measured on
+    // `boxes.docx`.
+    if before.len() != after.len() {
+        return Err(format!(
+            "paragraph count changed outside the edit ({} before, {} after)",
+            before.len(),
+            after.len()
+        ));
+    }
+    for (index, shape) in before.iter().enumerate() {
+        // An edit inside this paragraph — containment, which is what decides it,
+        // not the id.
+        if spans
+            .iter()
+            .any(|(start, end)| shape.start <= *start && *end <= shape.end)
+        {
+            continue;
+        }
+        let actual = &after[index];
+        if actual.text != shape.text {
+            return Err(format!(
+                "paragraph {index}: text outside the edit changed ({:?} -> {:?})",
+                shape.text, actual.text
+            ));
+        }
+        if actual.run_properties != shape.run_properties {
+            return Err(format!(
+                "paragraph {index}: run properties outside the edit changed ({} before, {} after)",
+                shape.run_properties.len(),
+                actual.run_properties.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// true when the deletion markup carries `escaped_old`.
+///
+/// A deletion that crosses runs is emitted as one `w:del` per run — wrapping
+/// each run is what keeps whatever sits BETWEEN runs (bookmarks, comment
+/// anchors) intact — so the recorded text is the JOIN of their `delText`, not
+/// one element. Reading them in document order and joining is the same
+/// assertion the single-element form made.
+fn deletion_covers(xml: &str, escaped_old: &str) -> bool {
+    if xml.contains(&format!("<w:delText>{escaped_old}</w:delText>"))
+        || xml.contains(&format!(
+            "<w:delText xml:space=\"preserve\">{escaped_old}</w:delText>"
+        ))
+    {
+        return true;
+    }
+    let mut joined = String::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find("<w:delText") {
+        let after = &rest[open..];
+        let Some(gt) = after.find('>') else { break };
+        let body_start = open + gt + 1;
+        let Some(close) = rest[body_start..].find("</w:delText>") else {
+            break;
+        };
+        joined.push_str(&rest[body_start..body_start + close]);
+        rest = &rest[body_start + close + "</w:delText>".len()..];
+    }
+    joined.contains(escaped_old)
 }
 
 fn part_key_from_path(path: &str) -> Option<String> {
@@ -874,12 +1245,22 @@ fn recompute_edited_part(template_part: &[u8], edits: &[&IslandEdit]) -> Result<
                 edit.paragraph_id, edit.leaf_index
             ));
         }
-        let (start, end) = find_old(template_part, leaf.text_start, leaf.text_end, &edit.old)?;
-        let replacement = xml_escape(&edit.new).into_bytes();
-        spans.push((start, end, replacement));
-        if needs_xml_space(&edit.new) {
-            if let Some(tag_span) = inject_xml_space(template_part, leaf.open_end) {
-                spans.push(tag_span);
+        // The new text takes the first covered run's place; every later covered
+        // run is emptied. One run covered is the ordinary case, and produces the
+        // single span this always produced.
+        let new_bytes = xml_escape(&edit.new).into_bytes();
+        let mut covered = edit_run_ranges(template_part, &edit.part, edit)?;
+        covered.sort_by_key(|(start, _)| *start);
+        for (position, (start, end)) in covered.into_iter().enumerate() {
+            if position == 0 {
+                spans.push((start, end, new_bytes.clone()));
+                if needs_xml_space(&edit.new) {
+                    if let Some(tag_span) = inject_xml_space(template_part, leaf.open_end) {
+                        spans.push(tag_span);
+                    }
+                }
+            } else {
+                spans.push((start, end, Vec::new()));
             }
         }
     }
@@ -889,82 +1270,293 @@ fn recompute_edited_part(template_part: &[u8], edits: &[&IslandEdit]) -> Result<
     }
     Ok(work)
 }
-
-/// Opaque replay check: every opaque block of the template part must appear
-/// verbatim in the output at its shifted position (shifts come only from
-/// the recorded leaf replacements before it).
-fn check_opaque_replay(
-    template_part: &[u8],
-    output_part: &[u8],
-    edits: &[&IslandEdit],
-) -> Result<(), String> {
-    let part_key = edits
-        .first()
-        .map(|edit| edit.part.as_str())
-        .unwrap_or("document");
-    // Shifts contributed by edits at or before a byte position.
-    let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-    for edit in edits {
-        let (leaf, _) = locate_leaf(
-            template_part,
-            &edit.part,
-            &edit.paragraph_id,
-            edit.leaf_index,
-        )?;
-        let (start, end) = find_old(template_part, leaf.text_start, leaf.text_end, &edit.old)?;
-        spans.push((start, end, xml_escape(&edit.new).into_bytes()));
-    }
-    spans.sort_by_key(|(start, _, _)| *start);
-    replay_opaque_blocks(template_part, output_part, part_key, &spans)
+/// One protected node, identified by what it IS rather than where it sits.
+///
+/// Comparing positions is what broke the old check: a tracked edit rewrites a
+/// run into `w:del` + `w:ins`, so every byte after it moves by an amount that
+/// depends on the WRAPPING, and estimating that from `xml_escape(new)` is wrong
+/// by construction. Identity survives re-wrapping; position does not.
+#[derive(Clone, Debug)]
+struct ProtectedNode {
+    paragraph_id: String,
+    /// Element name for an anchor, `opaque` for a locked interior.
+    kind: String,
+    /// The attributes that make this node that node (`w:id`, `w:name`, the
+    /// hyperlink's `r:id`), or the bytes' digest for an opaque interior.
+    identity: String,
+    /// Byte range in the part it was read from. Used only to ask whether an
+    /// edit lies INSIDE this node — a containment test, not a shift estimate.
+    /// Deliberately NOT part of equality: the range moves when the edit re-wraps
+    /// the text around this node, and comparing it would report every node as
+    /// having changed. Measured: it made the check reject its own clean output.
+    start: usize,
+    end: usize,
 }
 
-/// The shared opaque-replay walk: each opaque block of `base` must appear
-/// verbatim in the output at its shifted position, and no recorded span may
-/// cross one partially.
-fn replay_opaque_blocks(
-    base: &[u8],
+/// Two protected nodes are the same node when they ARE the same node — same
+/// paragraph, same kind, same identifying attributes. Where they sit is not
+/// part of that.
+impl PartialEq for ProtectedNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.paragraph_id == other.paragraph_id
+            && self.kind == other.kind
+            && self.identity == other.identity
+    }
+}
+
+impl Eq for ProtectedNode {}
+
+/// Every protected node of one part, in document order.
+///
+/// The set is the one the byte-range check used — anchors, hyperlink ranges,
+/// opaque interiors — read as identities. Anchors are recognised by their
+/// attributes rather than their bytes, so a rewrite that moves them keeps them.
+fn protected_nodes(part: &[u8], part_key: &str) -> Result<Vec<ProtectedNode>, String> {
+    let mut nodes = Vec::new();
+    let paragraphs = locate_paragraphs(part, part_key)?;
+    for (paragraph_id, start, end) in paragraphs {
+        let paragraph = &part[start..end];
+        let tags = scan_tags(paragraph);
+        let tree = build_light_tree(&tags)?;
+        let root = tree
+            .iter()
+            .position(|node| node.parent.is_none())
+            .ok_or("no root")?;
+        collect_protected(part, start, root, &tree, &paragraph_id, &mut nodes)?;
+    }
+    Ok(nodes)
+}
+
+fn collect_protected(
+    part: &[u8],
+    paragraph_start: usize,
+    node: usize,
+    tree: &[LightNode],
+    paragraph_id: &str,
+    out: &mut Vec<ProtectedNode>,
+) -> Result<(), String> {
+    let current = &tree[node];
+    for &child in &current.children {
+        let child_node = &tree[child];
+        let name = child_node.name.as_str();
+        match name {
+            "pPr" => {}
+            // The immutable anchors: same id, same pairing, same relative order.
+            // Their POSITION may move — a legal edit re-wraps the text around
+            // them — so only identity is compared here.
+            "bookmarkStart" | "bookmarkEnd" | "commentRangeStart" | "commentRangeEnd" => {
+                out.push(ProtectedNode {
+                    paragraph_id: paragraph_id.to_string(),
+                    kind: name.to_string(),
+                    identity: identity_attributes(
+                        &part[paragraph_start + child_node.open_start
+                            ..paragraph_start + child_node.open_end],
+                        name,
+                    ),
+                    start: paragraph_start + child_node.open_start,
+                    end: paragraph_start + child_node.end,
+                });
+            }
+            // A hyperlink is a range whose target is a relationship: the r:id
+            // must survive, or the link points somewhere else.
+            "hyperlink" => {
+                out.push(ProtectedNode {
+                    paragraph_id: paragraph_id.to_string(),
+                    kind: name.to_string(),
+                    identity: identity_attributes(
+                        &part[paragraph_start + child_node.open_start
+                            ..paragraph_start + child_node.open_end],
+                        name,
+                    ),
+                    start: paragraph_start + child_node.open_start,
+                    end: paragraph_start + child_node.end,
+                });
+                collect_protected(part, paragraph_start, child, tree, paragraph_id, out)?;
+            }
+            // Revision wrappers are the one thing an edit is allowed to ADD, so
+            // they are walked through rather than counted.
+            "ins" | "del" | "moveFrom" | "moveTo" => {
+                collect_protected(part, paragraph_start, child, tree, paragraph_id, out)?;
+            }
+            // Proofing marks are Word's, not the document's: they come and go.
+            "proofErr" => {}
+            "r" => {
+                let opaque = child_node
+                    .children
+                    .iter()
+                    .any(|&grand| !KNOWN_RUN_CHILDREN.contains(&tree[grand].name.as_str()));
+                if opaque {
+                    out.push(opaque_identity(
+                        part,
+                        paragraph_start,
+                        child_node,
+                        paragraph_id,
+                    ));
+                }
+            }
+            _ => out.push(opaque_identity(
+                part,
+                paragraph_start,
+                child_node,
+                paragraph_id,
+            )),
+        }
+    }
+    Ok(())
+}
+
+fn opaque_identity(
+    part: &[u8],
+    paragraph_start: usize,
+    node: &LightNode,
+    paragraph_id: &str,
+) -> ProtectedNode {
+    let bytes = &part[paragraph_start + node.open_end..paragraph_start + node.end];
+    ProtectedNode {
+        paragraph_id: paragraph_id.to_string(),
+        kind: "opaque".to_string(),
+        identity: format!("{}:{}", node.name, bytes_sha256(bytes)),
+        start: paragraph_start + node.open_start,
+        end: paragraph_start + node.end,
+    }
+}
+
+/// The attributes that identify one anchor, in a stable order.
+///
+/// Only the identity-carrying attributes are read, so an edit that re-writes the
+/// surrounding XML but leaves the anchor alone compares equal.
+fn identity_attributes(tag: &[u8], name: &str) -> String {
+    let text = String::from_utf8_lossy(tag);
+    let wanted: &[&str] = match name {
+        "bookmarkStart" => &["w:id", "w:name"],
+        "bookmarkEnd" => &["w:id"],
+        "commentRangeStart" | "commentRangeEnd" => &["w:id"],
+        "hyperlink" => &["r:id", "w:anchor"],
+        _ => &[],
+    };
+    let mut parts = Vec::new();
+    for key in wanted {
+        let needle = format!("{key}=\"");
+        if let Some(start) = text.find(&needle) {
+            let rest = &text[start + needle.len()..];
+            if let Some(end) = rest.find('"') {
+                parts.push(format!("{key}={}", &rest[..end]));
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+/// The protected structure of a part must survive an edit: nothing lost, nothing
+/// reordered — and it must survive RE-WRAPPING, which is what a tracked edit
+/// does to everything around it.
+///
+/// `targeted` names the paragraphs the edit declared. In those, the template's
+/// protected nodes must appear in the same relative order (an edit may move
+/// them; it may not drop, reorder or invent them). Everywhere else the lists
+/// must be equal outright. Synthesised paragraphs (`N`) have no baseline and are
+/// out of scope.
+fn check_protected_structure(
+    template_part: &[u8],
     output_part: &[u8],
     part_key: &str,
-    spans: &[(usize, usize, Vec<u8>)],
+    targeted: &[String],
+    spans: &[(usize, usize)],
 ) -> Result<(), String> {
-    let opaques = opaque_blocks(base, part_key)?;
-    for block in &opaques {
-        let contains_edit = spans
-            .iter()
-            .any(|(start, end, _)| block.start <= *start && *end <= block.end);
-        let partial_overlap = spans.iter().any(|(start, end, _)| {
-            (*start < block.end && block.start < *end)
-                && !(block.start <= *start && *end <= block.end)
-        });
-        if partial_overlap {
-            return Err(format!(
-                "opaque block {} ({}) is partially crossed by an edit",
-                block.tag, block.paragraph_id
-            ));
+    let before = protected_nodes(template_part, part_key)?;
+    let after = protected_nodes(output_part, part_key)?;
+    // An edit INSIDE an opaque interior rewrites that interior's bytes: a text
+    // box's paragraph (`B0.P0`) lives inside the `w:pict` run of the paragraph
+    // that owns it, so editing the box legitimately changes the drawing. The
+    // proof for such an edit is the leaf range, not byte identity of the
+    // container — this is a containment test, not the shift estimate the rest of
+    // this check exists to avoid.
+    let containers_of_edits: Vec<&ProtectedNode> = before
+        .iter()
+        .filter(|node| {
+            node.kind == "opaque"
+                && spans
+                    .iter()
+                    .any(|(start, end)| node.start <= *start && *end <= node.end)
+        })
+        .collect();
+    let is_targeted = |node: &ProtectedNode| {
+        node.paragraph_id.starts_with('N')
+            || targeted.contains(&node.paragraph_id)
+            || containers_of_edits
+                .iter()
+                .any(|container| container.paragraph_id == node.paragraph_id)
+    };
+
+    // Untouched paragraphs, compared ONE PARAGRAPH AT A TIME.
+    //
+    // Not as one list over the whole part: a structural edit inserts or removes
+    // a paragraph and shifts everything after it, so a global comparison reads
+    // the same nodes in a different order and calls it a change. Measured: an
+    // insert reported the identical identities as both "missing" and "added".
+    // Order WITHIN a paragraph is protected; order BETWEEN them is not.
+    let per_paragraph = |nodes: &[ProtectedNode]| {
+        let mut map: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for node in nodes.iter().filter(|node| !is_targeted(node)) {
+            map.entry(node.paragraph_id.clone())
+                .or_default()
+                .push(format!("{}:{}", node.kind, node.identity));
         }
-        if contains_edit {
-            // Text-box / content-control bridge: the block's interior prose
-            // is the documented editable surface (B0.P0 lives inside the
-            // w:pict run); the edit proof covers the leaf range.
+        map
+    };
+    let untouched_before = per_paragraph(&before);
+    let untouched_after = per_paragraph(&after);
+    if untouched_before != untouched_after {
+        let changed: Vec<_> = untouched_before
+            .iter()
+            .filter(|(id, nodes)| untouched_after.get(*id) != Some(nodes))
+            .map(|(id, nodes)| {
+                format!(
+                    "{id} was {nodes:?}, is {:?}",
+                    untouched_after.get(id).cloned().unwrap_or_default()
+                )
+            })
+            .take(3)
+            .collect();
+        return Err(format!(
+            "protected structure changed outside the edited paragraphs: {changed:?}"
+        ));
+    }
+
+    // Edited paragraphs: the template's nodes must still be there, in order.
+    for paragraph_id in targeted {
+        let expect: Vec<&ProtectedNode> = before
+            .iter()
+            .filter(|node| node.paragraph_id == *paragraph_id)
+            .collect();
+        if expect.is_empty() {
             continue;
         }
-        let shift: i64 = spans
+        let actual: Vec<&ProtectedNode> = after
             .iter()
-            .filter(|(_, end, _)| *end <= block.start)
-            .map(|(start, end, replacement)| replacement.len() as i64 - (end - start) as i64)
-            .sum();
-        let out_start = block.start as i64 + shift;
-        let out_end = block.end as i64 + shift;
-        if out_start < 0 || out_end > output_part.len() as i64 {
-            return Err(format!("opaque block {} out of range in output", block.tag));
-        }
-        let expected = &base[block.start..block.end];
-        let actual = &output_part[out_start as usize..out_end as usize];
-        if expected != actual {
-            return Err(format!(
-                "opaque block {} ({}) not byte-replayed",
-                block.tag, block.paragraph_id
-            ));
+            .filter(|node| node.paragraph_id == *paragraph_id)
+            .collect();
+        let mut cursor = 0usize;
+        for node in &expect {
+            match actual[cursor..]
+                .iter()
+                .position(|candidate| candidate == node)
+            {
+                Some(offset) => cursor += offset + 1,
+                None => {
+                    return Err(format!(
+                        "{paragraph_id}: protected {} {} did not survive the edit \
+                         (present after: {:?})",
+                        node.kind,
+                        node.identity,
+                        actual
+                            .iter()
+                            .map(|candidate| format!("{}:{}", candidate.kind, candidate.identity))
+                            .collect::<Vec<_>>()
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -978,14 +1570,16 @@ struct LocatedLeaf {
     open_end: usize,
 }
 
-/// Locate a paragraph's leaf in one part's bytes (independent port of the
+/// Locate EVERY leaf of one paragraph, in order (independent port of the
 /// locator discipline: paragraph ids, box/sdt/cell paths, leaf ordinals).
-fn locate_leaf(
+///
+/// `locate_leaf` picks one by ordinal; an edit that crosses runs needs the whole
+/// list, because which runs it covers is exactly what has to be resolved.
+fn locate_paragraph_leaves(
     part: &[u8],
     part_key: &str,
     paragraph_id: &str,
-    leaf_index: usize,
-) -> Result<(LocatedLeaf, ()), String> {
+) -> Result<Vec<LocatedLeaf>, String> {
     let paragraphs = locate_paragraphs(part, part_key)?;
     let Some((start, end)) = paragraphs
         .iter()
@@ -1001,7 +1595,7 @@ fn locate_leaf(
     let _in_run = false;
     let mut rpr_ok = true;
     let _leaves: Vec<LocatedLeaf> = Vec::new();
-    let mut found: Option<LocatedLeaf> = None;
+    let mut leaves: Vec<LocatedLeaf> = Vec::new();
     let _index = 0usize;
     let opaque_children = false;
     // Reuse the tree walk: build a light element list for the paragraph.
@@ -1013,7 +1607,6 @@ fn locate_leaf(
     let mut opaque_ranges: Vec<(usize, usize)> = Vec::new();
     collect_opaque_ranges(root, &nodes, &mut opaque_ranges, &mut rpr_ok);
     // walk runs
-    let mut leaf_cursor = 0usize;
     for node in nodes.iter() {
         if node.name != "r" {
             continue;
@@ -1038,19 +1631,28 @@ fn locate_leaf(
                     && !opaque_ranges.iter().any(|(start, end)| {
                         child_node.open_start >= *start && child_node.end <= *end
                     });
-                if leaf_cursor == leaf_index {
-                    found = Some(LocatedLeaf {
-                        editable,
-                        text_start: start + text_start,
-                        text_end: start + text_end,
-                        open_end: start + child_node.open_end,
-                    });
-                }
-                leaf_cursor += 1;
+                leaves.push(LocatedLeaf {
+                    editable,
+                    text_start: start + text_start,
+                    text_end: start + text_end,
+                    open_end: start + child_node.open_end,
+                });
             }
         }
     }
-    found
+    Ok(leaves)
+}
+
+/// Locate one paragraph's leaf by ordinal.
+fn locate_leaf(
+    part: &[u8],
+    part_key: &str,
+    paragraph_id: &str,
+    leaf_index: usize,
+) -> Result<(LocatedLeaf, ()), String> {
+    locate_paragraph_leaves(part, part_key, paragraph_id)?
+        .into_iter()
+        .nth(leaf_index)
         .map(|leaf| (leaf, ()))
         .ok_or_else(|| format!("leaf {leaf_index} not found in {paragraph_id}"))
 }
@@ -1154,40 +1756,6 @@ fn collect_opaque_ranges(
         }
     }
 }
-
-fn opaque_blocks(part: &[u8], part_key: &str) -> Result<Vec<OpaqueBlock>, String> {
-    let mut blocks = Vec::new();
-    let paragraphs = locate_paragraphs(part, part_key)?;
-    for (paragraph_id, start, end) in paragraphs {
-        let paragraph = &part[start..end];
-        let tags = scan_tags(paragraph);
-        let nodes = build_light_tree(&tags)?;
-        let root = nodes
-            .iter()
-            .position(|node| node.parent.is_none())
-            .ok_or("no root")?;
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        let mut _rpr_ok = true;
-        collect_opaque_ranges(root, &nodes, &mut ranges, &mut _rpr_ok);
-        for (block_start, block_end) in ranges {
-            blocks.push(OpaqueBlock {
-                tag: "opaque".to_string(),
-                paragraph_id: paragraph_id.clone(),
-                start: start + block_start,
-                end: start + block_end,
-            });
-        }
-    }
-    Ok(blocks)
-}
-
-struct OpaqueBlock {
-    tag: String,
-    paragraph_id: String,
-    start: usize,
-    end: usize,
-}
-
 /// Scan one part into paragraphs (independent port of the full recursive
 /// locator: direct body paragraphs, table-cell paragraphs with nested
 /// tables, text-box paragraphs, content-control paragraphs, and
@@ -1628,30 +2196,87 @@ fn inject_xml_space(part: &[u8], open_end: usize) -> Option<(usize, usize, Vec<u
     Some((tag_start, open_end, out))
 }
 
-/// Entity-aware old-text search inside a leaf's byte range.
-fn find_old(
+/// The byte range of every run one recorded edit covers, in order.
+///
+/// `old` may start in one run and end in another: a Word paragraph splits its
+/// text at every formatting change, so a phrase a human typed in Word routinely
+/// crosses runs, and the recorded `leaf_index` is the run it starts in. The
+/// covered texts concatenated equal `old`.
+///
+/// This is the verifier's own walk — it must reach the same runs Core's applier
+/// did, or the byte-exact check compares against a different edit than the one
+/// that was applied.
+fn edit_run_ranges(
     part: &[u8],
-    text_start: usize,
-    text_end: usize,
-    old: &str,
-) -> Result<(usize, usize), String> {
-    if old.is_empty() {
+    part_key: &str,
+    edit: &IslandEdit,
+) -> Result<Vec<(usize, usize)>, String> {
+    if edit.old.is_empty() {
         return Err("empty old text".to_string());
     }
-    let (decoded, char_bytes) = decode_text(&part[text_start..text_end])?;
-    // `match_indices` yields BYTE indices; translate to decoded char index
-    // (CJK text is multi-byte).
-    let mut matches = decoded.match_indices(old);
-    let Some((byte_index, _)) = matches.next() else {
-        return Err(format!("old text {:?} not found in leaf", old));
-    };
-    if matches.next().is_some() {
-        return Err("old text occurs more than once in the leaf".to_string());
+    let leaves = locate_paragraph_leaves(part, part_key, &edit.paragraph_id)?;
+    if edit.leaf_index >= leaves.len() {
+        return Err(format!(
+            "leaf {} not found in {}",
+            edit.leaf_index, edit.paragraph_id
+        ));
     }
-    let char_index = decoded[..byte_index].chars().count();
-    let byte_start = char_bytes[char_index].0 + text_start;
-    let byte_end = char_bytes[char_index + old.chars().count() - 1].1 + text_start;
-    Ok((byte_start, byte_end))
+    let mut found: Option<Vec<(usize, usize)>> = None;
+    for start in edit.leaf_index..leaves.len() {
+        let first = &leaves[start];
+        let (_, first_chars) = decode_text(&part[first.text_start..first.text_end])?;
+        let first_len = first_chars.len();
+        let mut accumulated = String::new();
+        let mut before_last = 0usize;
+        for end in start..leaves.len() {
+            if end > start {
+                let previous = &leaves[end - 1];
+                let (text, _) = decode_text(&part[previous.text_start..previous.text_end])?;
+                before_last += text.chars().count();
+            }
+            let (text, _) = decode_text(&part[leaves[end].text_start..leaves[end].text_end])?;
+            accumulated.push_str(&text);
+            let Some(byte_pos) = accumulated.find(&edit.old) else {
+                continue;
+            };
+            let head = accumulated[..byte_pos].chars().count();
+            let covered = edit.old.chars().count();
+            // The match must start inside the FIRST run and finish inside the
+            // LAST one; anything else belongs to a later start.
+            if head >= first_len || head + covered <= before_last {
+                break;
+            }
+            if found.is_some() {
+                return Err(
+                    "old text occurs more than once across the runs of this paragraph".to_string(),
+                );
+            }
+            let tail = head + covered - before_last;
+            let mut ranges = Vec::new();
+            for (offset, leaf) in leaves[start..=end].iter().enumerate() {
+                let is_first = offset == 0;
+                let is_last = offset == end - start;
+                let (text, char_bytes) = decode_text(&part[leaf.text_start..leaf.text_end])?;
+                let len = text.chars().count();
+                let from = if is_first { head } else { 0 };
+                let to = if is_last { tail } else { len };
+                if to <= from {
+                    continue;
+                }
+                let byte_start = char_bytes[from].0 + leaf.text_start;
+                let byte_end = char_bytes[to - 1].1 + leaf.text_start;
+                ranges.push((byte_start, byte_end));
+            }
+            found = Some(ranges);
+            break;
+        }
+    }
+    found.ok_or_else(|| {
+        format!(
+            "old text {:?} not found in paragraph {}",
+            edit.old, edit.paragraph_id
+        )
+    })
 }
 
 fn decode_text(raw: &[u8]) -> Result<(String, Vec<(usize, usize)>), String> {

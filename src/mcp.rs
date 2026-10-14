@@ -376,11 +376,31 @@ impl McpSession {
                 build_commit,
             );
         }
-        if self.workdir.is_some() {
-            return self.failure(
+        if let Some(open) = self.workdir.clone() {
+            // One connection drives one workdir. Saying only "already open" left
+            // a session believing the block was transient — it retried with a
+            // forked copy, then moved the directories around on disk to get
+            // past it. Name the workdir that is open and the way forward.
+            return self.tool_result(
                 "workdir_open",
-                "workdir-already-open",
-                "this MCP connection already has an open workdir",
+                "failure",
+                Value::Object(Default::default()),
+                vec![Diagnostic::with_details(
+                    "workdir-already-open",
+                    format!(
+                        "this connection already drives {open}, and one connection drives one \
+                         workdir for its whole lifetime"
+                    ),
+                    Some(json!({ "open_workdir": open })),
+                    Some(vec![
+                        "keep working in the open workdir; it is the one the session state, \
+                         draft and store belong to"
+                            .to_string(),
+                        "to drive another workdir, start a second server process for it"
+                            .to_string(),
+                    ]),
+                )],
+                true,
                 build_commit,
             );
         }
@@ -390,8 +410,42 @@ impl McpSession {
         {
             Ok(session) => session,
             Err(message) => {
+                // Passing a document where a workdir belongs is the first thing
+                // anyone tries, and "workdir not found" does not say that the
+                // argument is the wrong KIND of thing. A session that made this
+                // call spent the next thirty steps reading the server's source
+                // to discover a distinction one sentence would have settled.
+                let path = Path::new(&workdir);
+                let is_document = path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("docx"));
+                if is_document {
+                    return self.tool_result(
+                        "workdir_open",
+                        "failure",
+                        Value::Object(Default::default()),
+                        vec![Diagnostic::with_details(
+                            "workdir-invalid",
+                            format!(
+                                "{workdir} is a DOCX document; workdir_open takes the DIRECTORY \
+                                 that extract wrote"
+                            ),
+                            Some(
+                                json!({ "received": "document", "expected": "workdir directory" }),
+                            ),
+                            Some(vec![
+                                "run extract <source.docx> -o <dir> once, then open <dir>"
+                                    .to_string(),
+                                "or pass the workdir of a document already extracted".to_string(),
+                            ]),
+                        )],
+                        true,
+                        build_commit,
+                    );
+                }
                 let code = domain_code_from_message(&message);
-                return self.failure("workdir_open", code, &message, build_commit);
+                return self.failure("workdir_open", &code, &message, build_commit);
             }
         };
         // Paragraph count from the template inventory (Rust workdirs carry a
@@ -401,6 +455,14 @@ impl McpSession {
             .unwrap_or(0);
         if let Some(count) = session.get_mut("paragraphs") {
             *count = json!(paragraphs);
+        }
+        // A source that changed after the extract is invisible in `freshness`,
+        // which only describes the workdir against its own store. A session
+        // asked to "sync first" had no signal at all, opened with `clean`, and
+        // spent its budget on archaeology while the document it was about to
+        // overwrite sat there newer than the workdir.
+        if let Some(drift) = draft::source_drift(Path::new(&workdir)) {
+            session["source_drift"] = drift;
         }
         // The session's identity is STICKY: a field is updated when the call
         // supplies it and left alone when it does not. Resetting `track` on
@@ -1747,6 +1809,7 @@ impl McpSession {
             docx2typed_app::OperationArgs::Extract(docx2typed_app::ExtractArgs {
                 input: source.to_path_buf(),
                 outdir: target.to_path_buf(),
+                discard_committed_versions: false,
             }),
         ) {
             Ok(outcome) => outcome,
@@ -2273,18 +2336,20 @@ fn batch_edit_impl(
 /// Stable diagnostic code from a domain failure message prefix (kebab-code
 /// prefix when registered; `workdir-invalid` fallback) — mirroring Python's
 /// `domain_code_from_message`.
-fn domain_code_from_message(message: &str) -> &'static str {
-    let candidate = message
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_lowercase()
-        .replace(' ', "-");
-    match candidate.as_str() {
-        "file not found" | "source file not found" => "input-not-found",
-        "workdir not found" => "workdir-not-found",
-        _ => "workdir-invalid",
+fn domain_code_from_message(message: &str) -> String {
+    let candidate = message.split(':').next().unwrap_or("").trim();
+    // The engine writes domain errors as `"<code>: <detail>"`. A prefix is taken
+    // as the code only when the engine DECLARES it, so prose containing a colon
+    // cannot invent one — and nothing that IS declared gets relabelled. This
+    // used to know two phrases and call everything else `workdir-invalid`, which
+    // threw away a precise refusal the message had carried all along.
+    if docx2typed_protocol::diagnostic_spec_opt(candidate).is_some() {
+        return candidate.to_string();
+    }
+    match candidate {
+        "file not found" | "source file not found" => "input-not-found".to_string(),
+        "workdir not found" => "workdir-not-found".to_string(),
+        _ => "workdir-invalid".to_string(),
     }
 }
 

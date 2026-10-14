@@ -156,9 +156,27 @@ verify 从 workdir 和 output DOCX 独立重建 baseline/typed AST，校验文�
 build 只写临时 DOCX；typed validator、XML patch、package manifest 和 independent verify 全部通过后，才原子替换最终 output。
 
 **Baseline drift**:
-extract 后记录的 source/template fingerprint 与当前 DOCX 不一致；当前 workdir 不能继续 build，必须重新建立基线或显式合并。
+extract 后记录的 source/template fingerprint 与当前 DOCX 不一致 —— 即源文件在 workdir 之外被改过（别人编辑、Word 另存、投稿系统回传），workdir 落后于源。
+_Avoid_: 文件过期, 版本冲突
+
 **Baseline drift policy**:
-source/template fingerprint 变化时拒绝当前 workdir；不自动覆盖或三方合并未完成的 typed 修改，必须从最新 DOCX 建立新 workdir。
+一个 workdir 是这份文档**固定**的编辑住所，永不因漂移而新建。同步 = `extract <源.docx> -o <workdir>` 一次，把源的最新状态拉进同一个 workdir。
+
+但 `extract` 是**基线构造器**，不是合并：它从源重新推导 `_template.docx` 与投影，因此对任何**已经越过基线**的 workdir 都是一次重置。**判断条件是「workdir 是否停在基线上」，不是「源有没有变」** —— 实测：一个已提交一版、且源一个字节都没变的 workdir，再 extract 一次同样会丢掉已提交正文。
+
+两条守卫各指明不同的出路：
+- `workdir-has-pending-edit` —— 有未提交草稿：先 `commit_sync`。
+- `workdir-not-at-baseline` —— 有源不携带的已提交版本：先 `build_docx` 导出，或用 `--discard-committed-versions` 明示「以后者为准」。**"历史里还有它"不等于"它仍是当前版本"。**
+一次同步只发布**一个**变更集：新基线与随它一起必须清除的东西同时落地。分两步（写基线，再清旧状态）在中断时正好留下所要消除的撕裂。清除的是**针对旧基线表达的一切**：编辑 sidecar、投影与其状态、版本指针、以及 store 车道（有 store 目录而没有它的指针，是 store 拒绝打开的 workdir）。
+
+**保证的准确边界**：拒绝路径无副作用、成功路径一致（两者都有测试）；**发布中途的文件错误或崩溃不是原子的**（实测：变更集里靠前的资产已写入、靠后的没有，无回滚）。不要把它说成磁盘事务。
+
+`.review/` 不清除也无需清除：会话以 `_template.docx` 的哈希为锚，基线被替换时 `ensure_session` 自行重建会话并追加 `session-rebound` 事件。
+_Avoid_: 新建 workdir, fork 同步, 三方合并, 用源哈希判断是否安全, 分两步重置
+
+**Sync**:
+用源文件的当前状态刷新一个既有 workdir 的动作。它跟上"文档被外部改过"，不是"重开一个文档"。同步之后，workdir 与源再次一致，而它的历史与身份不变。只对**停在基线上**的 workdir 成立。
+_Avoid_: re-extract 到新目录, reimport, re-fork
 **Fixture corpus**:
 用于端到端验证的真实 DOCX 样本集合，覆盖文字、样式、空白、结构 token、关系、opaque 节点、表格、section 和失败路径；主证据是 package/XML 不变量。
 **Textual superscript/subscript**:
@@ -449,3 +467,40 @@ _Avoid_: source commit hash
 **Oracle major**:
 Python reference 行为闭包的显式版本；任何 canonical output、verdict、stable failure 或 side-effect 变化都必须发布新 major，不能 patch 原冻结 bundle。
 _Avoid_: Python patch release
+
+## Agent-facing surface
+
+这一节描述 agent 看到的那一层。上面的术语描述引擎存了什么；这一节描述调用者面对什么。
+两层要分开命名：同一件事有两个名字时，agent 名字是**权威**，引擎名字是**实现细节**。
+
+**Facade**:
+`facade_locate` / `facade_edit` / `facade_resolve` / `facade_verify` —— 薄组合层，不新增编辑、历史或验证机制，只把引擎已有的证明翻译成 agent 词汇。
+_Avoid_: editor API, wrapper, adapter, 工具收拢层
+
+**Handle**:
+一次定位结果的、绑定版本的引用。wire 上的名字是 `match_ref`，facade 发布为 `handle`；它钉住定位时的 revision 与所指向的原文，失配时拒绝而不是照旧套用。
+_Avoid_: match_id, target id, anchor, span ref, 偏移量
+
+**Capability verdict**:
+对单个目标"这次编辑能否成功"的回答：`supported` / `unsupported` / `ambiguous` / `stale_revision`。agent 据此分派；自由文本诊断是给人看的。
+_Avoid_: status, result code, 错误码
+
+**Coverage**:
+一次搜索或验证**实际扫过**的部件与范围。零结果必须连 coverage 一起返回，否则"不存在"会被读成"没找过"。
+_Avoid_: scope（scope 是请求，coverage 是回答）
+
+**Session**:
+一条 MCP 连接已打开的那个 workdir。一条连接在其生命周期内只驱动一个 workdir；`workdir-already-open` 是生命周期规则，不是瞬时故障。
+_Avoid_: connection, context, 会话状态
+
+**Family** (`f_…`):
+永久的逻辑文档，首次 extract 时铸造，存于 `<workdir>/workspace.json`。
+_Avoid_: 项目, 文件族, 文档 ID
+
+**Workspace** (`ws_…`):
+一次提取产生的编辑状态；来自 fork 时携带 `origin_family` / `origin_version`。
+_Avoid_: 工程, 项目, 目录
+
+**Observation**:
+某个 family 被看到过的一份 DOCX —— 副本、回传件、导出件都算。resolve 一个 observation 走证据分级（P1 哈希唯一 / P3 文件对象+哈希 / C1 文件对象在而内容已变 / C2 docId 仅作候选 / U 无证据），**C1、C2 与冲突档必须问用户一次**，不得自行认领。
+_Avoid_: 输入文件, 源文件, instance

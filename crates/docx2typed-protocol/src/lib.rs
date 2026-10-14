@@ -19,7 +19,7 @@ pub use descriptor::{
     engine_descriptor, EngineDescriptor, CONTRACT_RANGES, FEATURES, PACKAGE_VERSION,
     PROTOCOL_COMMANDS, PROTOCOL_TOOLS, REQUIRED_FEATURES,
 };
-pub use dto::{diagnostic_spec, Diagnostic, DiagnosticSpec, ResultEnvelope};
+pub use dto::{diagnostic_spec, diagnostic_spec_opt, Diagnostic, DiagnosticSpec, ResultEnvelope};
 pub use evidence::{base_evidence_payload, run_evidence, RunEvidence};
 pub use negotiate::{negotiate, NegotiationError};
 

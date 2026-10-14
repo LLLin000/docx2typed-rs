@@ -129,7 +129,11 @@ pub struct ProjectionImage {
 pub struct ParagraphEntry {
     pub part_key: String,
     pub paragraph_id: String,
-    /// Final-view visible text (w:t leaves only, deletion revisions hidden).
+    /// Final-view visible text: every leaf of the paragraph, joined. That
+    /// includes leaves a deletion revision locked (`w:delText`), because the
+    /// inventory enumerates those as leaves too — so this is the paragraph's
+    /// text as STORED, not as Word's final view shows it. The editable surface
+    /// is the subset with `editable` true.
     pub visible_text: String,
     /// true when the paragraph contains no opaque nodes.
     pub editable: bool,
@@ -365,6 +369,184 @@ pub fn find_old_byte_range(
     let byte_start = char_bytes[char_index].0 + text_start;
     let byte_end = char_bytes[char_index + old.chars().count() - 1].1 + text_start;
     Ok(Some((byte_start, byte_end)))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-run span matching
+// ---------------------------------------------------------------------------
+
+/// One leaf's share of a match that crosses runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanCover {
+    /// Leaf ordinal (`w:t` within the paragraph) covered by the match.
+    pub leaf_index: usize,
+    /// The portion of that leaf's text the match covers.
+    pub covered: String,
+}
+
+/// A match of `old` inside one paragraph's leaves, possibly across several runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafSpanMatch {
+    /// Leaf ordinal carrying the first character of the match.
+    pub first_leaf: usize,
+    /// Leaf ordinal carrying the last character of the match.
+    pub last_leaf: usize,
+    /// Text in the first leaf before the match ("" when the match starts at its
+    /// beginning).
+    pub prefix: String,
+    /// Text in the last leaf after the match ("" when the match ends at its end).
+    pub suffix: String,
+    /// The covered portion of every leaf from `first_leaf` to `last_leaf`, in
+    /// order. Length 1 for an ordinary single-run match.
+    pub covers: Vec<SpanCover>,
+}
+
+impl LeafSpanMatch {
+    /// true when the match needs more than one run.
+    pub fn crosses_runs(&self) -> bool {
+        self.covers.len() > 1
+    }
+
+    /// The whole matched text, run by run.
+    pub fn matched(&self) -> String {
+        self.covers
+            .iter()
+            .map(|cover| cover.covered.as_str())
+            .collect()
+    }
+}
+
+/// Locate `old` across a paragraph's text runs.
+///
+/// Word splits a paragraph's visible text into one `w:t` per formatting run —
+/// **65** of them in one paragraph of a real patent we measured, because Word
+/// starts a new run at every font, language and spell-check boundary. Text a
+/// human typed in Word therefore routinely crosses runs, and a rewrite that can
+/// only address a single run cannot express the edit at all.
+///
+/// Only leaves at or after `from_leaf` are considered, so the recorder that
+/// resolved the first leaf and the applier that rebuilds the runs agree about
+/// which pair of leaves an edit lands in.
+///
+/// `Ok(None)` when no run sequence carries `old`. `Err` with
+/// `prose-edit-ambiguous` when more than one sequence does: picking one
+/// silently would apply an edit somewhere the caller did not ask for, which is
+/// the same reason a repeated phrase inside one leaf already refuses.
+pub fn match_leaf_span(
+    inventory: &ProseInventory,
+    part: &str,
+    paragraph_id: &str,
+    from_leaf: usize,
+    old: &str,
+) -> Result<Option<LeafSpanMatch>, CoreError> {
+    if old.is_empty() {
+        return Ok(None);
+    }
+    // Every leaf, not only the editable ones: a match that runs into an opaque
+    // interior or a deletion revision has to reach `resolve_leaf`, which names
+    // the actual reason (`opaque-paragraph-mutated`). Filtering here would turn
+    // that into a vague "not found" and lose the only useful part of the error.
+    let mut leaves: Vec<&ProseLeaf> = inventory
+        .leaves
+        .iter()
+        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
+        .collect();
+    if leaves.is_empty() {
+        return Ok(None);
+    }
+    leaves.sort_by_key(|leaf| leaf.leaf_index);
+    let start_at = leaves
+        .iter()
+        .position(|leaf| leaf.leaf_index >= from_leaf)
+        .unwrap_or(leaves.len());
+
+    let mut found: Option<LeafSpanMatch> = None;
+    for start in start_at..leaves.len() {
+        let first_chars = leaves[start].text.chars().count();
+        let mut accumulated = String::new();
+        let mut before_last = 0usize;
+        for end in start..leaves.len() {
+            if end > start {
+                before_last += leaves[end - 1].text.chars().count();
+            }
+            accumulated.push_str(&leaves[end].text);
+            let Some(byte_pos) = accumulated.find(old) else {
+                continue;
+            };
+            let head = accumulated[..byte_pos].chars().count();
+            let covered = old.chars().count();
+            // The match must start inside the FIRST leaf and finish inside the
+            // LAST one. Anything else is some other start's business, and since
+            // `find` returns the earliest occurrence in the accumulator, no
+            // larger `end` can change that.
+            if head >= first_chars || head + covered <= before_last {
+                break;
+            }
+            if found.is_some() {
+                return Err(CoreError::Domain(
+                    "prose-edit-ambiguous: old text occurs more than once across the text \
+                     runs of this paragraph"
+                        .to_string(),
+                ));
+            }
+            found = Some(span_match_from(
+                &leaves,
+                start,
+                end,
+                head,
+                covered,
+                before_last,
+            ));
+            break;
+        }
+    }
+    Ok(found)
+}
+
+/// Build the per-leaf breakdown of a match located in `leaves[start..=end]`,
+/// where the match begins `head` characters into the first leaf and is
+/// `covered` characters long.
+fn span_match_from(
+    leaves: &[&ProseLeaf],
+    start: usize,
+    end: usize,
+    head: usize,
+    covered: usize,
+    before_last: usize,
+) -> LeafSpanMatch {
+    let tail = head + covered - before_last;
+    let take = |text: &str, from: usize, to: usize| -> String {
+        text.chars()
+            .skip(from)
+            .take(to.saturating_sub(from))
+            .collect()
+    };
+    let mut covers = Vec::with_capacity(end - start + 1);
+    for (offset, leaf) in leaves[start..=end].iter().enumerate() {
+        let is_first = offset == 0;
+        let is_last = offset == end - start;
+        let len = leaf.text.chars().count();
+        let (from, to) = if is_first && is_last {
+            (head, head + covered)
+        } else if is_first {
+            (head, len)
+        } else if is_last {
+            (0, tail)
+        } else {
+            (0, len)
+        };
+        covers.push(SpanCover {
+            leaf_index: leaf.leaf_index,
+            covered: take(&leaf.text, from, to.min(len)),
+        });
+    }
+    LeafSpanMatch {
+        first_leaf: leaves[start].leaf_index,
+        last_leaf: leaves[end].leaf_index,
+        prefix: take(&leaves[start].text, 0, head),
+        suffix: take(&leaves[end].text, tail, leaves[end].text.chars().count()),
+        covers,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,26 +1394,46 @@ pub fn resolve_leaf(
     Ok(leaf)
 }
 
-/// Validate one island edit against the template package: resolve the leaf,
-/// prove the old text exists uniquely, and confirm the surgery byte range.
-/// Returns the leaf plus the byte range to replace.
-pub fn validate_edit(
-    template: &Path,
-    edit: &IslandEdit,
-) -> Result<(ProseLeaf, (usize, usize)), CoreError> {
+/// Validate one island edit against the template package: prove the text is
+/// reachable, that every run it covers is on the editable surface, and that the
+/// applier's own byte proof succeeds.
+///
+/// The edit may cross text runs — Word splits a paragraph's text into one run
+/// per formatting change, so text a human typed in Word usually does — and this
+/// resolves it with `match_leaf_span`, the same resolver `apply_edits` uses, so
+/// validation and application cannot disagree about which runs an edit covers.
+pub fn validate_edit(template: &Path, edit: &IslandEdit) -> Result<(), CoreError> {
     let part = edit.part.clone();
     let part_bytes = read_part(template, &part)?;
     let inventory = enumerate_package(template)?;
-    let leaf = resolve_leaf(&inventory, &part, &edit.paragraph_id, edit.leaf_index)?;
-    let Some((byte_start, byte_end)) =
-        find_old_byte_range(&part_bytes, leaf.text_start, leaf.text_end, &edit.old)?
+    let Some(span) = match_leaf_span(
+        &inventory,
+        &part,
+        &edit.paragraph_id,
+        edit.leaf_index,
+        &edit.old,
+    )?
     else {
         return Err(CoreError::Domain(format!(
-            "invalid-edit: old text {:?} not found in leaf {}.{} of {}",
-            edit.old, edit.paragraph_id, edit.leaf_index, part
+            "invalid-edit: old text {:?} not found in paragraph {} of {}",
+            edit.old, edit.paragraph_id, part
         )));
     };
-    Ok((leaf.clone(), (byte_start, byte_end)))
+    for cover in &span.covers {
+        if cover.covered.is_empty() {
+            continue;
+        }
+        let leaf = resolve_leaf(&inventory, &part, &edit.paragraph_id, cover.leaf_index)?;
+        if find_old_byte_range(&part_bytes, leaf.text_start, leaf.text_end, &cover.covered)?
+            .is_none()
+        {
+            return Err(CoreError::Domain(format!(
+                "invalid-edit: {:?} not found in run {}.{} of {}",
+                cover.covered, edit.paragraph_id, cover.leaf_index, part
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_part(template: &Path, part: &str) -> Result<Vec<u8>, CoreError> {
@@ -1279,44 +1481,72 @@ pub fn apply_edits(template: &Path, edits: &[IslandEdit]) -> Result<Vec<u8>, Cor
         let inventory = enumerate_package_bytes(&current)?;
         let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
         for edit in part_edits {
-            let leaf = resolve_leaf(&inventory, part, &edit.paragraph_id, edit.leaf_index)?;
-            let Some((byte_start, byte_end)) =
-                find_old_byte_range(&part_bytes, leaf.text_start, leaf.text_end, &edit.old)?
-            else {
+            // A Word paragraph splits its text into one run per formatting
+            // change, so an edit a human made in Word usually crosses runs. The
+            // match is re-derived here from the recorded anchor and `old`, which
+            // is also what proves the sidecar and the template still agree.
+            let span = match_leaf_span(
+                &inventory,
+                part,
+                &edit.paragraph_id,
+                edit.leaf_index,
+                &edit.old,
+            )?;
+            let Some(span) = span else {
                 return Err(CoreError::Domain(format!(
-                    "invalid-edit: old text {:?} not found in leaf {}.{} of {}",
-                    edit.old, edit.paragraph_id, edit.leaf_index, part
+                    "invalid-edit: old text {:?} not found in paragraph {} of {}",
+                    edit.old, edit.paragraph_id, part
                 )));
             };
-            if edit.tracked {
-                let replacement = tracked_run_replacement(
-                    TrackedEditContext {
-                        part: &part_bytes,
-                        leaf: &leaf,
-                    },
-                    TrackedEditContent {
-                        old: &edit.old,
-                        new: &edit.new,
-                    },
-                    TrackedEditRevision {
-                        author: &edit.author,
-                        date: &edit.date,
-                        delete_id: next_revision_id,
-                        insert_id: next_revision_id.saturating_add(1),
-                    },
-                )?;
-                next_revision_id = next_revision_id.saturating_add(2);
-                spans.push(replacement);
-            } else {
-                let replacement = xml_escape(&edit.new).into_bytes();
-                spans.push((byte_start, byte_end, replacement));
-                // Whitespace preservation: a text with leading/trailing spaces
-                // needs xml:space="preserve" on the w:t start tag.
-                if needs_xml_space(&edit.new) {
-                    if let Some(tag_span) = maybe_inject_xml_space(&part_bytes, leaf.open_end) {
-                        spans.push(tag_span);
+            if !edit.tracked {
+                // Direct: the new text takes the place of the first covered run's
+                // share; every later covered run loses its share and nothing
+                // between runs is touched. One run covered is the ordinary case
+                // and produces exactly the byte range it always did.
+                for (position, cover) in span.covers.iter().enumerate() {
+                    if cover.covered.is_empty() {
+                        continue;
+                    }
+                    let leaf =
+                        resolve_leaf(&inventory, part, &edit.paragraph_id, cover.leaf_index)?;
+                    let Some((byte_start, byte_end)) = find_old_byte_range(
+                        &part_bytes,
+                        leaf.text_start,
+                        leaf.text_end,
+                        &cover.covered,
+                    )?
+                    else {
+                        return Err(CoreError::Domain(format!(
+                            "invalid-edit: {:?} not found in run {}.{} of {}",
+                            cover.covered, edit.paragraph_id, cover.leaf_index, part
+                        )));
+                    };
+                    if position == 0 {
+                        spans.push((byte_start, byte_end, xml_escape(&edit.new).into_bytes()));
+                        // Whitespace preservation: a text with leading/trailing
+                        // spaces needs xml:space="preserve" on the w:t start tag.
+                        if needs_xml_space(&edit.new) {
+                            if let Some(tag_span) =
+                                maybe_inject_xml_space(&part_bytes, leaf.open_end)
+                            {
+                                spans.push(tag_span);
+                            }
+                        }
+                    } else {
+                        spans.push((byte_start, byte_end, Vec::new()));
                     }
                 }
+            } else {
+                let mut replacement = tracked_span_replacement(
+                    &part_bytes,
+                    &inventory,
+                    part,
+                    edit,
+                    &span,
+                    next_revision_id,
+                )?;
+                next_revision_id = next_revision_id.saturating_add(2);
+                spans.append(&mut replacement);
             }
         }
         // Apply spans right-to-left so earlier offsets stay valid.
@@ -1358,30 +1588,13 @@ fn max_revision_id(package: &[u8]) -> u32 {
     max_id
 }
 
-// Grouped parameters to satisfy clippy::too_many_arguments
-struct TrackedEditContext<'a> {
-    part: &'a [u8],
-    leaf: &'a ProseLeaf,
-}
-
-struct TrackedEditContent<'a> {
-    old: &'a str,
-    new: &'a str,
-}
-
-struct TrackedEditRevision<'a> {
-    author: &'a str,
-    date: &'a str,
-    delete_id: u32,
-    insert_id: u32,
-}
-
-fn tracked_run_replacement(
-    ctx: TrackedEditContext<'_>,
-    content: TrackedEditContent<'_>,
-    revision: TrackedEditRevision<'_>,
-) -> Result<(usize, usize, Vec<u8>), CoreError> {
-    let before = &ctx.part[..ctx.leaf.text_start];
+/// The byte range of the `<w:r>…</w:r>` that owns `leaf`, with its raw `w:rPr`.
+///
+/// A run on the editable surface carries exactly one `w:t`; that is what makes
+/// "replace this run, keep its properties" a safe rewrite.
+fn run_range_for_leaf(part: &[u8], leaf: &ProseLeaf) -> Result<(usize, usize, String), CoreError> {
+    let text_start = leaf.text_start.min(part.len());
+    let before = &part[..text_start];
     let mut run_start = None;
     for index in 0..before.len().saturating_sub(3) {
         if &before[index..index + 4] == b"<w:r"
@@ -1394,12 +1607,13 @@ fn tracked_run_replacement(
     }
     let run_start = run_start
         .ok_or_else(|| CoreError::Domain("tracked-edit: owning run not found".to_string()))?;
-    let run_end_rel = ctx.part[ctx.leaf.text_end..]
+    let text_end = leaf.text_end.min(part.len());
+    let run_end_rel = part[text_end..]
         .windows(6)
         .position(|w| w == b"</w:r>")
         .ok_or_else(|| CoreError::Domain("tracked-edit: owning run end not found".to_string()))?;
-    let run_end = ctx.leaf.text_end + run_end_rel + 6;
-    let run = &ctx.part[run_start..run_end];
+    let run_end = text_end + run_end_rel + 6;
+    let run = &part[run_start..run_end];
     let t_count = run.windows(5).filter(|w| *w == b"<w:t>").count()
         + run.windows(5).filter(|w| *w == b"<w:t ").count();
     if t_count != 1 || run.windows(6).filter(|w| *w == b"</w:t>").count() != 1 {
@@ -1417,26 +1631,68 @@ fn tracked_run_replacement(
                 .map(|end| String::from_utf8_lossy(&run[start..start + end + 8]).into_owned())
         })
         .unwrap_or_default();
-    let prefix = ctx
-        .leaf
-        .text
-        .split_once(content.old)
-        .map(|(p, _)| p)
-        .unwrap_or("");
-    let suffix = ctx
-        .leaf
-        .text
-        .split_once(content.old)
-        .map(|(_, s)| s)
-        .unwrap_or("");
+    Ok((run_start, run_end, rpr))
+}
+
+/// One template run a cross-run edit covers, after merging covers that share a
+/// single run.
+struct CoveredRun {
+    start: usize,
+    end: usize,
+    rpr: String,
+    covered: String,
+}
+
+/// Replace a run range with a tracked delete/insert pair.
+///
+/// Each covered run is rewritten **in place** rather than absorbed into one span
+/// over `[run_start(first), run_end(last))`: anything that sits between runs — a
+/// bookmark, a comment anchor, a proofing mark — would be dropped by the wider
+/// span, and Word puts those between runs constantly. A single covered run
+/// produces exactly the bytes the single-run path always produced.
+///
+/// Covered leaves that share one owning run are merged first: two spans over the
+/// same bytes would invalidate each other's offsets.
+fn tracked_span_replacement(
+    part: &[u8],
+    inventory: &ProseInventory,
+    part_key: &str,
+    edit: &IslandEdit,
+    span: &LeafSpanMatch,
+    delete_id: u32,
+) -> Result<Vec<(usize, usize, Vec<u8>)>, CoreError> {
+    let mut runs: Vec<CoveredRun> = Vec::new();
+    for cover in &span.covers {
+        if cover.covered.is_empty() {
+            continue;
+        }
+        let leaf = resolve_leaf(inventory, part_key, &edit.paragraph_id, cover.leaf_index)?;
+        let (start, end, rpr) = run_range_for_leaf(part, &leaf)?;
+        match runs.last_mut() {
+            Some(previous) if previous.start == start && previous.end == end => {
+                previous.covered.push_str(&cover.covered);
+            }
+            _ => runs.push(CoveredRun {
+                start,
+                end,
+                rpr,
+                covered: cover.covered.clone(),
+            }),
+        }
+    }
+    if runs.is_empty() {
+        return Err(CoreError::Domain(
+            "tracked-edit: nothing to replace".to_string(),
+        ));
+    }
     let attrs = |kind: &str, id: u32| {
         format!(
             "<w:{kind} w:id=\"{id}\" w:author=\"{}\" w:date=\"{}\">",
-            xml_attr(revision.author),
-            xml_attr(revision.date)
+            xml_attr(&edit.author),
+            xml_attr(&edit.date)
         )
     };
-    let run_text = |tag: &str, text: &str| {
+    let run_text = |rpr: &str, tag: &str, text: &str| {
         let space = if text.starts_with(' ') || text.ends_with(' ') {
             " xml:space=\"preserve\""
         } else {
@@ -1447,25 +1703,30 @@ fn tracked_run_replacement(
             xml_escape(text)
         )
     };
-    if !ctx.leaf.text.contains(content.old) {
-        return Err(CoreError::Domain(
-            "tracked-edit: old text is not in leaf".to_string(),
-        ));
+    // The insertion carries the style the match started in, which is where a
+    // reader of the replacement expects to find it.
+    let insert_rpr = runs[0].rpr.clone();
+    let last = runs.len() - 1;
+    let mut out = Vec::with_capacity(runs.len());
+    for (position, run) in runs.iter().enumerate() {
+        let mut replacement = String::new();
+        if position == 0 && !span.prefix.is_empty() {
+            replacement.push_str(&run_text(&run.rpr, "t", &span.prefix));
+        }
+        replacement.push_str(&attrs("del", delete_id));
+        replacement.push_str(&run_text(&run.rpr, "delText", &run.covered));
+        replacement.push_str("</w:del>");
+        if position == last {
+            replacement.push_str(&attrs("ins", delete_id.saturating_add(1)));
+            replacement.push_str(&run_text(&insert_rpr, "t", &edit.new));
+            replacement.push_str("</w:ins>");
+            if !span.suffix.is_empty() {
+                replacement.push_str(&run_text(&run.rpr, "t", &span.suffix));
+            }
+        }
+        out.push((run.start, run.end, replacement.into_bytes()));
     }
-    let mut replacement = String::new();
-    if !prefix.is_empty() {
-        replacement.push_str(&run_text("t", prefix));
-    }
-    replacement.push_str(&attrs("del", revision.delete_id));
-    replacement.push_str(&run_text("delText", content.old));
-    replacement.push_str("</w:del>");
-    replacement.push_str(&attrs("ins", revision.insert_id));
-    replacement.push_str(&run_text("t", content.new));
-    replacement.push_str("</w:ins>");
-    if !suffix.is_empty() {
-        replacement.push_str(&run_text("t", suffix));
-    }
-    Ok((run_start, run_end, replacement.into_bytes()))
+    Ok(out)
 }
 
 fn xml_attr(text: &str) -> String {
@@ -2802,7 +3063,7 @@ pub fn validate_islands(template: &Path, edits: &[IslandEdit]) -> Result<(), Cor
     }
     validate_package(template)?;
     for edit in edits {
-        let _ = validate_edit(template, edit)?;
+        validate_edit(template, edit)?;
     }
     Ok(())
 }
