@@ -43,13 +43,47 @@ fn fixture(name: &str) -> PathBuf {
 
 /// Fresh store-backed workdir extracted from one fixture (mutation-safe:
 /// every test gets its own scratch dir).
-fn workdir(tag: &str, fixture_name: &str) -> PathBuf {
+struct ScratchGuard(PathBuf);
+
+impl std::ops::Deref for ScratchGuard {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for ScratchGuard {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn workdir(tag: &str, fixture_name: &str) -> ScratchGuard {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!(
-        "review60-crate-{tag}-{}-{}",
+        "review60-crate-{tag}-{}-{}-{}-{}",
         std::process::id(),
-        thread::current().name().unwrap_or("t").replace("::", "-")
+        thread::current().name().unwrap_or("t").replace("::", "-"),
+        now,
+        seq
     ));
-    let _ = fs::remove_dir_all(&dir);
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove stale scratch dir {}: {error}", dir.display()),
+    }
     fs::create_dir_all(&dir).expect("create scratch dir");
     let engine = Engine::new();
     let outcome = engine
@@ -67,7 +101,7 @@ fn workdir(tag: &str, fixture_name: &str) -> PathBuf {
     assert_eq!(envelope.outcome, "success", "{:?}", envelope.diagnostics);
     docx2typed_store::Store::ensure(&dir, &docx2typed_protocol::new_operation_id(), "")
         .expect("store initialization");
-    dir
+    ScratchGuard(dir)
 }
 
 fn event_id(value: &Value) -> String {

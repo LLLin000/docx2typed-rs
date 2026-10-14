@@ -12,18 +12,40 @@ use serde_json::{json, Value};
 
 const TYPED_HEADER: &str = "<!--@typed schema=\"docx2typed-typed-1\"-->";
 
-fn workdir(tag: &str) -> PathBuf {
+struct ScratchGuard(PathBuf);
+
+impl std::ops::Deref for ScratchGuard {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for ScratchGuard {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn workdir(tag: &str) -> ScratchGuard {
     let dir = std::env::temp_dir().join(format!(
         "docx2typed-history-read-{tag}-{}-{}",
         std::process::id(),
         new_operation_id().get(..8).unwrap_or("x")
     ));
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("typed.md"), "hello\n").unwrap();
     fs::write(dir.join("format.json"), "{}").unwrap();
     fs::write(dir.join("styles.json"), "{}").unwrap();
     fs::write(dir.join("_template.docx"), b"PK\x03\x04").unwrap();
-    dir
+    ScratchGuard(dir)
 }
 
 /// Store one object at the Python address (`sha256(kind + "\0" + bytes)`).

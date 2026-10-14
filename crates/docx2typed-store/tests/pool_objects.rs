@@ -6,17 +6,39 @@ use std::path::PathBuf;
 
 use docx2typed_protocol::new_operation_id;
 
-fn scratch(tag: &str) -> PathBuf {
+struct ScratchGuard(PathBuf);
+
+impl std::ops::Deref for ScratchGuard {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for ScratchGuard {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(tag: &str) -> ScratchGuard {
     let dir = std::env::temp_dir().join(format!(
         "docx2typed-pool-{tag}-{}-{}",
         std::process::id(),
         new_operation_id().get(..8).unwrap_or("x")
     ));
+    let _ = std::fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    dir
+    ScratchGuard(dir)
 }
 
-fn state_dir(tag: &str) -> PathBuf {
+fn state_dir(tag: &str) -> ScratchGuard {
     let dir = scratch(tag);
     fs::write(dir.join("typed.md"), "# typed\nP1\tfirst\n").unwrap();
     fs::write(dir.join("format.json"), "{\"P1\":{\"bold\":true}}\n").unwrap();

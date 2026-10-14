@@ -11,14 +11,36 @@ use docx2typed_store::versions::{history_gc, history_list, history_restore, trim
 use docx2typed_store::{read_root, MutateRun, RunOutcome, StoreError};
 use serde_json::{json, Value};
 
-fn temp_dir(tag: &str) -> PathBuf {
+struct ScratchGuard(PathBuf);
+
+impl std::ops::Deref for ScratchGuard {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for ScratchGuard {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_dir(tag: &str) -> ScratchGuard {
     let dir = std::env::temp_dir().join(format!(
         "docx2typed-history-write-{tag}-{}-{}",
         std::process::id(),
         new_operation_id().get(..8).unwrap_or("x")
     ));
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    dir
+    ScratchGuard(dir)
 }
 
 /// Store one object at the Python address (`sha256(kind + "\0" + bytes)`).
@@ -54,7 +76,7 @@ fn write_pointer(root: &Path, fields: &Value) {
 
 /// A Python-shaped two-version pool: V1 (tree t1) then V2 (tree t2), with a
 /// generation for each. `pin_v1` pins V1 as a retention root.
-fn pool_workdir(tag: &str, pin_v1: bool) -> PathBuf {
+fn pool_workdir(tag: &str, pin_v1: bool) -> ScratchGuard {
     let root = temp_dir(tag);
     fs::write(root.join("typed.md"), "v2\n").unwrap();
     fs::write(root.join("format.json"), "{}").unwrap();
@@ -286,7 +308,7 @@ fn commit(store: &Store, run: MutateRun) -> Value {
 }
 
 /// V1 = (alpha, beta), V2 = (ALPHA, BETA). Returns the workdir root.
-fn two_versions(tag: &str, p0_tokens: Value) -> PathBuf {
+fn two_versions(tag: &str, p0_tokens: Value) -> ScratchGuard {
     let root = temp_dir(tag);
     make_workdir(&root, "alpha", "beta", p0_tokens.clone());
     let store = Store::init(&root, &new_operation_id(), "input").expect("init");
