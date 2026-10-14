@@ -121,41 +121,102 @@ impl WorkdirStore {
         WorkdirStore
     }
 
-    /// Materialize an extract ChangeSet into `dir` (created if absent).
+    /// Materialize a (possibly partial) `ChangeSet` into `dir`.
+    ///
+    /// Staging contract (Gap 1): the ChangeSet is treated as a DELTA applied on
+    /// top of a seeded copy of the existing workdir. The staging directory is
+    /// first populated byte-for-byte from the current workdir (via `copy_workdir`)
+    /// and only then has the ChangeSet applied to it; the populated staging dir
+    /// is renamed over `dir` in one step. Consequences:
+    ///   * a ChangeSet that names one asset leaves every other existing asset
+    ///     in place (no silent deletion);
+    ///   * a ChangeSet that fails partway through leaves the previous workdir
+    ///     untouched, because nothing is published until the whole apply
+    ///     succeeds.
+    /// Choose copy-over-empty for this reason: the empty-staging alternative
+    /// forces every caller to pass a COMPLETE set or risk wiping the workdir.
     pub fn commit_workdir(
         &self,
         dir: &Path,
         change_set: &docx2typed_core::ChangeSet,
     ) -> Result<(), StoreError> {
         let root = resolve_path(dir);
-        fs::create_dir_all(&root)?;
-        for asset in &change_set.assets {
-            let target = root.join(asset_path(asset));
-            match asset {
-                Asset::Bytes(_, bytes) => {
-                    fs::write(&target, bytes)?;
-                }
-                Asset::CopySource { source, .. } => {
-                    // byte copy: the template is the source package verbatim
-                    fs::copy(source, &target)?;
-                }
-                Asset::Remove(_) => {
-                    // Already absent is the ordinary case: a workdir at its
-                    // baseline has none of these, and the plan only lists the
-                    // ones it found. A lane is a DIRECTORY (the store's), and
-                    // `remove_file` on a directory is an access-denied error on
-                    // Windows rather than a clear "wrong call".
-                    let result = if target.is_dir() {
-                        fs::remove_dir_all(&target)
-                    } else {
-                        fs::remove_file(&target)
-                    };
-                    match result {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
+        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let staging = parent.join(format!(
+            ".docx2typed-commit-{}-{}.tmp",
+            std::process::id(),
+            counter
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir(&staging)?;
+
+        if root.exists() {
+            self.copy_workdir(&root, &staging)?;
+        }
+
+        let apply_result = (|| {
+            for asset in &change_set.assets {
+                let target = staging.join(asset_path(asset));
+                match asset {
+                    Asset::Bytes(_, bytes) => {
+                        if let Some(parent) = target.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::write(&target, bytes)?;
+                    }
+                    Asset::CopySource { source, .. } => {
+                        if let Some(parent) = target.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::copy(source, &target)?;
+                    }
+                    Asset::Remove(_) => {
+                        let result = if target.is_dir() {
+                            fs::remove_dir_all(&target)
+                        } else {
+                            fs::remove_file(&target)
+                        };
+                        match result {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error.into()),
+                        }
                     }
                 }
+            }
+            Ok(())
+        })();
+        if let Err(error) = apply_result {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        let identity_path = root.join("workspace.json");
+        if identity_path.is_file() {
+            let _ = fs::copy(&identity_path, staging.join("workspace.json"));
+        }
+
+        if root.exists() {
+            let backup = parent.join(format!(
+                ".docx2typed-commit-old-{}-{}.tmp",
+                std::process::id(),
+                counter
+            ));
+            let _ = fs::remove_dir_all(&backup);
+            if let Err(error) = fs::rename(&root, &backup) {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error.into());
+            }
+            if let Err(error) = fs::rename(&staging, &root) {
+                let _ = fs::rename(&backup, &root);
+                return Err(error.into());
+            }
+            let _ = fs::remove_dir_all(&backup);
+        } else {
+            if let Err(error) = fs::rename(&staging, &root) {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error.into());
             }
         }
         Ok(())
