@@ -266,9 +266,56 @@ pub fn filtered_recovery_for(operation: &str, code: &str, active: Option<&[Strin
         });
     }
     translated.tools = Some(surface);
-    translated.tool = recovery.tool.as_deref().map(|tool| to_agent_surface(tool).to_string());
+    translated.tool = recovery
+        .tool
+        .as_deref()
+        .map(|tool| to_agent_surface(tool).to_string());
     translated
 }
+
+/// The agent-surface tool that carries out what a legacy tool did.
+///
+/// The recovery table is written in the engine's vocabulary — it predates the
+/// five-tool surface and is still what the CLI and the tests read. An agent,
+/// though, can only call the five, so naming `workdir_open` in a recovery
+/// payload tells it to call a tool that is not mounted. Measured: every refusal
+/// carried a `tools` list of names the agent could not use.
+///
+/// Where a legacy tool has no surface equivalent — `format_span`, the review
+/// console, `revert`, the table operations — the honest answer is
+/// `document_status`: it reports the state and names the next step, and it is
+/// the one call that is always available. The legacy name stays in the payload's
+/// `detail` field for a human or the CLI, rather than being dropped.
+pub fn to_agent_surface(tool: &str) -> &'static str {
+    match tool {
+        "workdir_open" => "document_open",
+        "workdir_status" => "document_status",
+        "document_read" | "document_search" | "get_paragraph" => "document_find",
+        "document_patch" | "batch_edit" | "diff_preview" => "document_edit",
+        // The sync is absorbed: `document_edit` takes it, so a recovery that
+        // told the caller to run it would be naming a step that no longer
+        // exists on the surface.
+        "commit_sync" => "document_edit",
+        "build_docx" => "document_save",
+        _ => "document_status",
+    }
+}
+
+/// The same list, in the agent's vocabulary, with duplicates removed.
+///
+/// Order is preserved: the reference lists its recovery tools in the order they
+/// should be tried, and that ordering is the useful part.
+pub fn agent_surface_tools(tools: &[String]) -> Vec<String> {
+    let mut mapped: Vec<String> = Vec::new();
+    for tool in tools {
+        let surface = to_agent_surface(tool).to_string();
+        if !mapped.contains(&surface) {
+            mapped.push(surface);
+        }
+    }
+    mapped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,47 +397,4 @@ mod tests {
             }
         }
     }
-}
-
-/// The agent-surface tool that carries out what a legacy tool did.
-///
-/// The recovery table is written in the engine's vocabulary — it predates the
-/// five-tool surface and is still what the CLI and the tests read. An agent,
-/// though, can only call the five, so naming `workdir_open` in a recovery
-/// payload tells it to call a tool that is not mounted. Measured: every refusal
-/// carried a `tools` list of names the agent could not use.
-///
-/// Where a legacy tool has no surface equivalent — `format_span`, the review
-/// console, `revert`, the table operations — the honest answer is
-/// `document_status`: it reports the state and names the next step, and it is
-/// the one call that is always available. The legacy name stays in the payload's
-/// `detail` field for a human or the CLI, rather than being dropped.
-pub fn to_agent_surface(tool: &str) -> &'static str {
-    match tool {
-        "workdir_open" => "document_open",
-        "workdir_status" => "document_status",
-        "document_read" | "document_search" | "get_paragraph" => "document_find",
-        "document_patch" | "batch_edit" | "diff_preview" => "document_edit",
-        // The sync is absorbed: `document_edit` takes it, so a recovery that
-        // told the caller to run it would be naming a step that no longer
-        // exists on the surface.
-        "commit_sync" => "document_edit",
-        "build_docx" => "document_save",
-        _ => "document_status",
-    }
-}
-
-/// The same list, in the agent's vocabulary, with duplicates removed.
-///
-/// Order is preserved: the reference lists its recovery tools in the order they
-/// should be tried, and that ordering is the useful part.
-pub fn agent_surface_tools(tools: &[String]) -> Vec<String> {
-    let mut mapped: Vec<String> = Vec::new();
-    for tool in tools {
-        let surface = to_agent_surface(tool).to_string();
-        if !mapped.contains(&surface) {
-            mapped.push(surface);
-        }
-    }
-    mapped
 }
