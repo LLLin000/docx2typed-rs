@@ -1189,6 +1189,8 @@ fn island_leaf_for(
             ),
         ));
     };
+    docx2typed_core::prose::resolve_leaf(&inventory, &part, paragraph_id, span.first_leaf)
+        .map_err(|error| CollaborationError::new("opaque-paragraph-mutated", error.to_string()))?;
     if let Some(index) = leaf_index {
         if index != span.first_leaf {
             return Err(CollaborationError::new(
@@ -1750,7 +1752,12 @@ fn token_boundary_kind(token: &str) -> String {
 /// stripped — i.e. it strictly spans a revision-control (or protected) marker.
 /// Boundaries exactly at the span edges do not count: a span covering a whole
 /// revision body is one editable span (mirror of `_span_crosses_boundary`).
-fn span_crosses_boundary(paragraph_id: &str, body: &str, old: &str) -> Option<CollaborationError> {
+fn span_crosses_boundary(
+    paragraph_id: &str,
+    body: &str,
+    old: &str,
+    start: Option<usize>,
+) -> Option<CollaborationError> {
     if old.contains('\u{27e6}') || old.contains('\u{27e7}') {
         return None;
     }
@@ -1758,8 +1765,13 @@ fn span_crosses_boundary(paragraph_id: &str, body: &str, old: &str) -> Option<Co
     if boundaries.is_empty() {
         return None;
     }
-    let position = flat.find(old)?;
-    let start = flat[..position].chars().count();
+    let start = match start {
+        Some(offset) => offset,
+        None => {
+            let position = flat.find(old)?;
+            flat[..position].chars().count()
+        }
+    };
     let end = start + old.chars().count();
     let mut crossed: Vec<String> = boundaries
         .iter()
@@ -2001,6 +2013,17 @@ fn plan_patch(
                     let chars: Vec<char> = visible.chars().collect();
                     chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>()
                 });
+                // A span that names a span with a match_ref still has to obey
+                // the boundary rule: the handle addresses text, not a right to
+                // cross an inline revision marker.
+                if let Some(chars_start) = anchored_chars {
+                    if let Some(error) =
+                        span_crosses_boundary(paragraph_id, &body, old, Some(chars_start))
+                    {
+                        hunk_problem(&mut problems, number, hunk, error);
+                        continue;
+                    }
+                }
                 let start = if let Some(start) = anchored {
                     start
                 } else {
@@ -2012,7 +2035,7 @@ fn plan_patch(
                     // the case this guard exists for: it fell through to
                     // `replace_at` and reported a bare `text-not-found` for text
                     // plainly on screen. The boundary test caught it.
-                    if let Some(error) = span_crosses_boundary(paragraph_id, &body, old) {
+                    if let Some(error) = span_crosses_boundary(paragraph_id, &body, old, None) {
                         hunk_problem(&mut problems, number, hunk, error);
                         continue;
                     }
@@ -2021,7 +2044,7 @@ fn plan_patch(
                         // A span that is contiguous only once the inline tokens
                         // are stripped is not one editable run: name the
                         // boundary instead of reporting a bare text-not-found.
-                        if let Some(error) = span_crosses_boundary(paragraph_id, &body, old) {
+                        if let Some(error) = span_crosses_boundary(paragraph_id, &body, old, None) {
                             hunk_problem(&mut problems, number, hunk, error);
                             continue;
                         }
@@ -4142,18 +4165,18 @@ mod tests {
     fn span_crosses_boundary_names_the_flavour() {
         let body = "ab\u{27e6}insert\u{27e7}cd\u{27e6}/insert\u{27e7}ef";
         // "bc" reads contiguous in the flat text but strictly spans the marker.
-        let error = span_crosses_boundary("P0", body, "bc").expect("boundary crossed");
+        let error = span_crosses_boundary("P0", body, "bc", None).expect("boundary crossed");
         assert_eq!(error.code, "edit-span-crosses-revision-boundary");
         // Boundaries exactly at the span edges do not count.
-        assert!(span_crosses_boundary("P0", body, "ab").is_none());
-        assert!(span_crosses_boundary("P0", body, "ef").is_none());
-        assert!(span_crosses_boundary("P0", body, "cd").is_none());
+        assert!(span_crosses_boundary("P0", body, "ab", None).is_none());
+        assert!(span_crosses_boundary("P0", body, "ef", None).is_none());
+        assert!(span_crosses_boundary("P0", body, "cd", None).is_none());
         // An anchor or format-history token is not a revision: say so.
-        let error = span_crosses_boundary("P0", "x\u{27e6}kind=\"hyperlink\"\u{27e7}y", "xy")
+        let error = span_crosses_boundary("P0", "x\u{27e6}kind=\"hyperlink\"\u{27e7}y", "xy", None)
             .expect("protected marker crossed");
         assert_eq!(error.code, "edit-span-crosses-protected-marker");
         // A span that is not contiguous in the flat text is simply not found.
-        assert!(span_crosses_boundary("P0", body, "zz").is_none());
+        assert!(span_crosses_boundary("P0", body, "zz", None).is_none());
     }
 
     /// The batch primitive's argument surface, exercised without a workdir.
