@@ -221,12 +221,49 @@ jobs:
             if (-not $a.match_pinned) { throw "embedded asset mismatch: $($a.name)" }
           }
           Write-Host "CLI smoke OK: $($d.name), $($d.embedded_assets.Count) embedded assets pinned"
+      - name: Agent surface acceptance
+        shell: bash
+        run: |
+          # docs/specs/08_agent_surface.md §6: acceptance is the WORKFLOW, not the
+          # tool calls. These drive open -> find -> edit -> save -> status the way
+          # an agent does and read the built DOCX back rather than trusting a
+          # success flag, plus the failure modes that are injectable from outside.
+          cargo test --test agent_surface
+          # And the same 19 natural-language tasks, run through the five tools.
+          # docs/specs/08_agent_surface.md §6: a task passes only when the
+          # exported document reaches the expected state, and the surface has to
+          # reach it too — not just the engine underneath.
+          # Windows' default stdout is cp1252, and this suite prints task names
+          # that are Chinese: without this it dies on `UnicodeDecodeError` before
+          # reporting a single result. The env var is the fix; the shell is bash
+          # on both runners, so it is the Python side that needs telling.
+          PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python qualification/facade_task_suite.py --surface
+
       - name: MCP smoke (engine_info + tools/list)
         shell: bash
         run: |
-          OUT=$(printf '{"tool":"engine_info","args":{}}\n{"tool":"tools/list","args":{}}\n' | ./target/release/${{ matrix.bin }} mcp)
+          # Two questions, and the smoke checks both because they are the two
+          # halves that must not drift apart: what an AGENT may call (five), and
+          # what the ENGINE still serves (all of it, by name). This step used to
+          # assert `tools/list` contained `review_settle` -- a proxy for the
+          # second question asked through the first answer, which stopped being
+          # the same thing when the agent surface was narrowed. See
+          # docs/specs/08_agent_surface.md and divergence #5.
+          OUT=$(printf '{"tool":"engine_info","args":{}}\n{"tool":"tools/list","args":{}}\n{"tool":"review_settle","args":{}}\n' | ./target/release/${{ matrix.bin }} mcp)
           echo "$OUT" | grep -q '^OK ' || { echo "engine_info not OK"; exit 1; }
-          echo "$OUT" | grep -q '"review_settle"' || { echo "tools/list missing review_settle"; exit 1; }
+          for t in document_open document_find document_edit document_save document_status; do
+            echo "$OUT" | grep -q "\"$t\"" || { echo "tools/list missing $t"; exit 1; }
+          done
+          # The engine's own tools stay callable even though they are not
+          # advertised: the CLI and the suites call them by name.
+          # `if`, not `grep -q && {...}`: under `bash -e` a bare `&&` compound
+          # returns the grep's status, so the GOOD case (no unknown tool) aborts
+          # the step. That is how this check failed the packaging job on the
+          # first attempt.
+          if echo "$OUT" | grep -q 'ERR unknown tool'; then
+            echo "a legacy tool name stopped dispatching"
+            exit 1
+          fi
       - name: Package release bundle
         shell: pwsh
         run: ./scripts/package_release.ps1 -Bin target/release/${{ matrix.bin }} -OutDir dist/release -Target ${{ matrix.target }} -Channel stable -Coverage ci-only

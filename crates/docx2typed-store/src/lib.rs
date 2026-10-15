@@ -6,6 +6,7 @@
 //! package — copy-if-unchanged per frozen PRD decisions 13/14/15. It never
 //! recompresses.
 
+use crate::store::at;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -116,48 +117,161 @@ impl Default for WorkdirStore {
     }
 }
 
+/// Rename a directory, retrying a transient sharing violation.
+///
+/// On Windows a directory rename fails with "Access is denied" while anything
+/// holds a handle inside it — a scanner, an indexer, another process briefly
+/// opening a file. That is transient by nature, and it is why the publish below
+/// cannot be a single unguarded `fs::rename`: measured on CI, the extract in
+/// `review_crate` failed this way on windows-latest, a different test each run,
+/// with 47 of 48 passing — and never locally, where nothing scans the directory.
+///
+/// The retry is bounded and the last error is returned, so a genuine permission
+/// problem still fails loudly rather than being papered over.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 10;
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // Only a sharing/permission failure is worth retrying; anything
+                // else (a missing source, a cross-device move) will not improve.
+                let transient = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                );
+                if !transient {
+                    return Err(error);
+                }
+                last = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+            }
+        }
+    }
+    Err(last.expect("a transient failure was recorded"))
+}
+
+/// Apply a ChangeSet into `target`, which must already exist.
+///
+/// Shared by both publish paths: the in-place one, where there is nothing to
+/// protect, and the staged one, where the previous workdir must survive a
+/// partial apply.
+fn apply_change_set(
+    target: &Path,
+    change_set: &docx2typed_core::ChangeSet,
+) -> Result<(), StoreError> {
+    for asset in &change_set.assets {
+        let path = target.join(asset_path(asset));
+        match asset {
+            Asset::Bytes(_, bytes) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| at(parent, error))?;
+                }
+                fs::write(&path, bytes).map_err(|error| at(&path, error))?;
+            }
+            Asset::CopySource { source, .. } => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| at(parent, error))?;
+                }
+                fs::copy(source, &path).map_err(|error| at(source, error))?;
+            }
+            Asset::Remove(_) => {
+                let result = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+                match result {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(at(&path, error)),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl WorkdirStore {
     pub fn new() -> Self {
         WorkdirStore
     }
 
-    /// Materialize an extract ChangeSet into `dir` (created if absent).
+    /// Materialize a `ChangeSet` into `dir`.
+    ///
+    /// Two publish paths, chosen by whether there is anything to protect:
+    ///
+    /// * **The workdir does not exist** — nothing can be damaged, so the ChangeSet is
+    ///   applied in place. This is the extract case, and it matters that it takes no
+    ///   RENAME: a directory rename on Windows fails intermittently while a scanner
+    ///   holds a handle on a freshly written file. Measured: the extract in
+    ///   `review_crate` failed that way on windows-latest, a different test each run,
+    ///   47 of 48 passing, `os error 3` or `os error 5`, no path in the message —
+    ///   because the failing call was the rename of a staging directory that had just
+    ///   been written. It reproduces locally at `--test-threads=8` (6 of 6) and never
+    ///   at `--test-threads=2`, which is why it looked CI-only.
+    /// * **The workdir exists** — the ChangeSet is applied to a staging copy seeded
+    ///   byte-for-byte from the current workdir, and that copy is renamed over `dir`
+    ///   in one step. So a ChangeSet that names one asset leaves every other existing
+    ///   asset in place, and a ChangeSet that fails partway leaves the previous
+    ///   workdir untouched.
+    ///
+    /// Seeding from the existing workdir rather than staging over an empty one is
+    /// deliberate: the empty-staging alternative would force every caller to pass a
+    /// COMPLETE set or risk wiping the workdir.
     pub fn commit_workdir(
         &self,
         dir: &Path,
         change_set: &docx2typed_core::ChangeSet,
     ) -> Result<(), StoreError> {
         let root = resolve_path(dir);
-        fs::create_dir_all(&root)?;
-        for asset in &change_set.assets {
-            let target = root.join(asset_path(asset));
-            match asset {
-                Asset::Bytes(_, bytes) => {
-                    fs::write(&target, bytes)?;
-                }
-                Asset::CopySource { source, .. } => {
-                    // byte copy: the template is the source package verbatim
-                    fs::copy(source, &target)?;
-                }
-                Asset::Remove(_) => {
-                    // Already absent is the ordinary case: a workdir at its
-                    // baseline has none of these, and the plan only lists the
-                    // ones it found. A lane is a DIRECTORY (the store's), and
-                    // `remove_file` on a directory is an access-denied error on
-                    // Windows rather than a clear "wrong call".
-                    let result = if target.is_dir() {
-                        fs::remove_dir_all(&target)
-                    } else {
-                        fs::remove_file(&target)
-                    };
-                    match result {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-            }
+        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+
+        if !root.exists() {
+            fs::create_dir_all(&root).map_err(|error| at(&root, error))?;
+            return apply_change_set(&root, change_set);
         }
+
+        fs::create_dir_all(parent)?;
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let staging = parent.join(format!(
+            ".docx2typed-commit-{}-{}.tmp",
+            std::process::id(),
+            counter
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir(&staging).map_err(|error| at(&staging, error))?;
+        if let Err(error) = self.copy_workdir(&root, &staging) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        if let Err(error) = apply_change_set(&staging, change_set) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        // Preserve the engine-owned workspace identity across a baseline
+        // replacement so re-extracting keeps family/workspace ids stable.
+        let identity_path = root.join("workspace.json");
+        if identity_path.is_file() {
+            let _ = fs::copy(&identity_path, staging.join("workspace.json"));
+        }
+
+        let backup = parent.join(format!(
+            ".docx2typed-commit-old-{}-{}.tmp",
+            std::process::id(),
+            counter
+        ));
+        let _ = fs::remove_dir_all(&backup);
+        if let Err(error) = rename_with_retry(&root, &backup) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(at(&root, error));
+        }
+        if let Err(error) = rename_with_retry(&staging, &root) {
+            let _ = rename_with_retry(&backup, &root);
+            return Err(at(&staging, error));
+        }
+        let _ = fs::remove_dir_all(&backup);
         Ok(())
     }
 

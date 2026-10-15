@@ -39,7 +39,9 @@ fn descriptor_contracts_match_frozen_ranges() {
     let descriptor = docx2typed_protocol::engine_descriptor("test-commit");
     assert_eq!(descriptor.schema, "docx2typed-engine-descriptor-1");
     assert_eq!(descriptor.name, "docx2typed-rust");
-    assert_eq!(descriptor.version, "0.2.0");
+    // The wiring, not a literal: this test is about the frozen contract ranges,
+    // and a hand-edited version string here turns every release into a test fix.
+    assert_eq!(descriptor.version, docx2typed_protocol::PACKAGE_VERSION);
     assert_eq!(descriptor.build_commit, "test-commit");
     let contracts = descriptor.contracts.as_object().expect("contracts object");
     for name in ["cli", "mcp", "result", "evidence", "workdir"] {

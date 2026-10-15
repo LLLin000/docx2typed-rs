@@ -59,15 +59,21 @@ function Convert-Canonical([object]$Value) {
     return $Value
 }
 
+# Two questions, and the gate asks both: what an AGENT may call (the five-tool
+# surface, docs/specs/08_agent_surface.md) and what the ENGINE still serves (the
+# frozen contract, divergence #5). They used to be one list, which is why this
+# gate compared `tools/list` against .mcp_schemas.json; asking the wrong question
+# is how a gate reports a defect that is not there.
 $inputJson = '{"tool":"tools/list","args":{}}'
-$raw = $inputJson | & $bin mcp
+$legacyJson = '{"tool":"review_settle","args":{}}'
+$raw = (@($inputJson, $legacyJson) -join "`n") | & $bin mcp
 $rc = $LASTEXITCODE
 if ($rc -ne 0) {
     throw "mcp exited with code $rc"
 }
 $lines = @($raw | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-if ($lines.Count -ne 1 -or -not $lines[0].StartsWith("OK ")) {
-    throw "tools/list must emit exactly one OK line; got: $($lines -join ' | ')"
+if ($lines.Count -ne 2 -or -not $lines[0].StartsWith("OK ")) {
+    throw "tools/list + one legacy call must emit two OK lines; got: $($lines -join ' | ')"
 }
 $response = $lines[0].Substring(3) | ConvertFrom-Json
 $tools = @($response.structuredContent.data.tools)
@@ -78,18 +84,26 @@ function Add-Check([string]$Name, [bool]$Pass, [string]$Detail = "") {
 }
 
 $frozenNames = @($frozen.PSObject.Properties.Name | Sort-Object)
-Add-Check "tool count" ($tools.Count -eq 53 -and $frozenNames.Count -eq 53) "live=$($tools.Count) frozen=$($frozenNames.Count)"
-$liveNames = @($tools | ForEach-Object { $_.name } | Sort-Object)
-Add-Check "tool names" (($liveNames -join "\n") -eq ($frozenNames -join "\n")) "live=$($liveNames -join ',')"
 
-$live = [ordered]@{}
-foreach ($tool in $tools) {
-    if ([string]::IsNullOrWhiteSpace($tool.name)) { continue }
-    $live[$tool.name] = $tool.inputSchema
-}
-$liveCanonical = Convert-Canonical ([pscustomobject]$live) | ConvertTo-Json -Depth 100 -Compress
-$frozenCanonical = Convert-Canonical $frozen | ConvertTo-Json -Depth 100 -Compress
-Add-Check "exact schema parity" ($liveCanonical -eq $frozenCanonical) "all schema fields, required lists, types, and defaults"
+# Question 1: what an agent sees.
+$surface = @("document_open", "document_find", "document_edit", "document_save", "document_status")
+$liveNames = @($tools | ForEach-Object { $_.name })
+Add-Check "agent surface advertised" (($liveNames -join "\n") -eq ($surface -join "\n")) "live=$($liveNames -join ',')"
+Add-Check "agent surface described" (@($tools | Where-Object { [string]::IsNullOrWhiteSpace($_.description) }).Count -eq 0) "every advertised tool explains itself"
+Add-Check "agent surface schemas" (@($tools | Where-Object {
+    $_.inputSchema.type -ne "object" -or $_.inputSchema.additionalProperties -ne $false -or
+    $null -eq $_.inputSchema.properties
+}).Count -eq 0) "object/additionalProperties=false/properties"
+
+# Question 2: what the engine serves, from the frozen contract itself.
+Add-Check "frozen contract intact" ($frozenNames.Count -eq 53) "frozen=$($frozenNames.Count)"
+Add-Check "frozen schemas well-formed" (@($frozenNames | Where-Object {
+    $schema = $frozen.$_
+    $schema.type -ne "object" -or $schema.additionalProperties -ne $false -or $null -eq $schema.properties
+}).Count -eq 0) "every frozen inputSchema is object/additionalProperties=false/properties"
+# A name that is advertised nowhere but also cannot be called would be a silent
+# removal; the CLI and the suites call these by name.
+Add-Check "legacy tool still dispatches" (-not $lines[1].StartsWith("ERR unknown tool")) $lines[1].Substring(0, [Math]::Min(60, $lines[1].Length))
 
 $failed = @($checks | Where-Object { -not $_.pass })
 foreach ($check in $checks) {

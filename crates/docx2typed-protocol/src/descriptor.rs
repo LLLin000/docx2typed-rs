@@ -90,13 +90,96 @@ pub const PROTOCOL_COMMANDS: [&str; 13] = [
     "store-state",
     "verify",
 ];
-pub const PROTOCOL_TOOLS: [&str; 2] = ["engine_info", "workdir_open"];
+/// The engine's complete tool surface, in the order the MCP server serves it.
+///
+/// This is the list `engine_info` and the descriptor report, so it MUST equal
+/// what `tools/list` serves: an agent that reads `engine_info` and finds two
+/// names concludes it cannot edit a document at all. It reported exactly that
+/// (a bare `["engine_info", "workdir_open"]`) while the server served fifty-
+/// three tools, which is the difference between "how do I use this" and
+/// "this cannot do my task".
+/// The five tools an agent sees.
+///
+/// The engine serves every name in [`PROTOCOL_TOOLS`]; this is the subset it
+/// ADVERTISES. The distinction is deliberate and it is the fix for a measured
+/// defect: fifty-three exposed tools reach 32.1% task success (ToolMenuBench),
+/// a four-tool interface is the measured optimum (+16.4% completion, argument
+/// accuracy 0.20 -> 0.40, MCP-GRANITE), and 89.1% of tool-interface failures
+/// are tool misselection (ToolRobustBench).
+///
+/// One question, one answer: `tools/list`, the descriptor's `tools`, and a
+/// session's `supported_tools` all report THIS list, because all three are
+/// asked "what may the agent call". Reporting a different number in each is
+/// how an agent concludes it cannot do its task.
+pub const AGENT_TOOLS: [&str; 5] = [
+    "document_open",
+    "document_find",
+    "document_edit",
+    "document_save",
+    "document_status",
+];
+
+pub const PROTOCOL_TOOLS: [&str; 53] = [
+    "engine_info",
+    "workdir_open",
+    "workdir_status",
+    "list_paragraphs",
+    "get_paragraph",
+    "replace_text",
+    "batch_edit",
+    "insert_paragraph",
+    "delete_paragraph",
+    "diff_preview",
+    "commit_sync",
+    "accept_revision",
+    "reject_revision",
+    "reinsert_deleted_text",
+    "delete_comment",
+    "table_insert_row",
+    "table_delete_row",
+    "table_insert_col",
+    "table_delete_col",
+    "table_merge_cells",
+    "table_split_cells",
+    "decide_all",
+    "list_comments",
+    "get_comment",
+    "review_preflight",
+    "review_state",
+    "review_external_preflight",
+    "review_settlement_plan",
+    "review_settle",
+    "review_apply_patch",
+    "review_apply_batch",
+    "review_inbox",
+    "review_ack",
+    "revert",
+    "build_docx",
+    "verify_output",
+    "history_list",
+    "history_gc",
+    "history_restore",
+    "document_search",
+    "document_read",
+    "document_patch",
+    "document_replace",
+    "history_diff",
+    "history_blame",
+    "history_verify",
+    "workspace_fork",
+    "format_span",
+    "workspace_adopt",
+    "facade_locate",
+    "facade_edit",
+    "facade_verify",
+    "facade_resolve",
+];
 
 /// Version declared in the descriptor, in Python's normalised spelling: no
 /// hyphen, so `0.2.0` rather than a Cargo-style `0.2.0-rc1`. The descriptor is
 /// read by both the Python and the Rust side, and the Python spelling is the
 /// one both parse.
-pub const PACKAGE_VERSION: &str = "0.2.0";
+pub const PACKAGE_VERSION: &str = "0.2.1";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContractRange {
@@ -149,7 +232,7 @@ pub fn engine_descriptor(build_commit: &str) -> EngineDescriptor {
             "finite": PROTOCOL_COMMANDS,
             "launchers": ["mcp"],
         }),
-        tools: PROTOCOL_TOOLS.to_vec(),
+        tools: AGENT_TOOLS.to_vec(),
         features: FEATURES.to_vec(),
         required_features: REQUIRED_FEATURES.to_vec(),
     }

@@ -223,17 +223,27 @@ fn mcp_stdio_negotiates_engine_info_and_workdir_open() {
         "docx2typed-session-descriptor-1"
     );
 
-    // second open on the same connection is rejected (workdir-already-open)
+    // A second open naming the SAME workdir succeeds here, where the reference
+    // refuses it with `workdir-already-open`. Recorded divergence #4 in
+    // docs/specs/06_reference_divergences.md: the reference's stated rule is
+    // "one connection drives one workdir", and re-opening the one it already
+    // drives does not violate that. A real session read the refusal as a
+    // transient block and moved directories around on disk to get past it.
     writeln!(stdin, "{request}").expect("write");
     stdin.flush().expect("flush");
     line.clear();
     stdout.read_line(&mut line).expect("read reply");
     let reply: serde_json::Value =
         serde_json::from_str(line.trim_start_matches("OK ")).expect("reply json");
-    assert_eq!(reply["isError"], true);
     assert_eq!(
-        reply["structuredContent"]["diagnostics"][0]["code"],
-        "workdir-already-open"
+        reply["isError"], false,
+        "re-opening the same workdir is a retry, not a conflict: {reply}"
+    );
+    // What the rule actually protects: a DIFFERENT workdir on the same
+    // connection is still refused, and that half is not relaxed.
+    assert!(
+        reply["structuredContent"]["data"]["session"].is_object(),
+        "the re-open returns the live session: {reply}"
     );
 
     // incompatible contract major is a negotiation failure, not an open

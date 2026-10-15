@@ -114,3 +114,63 @@ anything. Only the text projection does.
 
 Closing this means rendering `typed.md` from the node tree, which is the
 projection-closure work, not a patch to the renderer.
+
+---
+
+## 4. Re-opening the SAME workdir succeeds instead of refusing
+
+**Symptom.** On the same MCP connection, a second `workdir_open` naming the
+workdir already open is refused by the reference with `workdir-already-open`;
+the Rust engine treats it as a success returning the current session.
+
+**The rule the reference states** (`mcp_server.py`, the refusal's own text):
+
+> this connection already drives {open}, and one connection drives one workdir
+> for its whole lifetime
+
+**The rule it applies.** It refuses on *any* second open, including one that
+names the same workdir the connection already drives. That is stricter than the
+stated rule: a connection that re-opens the workdir it is already driving still
+drives exactly one workdir, which is the property the rule is protecting.
+
+**Evidence.** A real session re-opened the workdir it had open, read
+`workdir-already-open` as a transient block, retried with a forked copy, and
+then moved directories around on disk to get past it. The refusal cost more than
+the condition it guarded.
+
+**Why we keep ours.** Re-opening the same thing is a retry, and a retry after a
+dropped connection is the ordinary case. What the rule exists to prevent — one
+connection driving two different workdirs — is still refused, and a dedicated
+test pins that half (`a_connection_still_drives_exactly_one_workdir`). The
+comparison canonicalises both paths, because `C:/a\b` and `C:/a/b` are one
+directory and string equality says they are two.
+
+---
+
+## 5. The advertised agent surface is five tools, not the engine's full set
+
+**Symptom.** `tools/list` on the Rust engine advertises five tools
+(`document_open`, `document_find`, `document_edit`, `document_save`,
+`document_status`). The reference advertises its whole tool set. The engine's
+other 48 remain implemented and callable by name — the CLI and the test suites
+call them — but an agent does not see them.
+
+**The rule the reference states.** None: the reference has no separate agent
+surface, and its `tools/list` is its engine surface.
+
+**Evidence.** One real session made 94 calls against the full surface and 16 of
+them errored, in two dominant classes: an agent guessing a calling convention it
+had no way to know (`{old, new}` at a tool that wanted `{handle,
+replace_with}`), and two engine gates reaching opposite verdicts about one edit.
+The published measurements say the count is the cause, not the individual tools:
+all-tools exposure reaches 32.1% task success (ToolMenuBench, arXiv 2606.15508),
+a four-tool interface is the measured optimum (+16.4% completion, argument
+accuracy 0.20 -> 0.40, MCP-GRANITE arXiv 2609.24161), and 89.1% of
+tool-interface failures are tool misselection (ToolRobustBench arXiv 2608.23635).
+
+**Why we keep ours.** `docs/specs/08_agent_surface.md` is the design. The five
+absorb the steps that have exactly one correct answer — the sync after an edit,
+the preflight before a write, the verification after a build — because asking an
+agent to choose among them is asking it to guess. Where a legacy tool has no
+surface equivalent, a refusal's recovery payload points at `document_status`
+rather than naming a tool the agent cannot call.

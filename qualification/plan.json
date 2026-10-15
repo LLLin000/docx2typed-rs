@@ -2,7 +2,7 @@
   "schema": "docx2typed-qualification-plan-1",
   "version": 1,
   "canon": "docx2typed-qual-canon-1",
-  "generated": "2026-08-14",
+  "generated": "2026-10-14",
   "identities": {
     "capability": {
       "schema": "docx2typed-capability-manifest-1",

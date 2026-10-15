@@ -47,6 +47,25 @@ pub enum Asset {
     Remove(String),
 }
 
+/// The workdir's baseline generation record. Extraction increments it and a
+/// reset does NOT clear it — which is the whole point: a reset that restores the
+/// IDENTICAL document leaves nothing else behind to distinguish it, because the
+/// template is byte-identical by construction and every other file it clears is
+/// gone. A session anchors to this number as well as to the template, so
+/// "same content, new lifecycle" is detectable.
+pub const BASELINE_FILE: &str = "baseline.json";
+pub const BASELINE_SCHEMA: &str = "docx2typed-baseline-1";
+
+/// The baseline generation this workdir is on, and the source it was built from.
+pub fn read_baseline_epoch(workdir: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(workdir.join(BASELINE_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(BASELINE_SCHEMA) {
+        return None;
+    }
+    value.get("epoch").and_then(serde_json::Value::as_u64)
+}
+
 /// The workdir's version pointer. The Store owns its CONTENTS; the layout
 /// constant lives here because extraction has to clear it when it replaces a
 /// baseline, and a literal in two crates is a literal that drifts.
@@ -458,6 +477,16 @@ pub fn plan_extract_with(
             crate::govern::revisions_md(&revisions).into_bytes(),
         ),
     ];
+    // The baseline generation, incremented here and never cleared by a reset.
+    let epoch = read_baseline_epoch(outdir).unwrap_or(0) + 1;
+    assets.push(Asset::Bytes(
+        BASELINE_FILE.to_string(),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": BASELINE_SCHEMA,
+            "epoch": epoch,
+        }))
+        .expect("serializes"),
+    ));
     // Replacing an existing baseline clears what was applied on top of the old
     // one, in this same published set — an extract that writes the new baseline
     // and then deletes the stale sidecars in a second step is not atomic, and a

@@ -40,61 +40,9 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// The frozen tool names (mirror of the Python `@mcp.tool` surface).
-pub const TOOL_NAMES: [&str; 53] = [
-    "engine_info",
-    "workdir_open",
-    "workdir_status",
-    "list_paragraphs",
-    "get_paragraph",
-    "replace_text",
-    "batch_edit",
-    "insert_paragraph",
-    "delete_paragraph",
-    "diff_preview",
-    "commit_sync",
-    "accept_revision",
-    "reject_revision",
-    "reinsert_deleted_text",
-    "delete_comment",
-    "table_insert_row",
-    "table_delete_row",
-    "table_insert_col",
-    "table_delete_col",
-    "table_merge_cells",
-    "table_split_cells",
-    "decide_all",
-    "list_comments",
-    "get_comment",
-    "review_preflight",
-    "review_state",
-    "review_external_preflight",
-    "review_settlement_plan",
-    "review_settle",
-    "review_apply_patch",
-    "review_apply_batch",
-    "review_inbox",
-    "review_ack",
-    "revert",
-    "build_docx",
-    "verify_output",
-    "history_list",
-    "history_gc",
-    "history_restore",
-    "document_search",
-    "document_read",
-    "document_patch",
-    "document_replace",
-    "history_diff",
-    "history_blame",
-    "history_verify",
-    "workspace_fork",
-    "format_span",
-    "workspace_adopt",
-    "facade_locate",
-    "facade_edit",
-    "facade_verify",
-    "facade_resolve",
-];
+/// The tools this server serves. The protocol crate owns the list because the
+/// descriptor advertises it; a second copy is how the two drifted apart.
+pub const TOOL_NAMES: [&str; 53] = docx2typed_protocol::PROTOCOL_TOOLS;
 
 /// The checked-in `.mcp_schemas.json` is the sole runtime source for the
 /// published MCP input contracts.
@@ -110,8 +58,28 @@ fn frozen_mcp_schemas() -> &'static serde_json::Map<String, Value> {
     &SCHEMAS
 }
 
+/// The embedded description table: one sentence-set per tool name.
+///
+/// Loaded once, like the schemas. A name with no entry yields an empty string,
+/// and the surface test refuses that — a tool an agent cannot understand is a
+/// tool it will call wrongly.
+fn frozen_tool_descriptions() -> &'static serde_json::Map<String, Value> {
+    static DESCRIPTIONS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
+        let value: Value = serde_json::from_str(docx2typed_app::embedded::TOOL_DESCRIPTIONS_JSON)
+            .expect("embedded tool_descriptions.json must be valid JSON");
+        value
+            .as_object()
+            .cloned()
+            .expect("embedded tool_descriptions.json must be an object")
+    });
+    &DESCRIPTIONS
+}
+
 /// Return the exact frozen input JSON Schema for a tool.
 pub fn tool_schema(name: &str) -> Value {
+    if let Some(schema) = crate::surface::schema(name) {
+        return schema;
+    }
     frozen_mcp_schemas()
         .get(name)
         .cloned()
@@ -120,11 +88,22 @@ pub fn tool_schema(name: &str) -> Value {
 
 /// `tools/list` payload: every frozen tool with its inputSchema.
 fn tools_list_payload() -> Value {
-    let tools: Vec<Value> = TOOL_NAMES
+    // The five, not the fifty-three: see src/surface/mod.rs for why the count is
+    // the defect and docs/specs/08_agent_surface.md for the evidence. The other
+    // forty-eight stay callable by name for the CLI and the suites.
+    let tools: Vec<Value> = crate::surface::AGENT_TOOLS
         .iter()
         .map(|name| {
+            // The description is not decoration: an agent that has only names to
+            // go on guesses, and 89.1% of tool-interface failures are exactly
+            // that -- tool misselection (ToolRobustBench, arXiv 2608.23635).
+            let description = frozen_tool_descriptions()
+                .get(*name)
+                .and_then(Value::as_str)
+                .unwrap_or("");
             json!({
                 "name": name,
+                "description": description,
                 "inputSchema": tool_schema(name),
             })
         })
@@ -136,7 +115,7 @@ fn tools_list_payload() -> Value {
 // Session
 // ---------------------------------------------------------------------------
 
-struct McpSession {
+pub(crate) struct McpSession {
     engine: Engine,
     workdir: Option<String>,
     author: Option<String>,
@@ -162,9 +141,9 @@ impl McpSession {
         match self.workdir.as_deref() {
             Some(workdir) => Ok(workdir),
             None => Err(self.failure(
+                "workdir_open",
                 "workdir-not-open",
-                "no workdir open; call workdir_open first",
-                "",
+                "no workdir open; call document_open first",
                 "",
             )),
         }
@@ -190,11 +169,23 @@ impl McpSession {
     }
 
     /// A failure envelope with one frozen diagnostic.
-    fn failure(&self, operation: &str, code: &str, message: &str, build_commit: &str) -> Value {
+    pub(crate) fn failure(
+        &self,
+        operation: &str,
+        code: &str,
+        message: &str,
+        build_commit: &str,
+    ) -> Value {
+        // Every refusal carries the recovery payload: the action to take and the
+        // agent-surface tools that carry it out. The Python reference has this
+        // table and the rewrite carried the field with nothing producing it, so
+        // an agent got a code and no way forward -- measured, a session spent
+        // calls discovering that `workdir_open` comes first.
+        let recovery = docx2typed_protocol::filtered_recovery_for(operation, code, None);
         self.tool_result(
             operation,
             "failure",
-            Value::Object(Default::default()),
+            json!({ "recovery": recovery }),
             vec![Diagnostic::new(code, message.to_string())],
             true,
             build_commit,
@@ -202,7 +193,7 @@ impl McpSession {
     }
 
     /// A success envelope carrying `data`.
-    fn success(&self, operation: &str, data: Value, build_commit: &str) -> Value {
+    pub(crate) fn success(&self, operation: &str, data: Value, build_commit: &str) -> Value {
         self.tool_result(operation, "success", data, vec![], false, build_commit)
     }
 
@@ -300,7 +291,7 @@ impl McpSession {
         value
     }
 
-    fn workdir_open(&mut self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn workdir_open(&mut self, args: &Value, build_commit: &str) -> Value {
         let workdir = match args.get("workdir").and_then(Value::as_str) {
             Some(workdir) => workdir.to_string(),
             None => {
@@ -376,11 +367,19 @@ impl McpSession {
                 build_commit,
             );
         }
-        if let Some(open) = self.workdir.clone() {
-            // One connection drives one workdir. Saying only "already open" left
-            // a session believing the block was transient — it retried with a
-            // forked copy, then moved the directories around on disk to get
-            // past it. Name the workdir that is open and the way forward.
+        // One connection drives one workdir — but re-opening the SAME one is
+        // not a conflict, and refusing it made an agent believe the block was
+        // transient: it retried with a forked copy and moved directories around
+        // on disk to get past it. A retry after a dropped connection is the
+        // common case, and it must simply work. A DIFFERENT workdir is a real
+        // conflict, and the refusal below names it.
+        let same = self.workdir.as_deref().is_some_and(|open| {
+            let normalize = |path: &str| {
+                std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
+            };
+            normalize(open) == normalize(&workdir)
+        });
+        if let Some(open) = self.workdir.clone().filter(|_| !same) {
             return self.tool_result(
                 "workdir_open",
                 "failure",
@@ -488,7 +487,30 @@ impl McpSession {
         self.success("workdir_open", json!({ "session": session }), build_commit)
     }
 
-    fn workdir_status(&self, build_commit: &str) -> Value {
+    /// The workdir this connection has open, if any.
+    pub(crate) fn open_workdir(&self) -> Option<&str> {
+        self.workdir.as_deref()
+    }
+
+    /// The operation engine, for the surface to run one op without a tool hop.
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// The session's revision-tracking choices, for the surface to pass through.
+    pub(crate) fn tracking(&self) -> bool {
+        self.track
+    }
+
+    pub(crate) fn authoring(&self) -> Option<&str> {
+        self.author.as_deref()
+    }
+
+    pub(crate) fn stamp(&self) -> Option<&str> {
+        self.date.as_deref()
+    }
+
+    pub(crate) fn workdir_status(&self, build_commit: &str) -> Value {
         let workdir = match self.require_workdir() {
             Ok(workdir) => workdir.to_string(),
             Err(failure) => return failure,
@@ -675,7 +697,88 @@ impl McpSession {
         }
     }
 
-    fn commit_sync(&self, args: &Value, build_commit: &str) -> Value {
+    /// One `document_edit` as a SINGLE store mutation.
+    ///
+    /// The facade's apply and `commit_sync`'s settle run inside one closure, so
+    /// the store hands them a copy of the current generation and publishes or
+    /// discards it as a unit. Two separate mutations left a window where the
+    /// draft had moved and the canonical document had not — a failure reported
+    /// as "nothing was written" while the draft carried the edit. The ledger
+    /// also sees this as one operation, so a repeat replays before the closure
+    /// runs and a stale handle cannot make a retry fail where the first attempt
+    /// succeeded.
+    /// Settle a draft the caller did not settle, or report why it cannot be.
+    ///
+    /// Returns `None` when the draft was already settled or has now been, and
+    /// the failure envelope when settling was refused. The same body
+    /// `document_edit` runs, for the same reason: one implementation, one
+    /// verdict, and no path on which a caller can be told a document is ready
+    /// when its draft was never applied.
+    pub(crate) fn settle_draft(&self, build_commit: &str) -> Option<Value> {
+        let workdir = self.workdir.clone()?;
+        let dirty = docx2typed_review::draft::diff_preview(Path::new(&workdir))
+            .ok()
+            .and_then(|data| data.get("changed_paragraph_ids").cloned())
+            .and_then(|ids| ids.as_array().map(|ids| !ids.is_empty()))
+            .unwrap_or(false);
+        if !dirty {
+            return None;
+        }
+        let tracked = self.track;
+        let author = self.author.clone();
+        let date = self.date.clone();
+        let args = json!({ "operation_id": docx2typed_protocol::new_operation_id() });
+        let result = self.draft_tool_with_boundary(
+            "commit_sync",
+            &args,
+            build_commit,
+            true,
+            move |target| {
+                crate::surface::apply_and_sync(
+                    target,
+                    &[],
+                    docx2typed_review::draft::EditTracking {
+                        tracked,
+                        author: author.as_deref(),
+                        date: date.as_deref(),
+                    },
+                )
+            },
+        );
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            return Some(result);
+        }
+        None
+    }
+
+    pub(crate) fn edit_mutation(
+        &self,
+        args: &Value,
+        edits: Vec<crate::surface::Edit>,
+        tracked: bool,
+        author: Option<String>,
+        date: Option<String>,
+        build_commit: &str,
+    ) -> Value {
+        // `save_boundary: true`, because this mutation IS `commit_sync` plus the
+        // edit it settles — and `commit_sync` is a save boundary. Passing false
+        // meant an edit never minted a Version: measured, `document_status`
+        // reported `versions.total: 0` after a successful edit, so the history a
+        // caller is supposed to be able to list and restore was always empty.
+        self.draft_tool_with_boundary("document_edit", args, build_commit, true, move |target| {
+            crate::surface::apply_and_sync(
+                target,
+                &edits,
+                docx2typed_review::draft::EditTracking {
+                    tracked,
+                    author: author.as_deref(),
+                    date: date.as_deref(),
+                },
+            )
+        })
+    }
+
+    pub(crate) fn commit_sync(&self, args: &Value, build_commit: &str) -> Value {
         let tracked = self.track;
         let author = self.author.clone();
         let date = self.date.clone();
@@ -1111,7 +1214,7 @@ impl McpSession {
         )
     }
 
-    fn review_state(&self, build_commit: &str) -> Value {
+    pub(crate) fn review_state(&self, build_commit: &str) -> Value {
         let workdir = match self.require_workdir() {
             Ok(workdir) => workdir.to_string(),
             Err(failure) => return failure,
@@ -1357,7 +1460,7 @@ impl McpSession {
         )
     }
 
-    fn build_docx(&self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn build_docx(&self, args: &Value, build_commit: &str) -> Value {
         let operation_id = match self.require_operation_id("build_docx", args, build_commit) {
             Ok(id) => id,
             Err(failure) => return failure,
@@ -1495,7 +1598,7 @@ impl McpSession {
         }
     }
 
-    fn verify_output(&self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn verify_output(&self, args: &Value, build_commit: &str) -> Value {
         let workdir = match self.require_workdir() {
             Ok(workdir) => workdir.to_string(),
             Err(failure) => return failure,
@@ -1520,7 +1623,7 @@ impl McpSession {
     /// `history_list`: the version timeline from HEAD backwards, newest
     /// first. Read-only. Python's wrapper reports the draft freshness beside
     /// the store's `version_dirty`, so both ride in the same payload.
-    fn history_list(&self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn history_list(&self, args: &Value, build_commit: &str) -> Value {
         let Some(workdir) = self.workdir.as_deref() else {
             return self.failure(
                 "history_list",
@@ -1600,7 +1703,7 @@ impl McpSession {
     /// the enclosing paragraph block plus its `match_ref`, so the caller can
     /// hand that ref straight to `document_patch`/`format_span` — search is
     /// where the addressing layer comes from.
-    fn document_search(&self, args: &Value, build_commit: &str) -> Value {
+    pub(crate) fn document_search(&self, args: &Value, build_commit: &str) -> Value {
         let Some(workdir) = self.workdir.as_deref() else {
             return self.failure(
                 "document_search",
@@ -2357,6 +2460,14 @@ fn domain_code_from_message(message: &str) -> String {
 /// payload (the same value the line protocol wraps in `OK <json>`).
 /// The declared parameters of one tool, from the frozen schema.
 fn declared_parameters(tool: &str) -> Option<BTreeSet<String>> {
+    // The agent surface first. Its schemas live in `crate::surface` because they
+    // are new and the frozen bundle is a published contract; reading only the
+    // bundle meant a surface tool had NO declared parameters, so `unknown
+    // argument` was never raised for one and a typo'd key was silently ignored.
+    if let Some(schema) = crate::surface::schema(tool) {
+        let properties = schema.get("properties")?.as_object()?;
+        return Some(properties.keys().cloned().collect());
+    }
     let schemas: Value = serde_json::from_str(docx2typed_app::embedded::MCP_SCHEMAS_JSON).ok()?;
     let properties = schemas.get(tool)?.get("properties")?.as_object()?;
     Some(properties.keys().cloned().collect())
@@ -2450,6 +2561,14 @@ fn reject_unknown_arguments(tool: &str, args: &Value) -> Result<(), (String, Str
     Err(("invalid-arguments".to_string(), message))
 }
 
+/// Is this a name the server will dispatch?
+///
+/// The agent surface plus every tool the engine serves: the five are what an
+/// agent may call, the rest are what the CLI and the suites call by name.
+fn is_known_tool(name: &str) -> bool {
+    crate::surface::is_agent_tool(name) || TOOL_NAMES.contains(&name)
+}
+
 fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commit: &str) -> Value {
     let args = if args.is_null() {
         Value::Object(Default::default())
@@ -2458,6 +2577,9 @@ fn dispatch_tool(session: &mut McpSession, tool: &str, args: &Value, build_commi
     };
     if let Err((code, message)) = reject_unknown_arguments(tool, &args) {
         return session.failure(tool, &code, &message, build_commit);
+    }
+    if crate::surface::is_agent_tool(tool) {
+        return crate::surface::dispatch(session, tool, &args, build_commit);
     }
     let reply = match tool {
         "tools/list" => {
@@ -2931,7 +3053,7 @@ pub fn run(build_commit: &str) -> i32 {
                             "structuredContent": result,
                             "isError": false,
                         }})
-                    } else if TOOL_NAMES.iter().any(|known| *known == name) {
+                    } else if is_known_tool(&name) {
                         let result = dispatch_tool(&mut session, &name, &arguments, build_commit);
                         json!({"jsonrpc": "2.0", "id": id, "result": result})
                     } else {
@@ -2961,7 +3083,7 @@ pub fn run(build_commit: &str) -> i32 {
             .unwrap_or("")
             .to_string();
         let args = request.get("args").cloned().unwrap_or(Value::Null);
-        let reply = if TOOL_NAMES.contains(&tool.as_str()) || tool == "tools/list" {
+        let reply = if is_known_tool(&tool) || tool == "tools/list" {
             let result = dispatch_tool(&mut session, &tool, &args, build_commit);
             let mut json = serde_json::to_string(&result).expect("serializes");
             json.insert_str(0, "OK ");

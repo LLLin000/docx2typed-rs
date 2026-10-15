@@ -34,6 +34,9 @@ pub const UNICODE_VERTICAL_CATALOG_JSON: &str =
 /// `tools/list`; the checked-in file is the frozen MCP contract artifact.
 pub const MCP_SCHEMAS_JSON: &str = include_str!("../assets/mcp_schemas.json");
 
+/// Embedded flat tool-name -> description map. This is the sole runtime
+/// source for the MCP `description` field in `tools/list`.
+pub const TOOL_DESCRIPTIONS_JSON: &str = include_str!("../assets/tool_descriptions.json");
 /// The catalog's self-pinned hash (the `catalog_hash` field inside the JSON).
 pub const UNICODE_CATALOG_HASH: &str =
     "460a8f5581375b6f16e2cd3025d591785e2b1cde941a9d33eb43ba09cdacde58";

@@ -10,19 +10,20 @@ pub mod descriptor;
 pub mod dto;
 pub mod evidence;
 pub mod negotiate;
+pub mod recovery;
 
 pub use canonical::{
     bytes_sha256, canonical_json, canonical_operation_input, file_sha256, new_operation_id,
     resolve_path, semantic_sha256, typed_path_value, utc_now_iso,
 };
 pub use descriptor::{
-    engine_descriptor, EngineDescriptor, CONTRACT_RANGES, FEATURES, PACKAGE_VERSION,
+    engine_descriptor, EngineDescriptor, AGENT_TOOLS, CONTRACT_RANGES, FEATURES, PACKAGE_VERSION,
     PROTOCOL_COMMANDS, PROTOCOL_TOOLS, REQUIRED_FEATURES,
 };
 pub use dto::{diagnostic_spec, diagnostic_spec_opt, Diagnostic, DiagnosticSpec, ResultEnvelope};
 pub use evidence::{base_evidence_payload, run_evidence, RunEvidence};
 pub use negotiate::{negotiate, NegotiationError};
-
+pub use recovery::{filtered_recovery_for, profile_recovery, recovery_for, Recovery};
 /// Frozen identity of the Protocol-major-1 schema bundle (semantic SHA-256 of
 /// `scripts/protocol_schema_bundle.json`, pinned by reference/bundle-1
 /// plan.identities.contract.schema_bundle_sha256).

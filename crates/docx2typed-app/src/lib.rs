@@ -2470,7 +2470,10 @@ impl Engine {
             "paragraphs": 0,
             "snapshot": {"current": "clean", "staged": "clean"},
             "cas": {"current_matches_filesystem": true},
-            "supported_tools": docx2typed_protocol::PROTOCOL_TOOLS.to_vec(),
+            // The agent surface, not the engine's full list: this field is read by
+            // an agent asking what it may call. See AGENT_TOOLS for why the two
+            // lists differ and why reporting the wrong one matters.
+            "supported_tools": docx2typed_protocol::AGENT_TOOLS.to_vec(),
         }))
     }
 

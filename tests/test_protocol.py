@@ -131,7 +131,16 @@ def test_mcp_stdio_negotiates_before_open_and_returns_structured_result(tmp_path
                 opened_session = result["data"]["session"]
                 assert opened_session["workdir"]["value"] == str(workdir.resolve())
                 assert len(opened_session["workdir_manifest_sha256"]) == 64
-                assert opened_session["supported_tools"] == ["engine_info", "workdir_open"]
+                # The agent surface, not the engine's full list: this field is read by
+                # an agent asking what it may call. It pinned the old two-name
+                # value, which was wrong twice over -- see AGENT_TOOLS.
+                assert opened_session["supported_tools"] == [
+                    "document_open",
+                    "document_find",
+                    "document_edit",
+                    "document_save",
+                    "document_status",
+                ]
 
                 second = await client.call_tool("workdir_open", {"workdir": str(workdir)})
                 assert second.isError is True

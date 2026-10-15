@@ -5,6 +5,7 @@
 
 mod cli;
 mod mcp;
+mod surface;
 
 use docx2typed_app::Operation;
 
