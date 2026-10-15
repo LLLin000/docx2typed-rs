@@ -1235,7 +1235,8 @@ fn island_leaf_for(
                  ({runs} run(s)). Word splits a paragraph's text at every formatting \
                  change, so a phrase copied out of Word can differ from the stored \
                  text by whitespace or punctuation inside a run. Read the paragraph \
-                 with document_read and copy the exact characters, or replace the \
+                 with document_find(query, scope=<paragraph_id>) and copy the exact \
+                 characters, or replace the \
                  whole paragraph with delete + insert_after, which needs no run match."
             ),
         ));
@@ -2639,7 +2640,7 @@ fn check_base_revision(
             "stale-document-view",
             format!(
                 "base_revision {token:?} matches neither the current draft ({current:?}) nor the \
-                 previous committed view ({previous:?}) — re-read with document_read/document_search \
+                 previous committed view ({previous:?}) — re-read with document_find \
                  and re-patch (current_revision is in data.current_revision)"
             ),
         ));
@@ -2656,7 +2657,7 @@ fn check_base_revision(
         "stale-document-view",
         format!(
             "base_revision {token:?} does not match the current draft ({current:?}) and at least \
-             one hunk no longer resolves — re-read with document_read/document_search and re-patch \
+             one hunk no longer resolves — re-read with document_find and re-patch \
              (current revision is in data.current_revision)"
         ),
     ))

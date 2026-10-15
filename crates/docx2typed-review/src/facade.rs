@@ -341,7 +341,10 @@ pub fn edit(
         "staged": staged.len(),
         "staged_targets": staged,
         "engine": result,
-        "next": "verify, then commit_sync and build_docx",
+        // Names only what the agent surface mounts: `document_edit` already
+        // synced and verified, so the next real step is writing the file out.
+        // The old text sent the caller to two tools that are not mounted.
+        "next": "document_save to write the file, then document_status to confirm",
     }))
 }
 
