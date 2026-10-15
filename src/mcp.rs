@@ -754,16 +754,21 @@ impl McpSession {
     pub(crate) fn edit_mutation(
         &self,
         args: &Value,
-        requests: Vec<docx2typed_review::facade::EditRequest>,
+        edits: Vec<crate::surface::Edit>,
         tracked: bool,
         author: Option<String>,
         date: Option<String>,
         build_commit: &str,
     ) -> Value {
-        self.draft_tool_with_boundary("document_edit", args, build_commit, false, move |target| {
+        // `save_boundary: true`, because this mutation IS `commit_sync` plus the
+        // edit it settles — and `commit_sync` is a save boundary. Passing false
+        // meant an edit never minted a Version: measured, `document_status`
+        // reported `versions.total: 0` after a successful edit, so the history a
+        // caller is supposed to be able to list and restore was always empty.
+        self.draft_tool_with_boundary("document_edit", args, build_commit, true, move |target| {
             crate::surface::apply_and_sync(
                 target,
-                &requests,
+                &edits,
                 docx2typed_review::draft::EditTracking {
                     tracked,
                     author: author.as_deref(),

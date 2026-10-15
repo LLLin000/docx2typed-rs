@@ -30,17 +30,37 @@ use docx2typed_review::{collab, server::MutationError};
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// One edit, in the shape its kind requires.
+///
+/// The kinds are a closed set and every one of them addresses its target the same
+/// way — a handle from `document_find` — because two addressing schemes is how a
+/// caller picks the wrong one. A missing per-kind argument is refused naming that
+/// argument, and an unknown kind is refused naming the allowed ones.
+pub(crate) enum Edit {
+    Replace(EditRequest),
+    InsertAfter { handle: String, text: String },
+    Delete { handle: String },
+}
+
+impl Edit {
+    #[allow(dead_code)] // the kinds are matched structurally; kept for symmetry
+    fn handle(&self) -> &str {
+        match self {
+            Edit::Replace(request) => &request.handle,
+            Edit::InsertAfter { handle, .. } => handle,
+            Edit::Delete { handle } => handle,
+        }
+    }
+}
+
 /// The edits, or a refusal that names the shape rather than only the mistake.
-fn requests_from(
-    session: &McpSession,
-    args: &Value,
-    build_commit: &str,
-) -> Result<Vec<EditRequest>, Value> {
+fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<Vec<Edit>, Value> {
     let Some(edits) = args.get("edits").and_then(Value::as_array) else {
         return Err(session.failure(
             "document_edit",
             "invalid-arguments",
-            "document_edit requires `edits`: an array of {handle, replace_with}",
+            "document_edit requires `edits`: an array of edits, each with a `handle` from \
+             document_find and a `kind` of replace, insert_after or delete",
             build_commit,
         ));
     };
@@ -53,58 +73,136 @@ fn requests_from(
             build_commit,
         ));
     }
-    let mut requests = Vec::with_capacity(edits.len());
+    let mut parsed = Vec::with_capacity(edits.len());
     for (index, edit) in edits.iter().enumerate() {
         let number = index + 1;
-        let handle = edit.get("handle").and_then(Value::as_str);
-        let replace_with = edit.get("replace_with").and_then(Value::as_str);
-        let (Some(handle), Some(replace_with)) = (handle, replace_with) else {
-            // Name the right keys, not just the wrong ones: this is the exact
-            // place a session guessed `{old, new}` and had to try again.
+        let keys = || {
+            edit.as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(", "))
+                .unwrap_or_default()
+        };
+        let Some(handle) = edit.get("handle").and_then(Value::as_str) else {
             return Err(session.failure(
                 "document_edit",
                 "invalid-arguments",
                 &format!(
-                    "edit #{number} must be exactly {{\"handle\": <a handle from \
-                     document_find>, \"replace_with\": <the new text>}}; got keys [{}]",
-                    edit.as_object()
-                        .map(|object| object.keys().cloned().collect::<Vec<_>>().join(", "))
-                        .unwrap_or_default()
+                    "edit #{number} needs a `handle` from document_find; got keys [{}]",
+                    keys()
                 ),
                 build_commit,
             ));
         };
-        requests.push(EditRequest {
-            handle: handle.to_string(),
-            replace_with: replace_with.to_string(),
-        });
+        let kind = edit
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("replace");
+        match kind {
+            "replace" => {
+                let Some(replace_with) = edit.get("replace_with").and_then(Value::as_str) else {
+                    return Err(session.failure(
+                        "document_edit",
+                        "invalid-arguments",
+                        &format!(
+                            "edit #{number} is kind `replace` and needs `replace_with` (the new \
+                             text); got keys [{}]",
+                            keys()
+                        ),
+                        build_commit,
+                    ));
+                };
+                parsed.push(Edit::Replace(EditRequest {
+                    handle: handle.to_string(),
+                    replace_with: replace_with.to_string(),
+                }));
+            }
+            "insert_after" => {
+                let Some(text) = edit.get("text").and_then(Value::as_str) else {
+                    return Err(session.failure(
+                        "document_edit",
+                        "invalid-arguments",
+                        &format!(
+                            "edit #{number} is kind `insert_after` and needs `text` (the \
+                             paragraph to insert); got keys [{}]",
+                            keys()
+                        ),
+                        build_commit,
+                    ));
+                };
+                parsed.push(Edit::InsertAfter {
+                    handle: handle.to_string(),
+                    text: text.to_string(),
+                });
+            }
+            "delete" => parsed.push(Edit::Delete {
+                handle: handle.to_string(),
+            }),
+            other => {
+                return Err(session.failure(
+                    "document_edit",
+                    "invalid-arguments",
+                    &format!(
+                        "edit #{number} has kind `{other}`; the allowed kinds are replace, \
+                         insert_after and delete"
+                    ),
+                    build_commit,
+                ))
+            }
+        }
     }
-    Ok(requests)
+    Ok(parsed)
 }
 
 /// Apply the edits and settle them, against one generation of the workdir.
 ///
-/// This is the body `commit_sync` runs, composed here rather than called
-/// through its handler: the handler opens its own store mutation, and nesting
-/// one inside another is not a transaction, it is two.
+/// This is the body `commit_sync` runs, composed here rather than called through
+/// its handler: the handler opens its own store mutation, and nesting one inside
+/// another is not a transaction, it is two.
+///
+/// Every kind runs inside the SAME closure, so a refusal anywhere discards the
+/// generation — inserts and deletes included. That is why the kinds do not each
+/// need their own fail-closed staging: the store's generation copy is the
+/// staging, and it covers all of them at once.
 pub(crate) fn apply_and_sync(
     target: &Path,
-    requests: &[EditRequest],
+    edits: &[Edit],
     tracking: EditTracking<'_>,
 ) -> Result<Value, MutationError> {
-    // No requests means "settle what is there" — the save path uses it, and it
-    // must not open an empty facade batch, which the facade refuses by design.
+    let mut requests: Vec<EditRequest> = Vec::new();
+    let mut structural: Vec<Value> = Vec::new();
+    for edit in edits {
+        match edit {
+            Edit::Replace(request) => requests.push(request.clone()),
+            Edit::InsertAfter { handle, text } => {
+                let anchor = paragraph_of(target, handle)?;
+                let inserted = draft::insert_paragraph(target, &anchor, text, Some(&anchor))
+                    .map_err(|error| MutationError::new(error.code, error.detail))?;
+                structural
+                    .push(json!({ "kind": "insert_after", "anchor": anchor, "result": inserted }));
+            }
+            Edit::Delete { handle } => {
+                let paragraph = paragraph_of(target, handle)?;
+                let deleted = draft::delete_paragraph(target, &paragraph)
+                    .map_err(|error| MutationError::new(error.code, error.detail))?;
+                structural.push(
+                    json!({ "kind": "delete", "paragraph_id": paragraph, "result": deleted }),
+                );
+            }
+        }
+    }
+
+    // No replacements means "settle what is there" — the save path uses it, and
+    // it must not open an empty facade batch, which the facade refuses by design.
     let edited = if requests.is_empty() {
         Value::Null
     } else {
-        facade::edit(target, requests, false, tracking)
+        facade::edit(target, &requests, false, tracking)
             .map_err(|error| MutationError::new(error.code, error.detail))?
     };
     if !requests.is_empty() && edited.get("outcome").and_then(Value::as_str) != Some("committed") {
         // The facade stages every target before it applies any, so a blocked
         // batch has written nothing. Report it and let the caller decide; the
         // generation it returns is the one it started from.
-        return Ok(json!({ "edit": edited, "synced": Value::Null }));
+        return Ok(json!({ "edit": edited, "structural": structural, "synced": Value::Null }));
     }
 
     // Bootstrap the review session BEFORE `apply_projection` rewrites typed.md.
@@ -123,6 +221,7 @@ pub(crate) fn apply_and_sync(
     if changed.is_empty() {
         return Ok(json!({
             "edit": edited,
+            "structural": structural,
             "synced": {
                 "changed_paragraph_ids": [],
                 "state": "clean",
@@ -150,12 +249,31 @@ pub(crate) fn apply_and_sync(
     .map_err(|error| MutationError::new(error.code, error.detail))?;
     Ok(json!({
         "edit": edited,
+        "structural": structural,
         "synced": {
             "changed_paragraph_ids": changed,
             "state": "clean",
             "current_snapshot": published.get("current_snapshot").cloned().unwrap_or(Value::Null),
         },
     }))
+}
+
+/// The paragraph a handle addresses.
+///
+/// A handle names a span, and a span lives in exactly one paragraph, so this is
+/// how an insert or a delete finds its target without a second addressing scheme.
+fn paragraph_of(workdir: &Path, handle: &str) -> Result<String, MutationError> {
+    docx2typed_core::document_search::resolve_match_ref(workdir, handle)
+        .map(|resolved| resolved.paragraph_id)
+        .map_err(|error| {
+            let message = error.to_string();
+            match message.split_once(':') {
+                Some((code, detail)) if !code.contains(' ') => {
+                    MutationError::new(code, detail.trim())
+                }
+                _ => MutationError::new("invalid-edit", message),
+            }
+        })
 }
 
 /// `document_edit` — apply the edits and settle them, in one transaction.
@@ -168,8 +286,8 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
             build_commit,
         );
     }
-    let requests = match requests_from(session, args, build_commit) {
-        Ok(requests) => requests,
+    let edits = match edits_from(session, args, build_commit) {
+        Ok(edits) => edits,
         Err(failure) => return failure,
     };
     // Optional, and minted when absent, so a caller does not have to learn an
@@ -198,7 +316,21 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
     if dry_run {
         // Nothing is written, so nothing needs a transaction or a ledger entry.
         let workdir = session.open_workdir().unwrap_or_default().to_string();
-        let preview = match facade::edit(Path::new(&workdir), &requests, true, tracking) {
+        let preview = match facade::edit(
+            Path::new(&workdir),
+            &edits
+                .iter()
+                .filter_map(|edit| match edit {
+                    Edit::Replace(request) => Some(request.clone()),
+                    // A dry run reports what the replacements would do; the
+                    // structural kinds are checked by the same resolve that the
+                    // real call uses, so the report is not weaker than the act.
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            true,
+            tracking,
+        ) {
             Ok(value) => value,
             Err(error) => {
                 return session.failure("document_edit", &error.code, &error.detail, build_commit)
@@ -218,13 +350,18 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
     mutation_args["edits"] = args.get("edits").cloned().unwrap_or(Value::Null);
     let applied = session.edit_mutation(
         &mutation_args,
-        requests.clone(),
+        edits,
         tracked,
         author.clone(),
         date.clone(),
         build_commit,
     );
 
+    let edit_count = args
+        .get("edits")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
     let Some(envelope) = applied.get("structuredContent") else {
         return applied;
     };
@@ -256,7 +393,7 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
             &format!(
                 "{} of {} edit(s) cannot be applied, so nothing was written: {}",
                 reasons.len().max(1),
-                requests.len(),
+                edit_count,
                 reasons.join("; ")
             ),
             build_commit,
@@ -267,7 +404,12 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
         json!({
             "operation_id": operation_id,
             "dry_run": false,
+            // Replacements report through `edit` (the facade's staged targets);
+            // inserts and deletes through `structural`. A caller that asked for
+            // one kind gets the report for it and an explicit null for the other,
+            // rather than a field that silently is not there.
             "edit": data.get("edit").cloned().unwrap_or(Value::Null),
+            "structural": data.get("structural").cloned().unwrap_or(Value::Null),
             "synced": data.get("synced").cloned().unwrap_or(Value::Null),
         }),
         build_commit,

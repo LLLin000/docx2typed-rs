@@ -26,7 +26,7 @@
 
 mod edit;
 
-pub(crate) use edit::apply_and_sync;
+pub(crate) use edit::{apply_and_sync, Edit};
 mod find;
 mod open;
 mod save;
@@ -86,10 +86,22 @@ pub fn schema(name: &str) -> Option<Value> {
                     "items": {
                         "type": "object",
                         "properties": {
+                            // A closed set, not free text: an invented kind is
+                            // refused naming the allowed ones. `replace` is the
+                            // default, so the common case needs no `kind` at all.
+                            "kind": {
+                                "type": "string",
+                                "enum": ["replace", "insert_after", "delete"],
+                                "default": "replace",
+                            },
+                            // Every kind addresses its target the same way: a
+                            // handle from document_find. One addressing scheme,
+                            // because two is how a caller picks the wrong one.
                             "handle": {"type": "string"},
-                            "replace_with": {"type": "string"},
+                            "replace_with": {"type": ["string", "null"], "default": null},
+                            "text": {"type": ["string", "null"], "default": null},
                         },
-                        "required": ["handle", "replace_with"],
+                        "required": ["handle"],
                         "additionalProperties": false,
                     },
                 },

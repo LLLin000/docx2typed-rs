@@ -105,12 +105,34 @@ Two suites, two subjects — and the split is deliberate:
   ENGINE's acceptance. They drive the engine's own tools, which are still served
   by name, so they still prove what they always proved.
 
-**The 19 tasks are NOT yet re-pointed at the surface**, and it is not a
-mechanical translation: their call lists are written against the engine's tools
-(including `commit_sync`, which the surface absorbs) and their payload checks are
-indexed by call position (`results[index + 2]`), so merging calls shifts every
-index and the assertions have to be rewritten per task rather than remapped. That
-is the remaining work, and it is named here rather than quietly skipped.
+**The 19 tasks now run through the surface too**, and pass 19/19:
+
+```text
+python qualification/facade_task_suite.py            # the engine's tools
+python qualification/facade_task_suite.py --surface  # the five
+```
+
+It is not a rename. The tasks needed three things the surface did not have:
+
+1. **A handle comes from a previous call.** The engine's tasks are one static
+   batch; a surface edit addresses a handle the search returned. The suite now
+   resolves `@<call index>.<dotted path>` placeholders — and `*` over a list, for
+   "unify this term everywhere", which is what an agent does by looping — and
+   runs one call per connection, as an agent does.
+2. **Insert and delete.** The surface could only replace a handle's text, so
+   "insert a dependent claim" — a core patent task — was not expressible at all.
+   `document_edit` now takes a closed `kind` of `replace`, `insert_after` or
+   `delete`, still addressing every kind with the same handle.
+3. **A save boundary.** The surface's edit absorbs `commit_sync`, and
+   `commit_sync` IS a save boundary; without it an edit never minted a Version
+   and `document_status` reported `versions.total: 0` after a successful edit.
+
+Two task expectations changed, and both are the surface being BETTER:
+`repeat_before_commit_refuses` expected `paragraph-has-uncommitted-length-change`
+— a state that cannot exist on the surface, because every edit is settled as part
+of the edit — and it now refuses for the reason that remains, `edit-blocked`. And
+an empty query is refused by the surface's own argument validator
+(`invalid-arguments`) before the search is reached.
 
 Additionally:
 

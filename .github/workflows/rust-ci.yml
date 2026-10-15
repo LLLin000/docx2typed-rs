@@ -229,6 +229,11 @@ jobs:
           # an agent does and read the built DOCX back rather than trusting a
           # success flag, plus the failure modes that are injectable from outside.
           cargo test --test agent_surface
+          # And the same 19 natural-language tasks, run through the five tools.
+          # docs/specs/08_agent_surface.md §6: a task passes only when the
+          # exported document reaches the expected state, and the surface has to
+          # reach it too — not just the engine underneath.
+          python qualification/facade_task_suite.py --surface
 
       - name: MCP smoke (engine_info + tools/list)
         shell: bash
