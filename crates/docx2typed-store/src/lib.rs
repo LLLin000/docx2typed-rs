@@ -116,6 +116,41 @@ impl Default for WorkdirStore {
     }
 }
 
+/// Rename a directory, retrying a transient sharing violation.
+///
+/// On Windows a directory rename fails with "Access is denied" while anything
+/// holds a handle inside it — a scanner, an indexer, another process briefly
+/// opening a file. That is transient by nature, and it is why the publish below
+/// cannot be a single unguarded `fs::rename`: measured on CI, the extract in
+/// `review_crate` failed this way on windows-latest, a different test each run,
+/// with 47 of 48 passing — and never locally, where nothing scans the directory.
+///
+/// The retry is bounded and the last error is returned, so a genuine permission
+/// problem still fails loudly rather than being papered over.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 10;
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // Only a sharing/permission failure is worth retrying; anything
+                // else (a missing source, a cross-device move) will not improve.
+                let transient = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                );
+                if !transient {
+                    return Err(error);
+                }
+                last = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+            }
+        }
+    }
+    Err(last.expect("a transient failure was recorded"))
+}
+
 impl WorkdirStore {
     pub fn new() -> Self {
         WorkdirStore
@@ -205,17 +240,17 @@ impl WorkdirStore {
                 counter
             ));
             let _ = fs::remove_dir_all(&backup);
-            if let Err(error) = fs::rename(&root, &backup) {
+            if let Err(error) = rename_with_retry(&root, &backup) {
                 let _ = fs::remove_dir_all(&staging);
                 return Err(error.into());
             }
-            if let Err(error) = fs::rename(&staging, &root) {
-                let _ = fs::rename(&backup, &root);
+            if let Err(error) = rename_with_retry(&staging, &root) {
+                let _ = rename_with_retry(&backup, &root);
                 return Err(error.into());
             }
             let _ = fs::remove_dir_all(&backup);
         } else {
-            if let Err(error) = fs::rename(&staging, &root) {
+            if let Err(error) = rename_with_retry(&staging, &root) {
                 let _ = fs::remove_dir_all(&staging);
                 return Err(error.into());
             }
