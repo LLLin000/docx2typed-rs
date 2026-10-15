@@ -1162,6 +1162,19 @@ pub fn check_editable_span(
     island_leaf_for(workdir, paragraph_id, old, leaf, Some(start)).map(|_| ())
 }
 
+/// A core domain failure carries `code: detail`. Keep the code the message
+/// names and drop the duplicated prefix: the caller's diagnostic already prints
+/// `code: message`, so a hardcoded code produced
+/// `prose-edit-ambiguous: prose-edit-ambiguous: old text occurs twice ...` and
+/// the agent quoted the doubled form back.
+fn core_failure(error: docx2typed_core::CoreError, fallback: &str) -> CollaborationError {
+    let message = error.to_string();
+    match message.split_once(':') {
+        Some((code, detail)) if !code.contains(' ') => CollaborationError::new(code, detail.trim()),
+        _ => CollaborationError::new(fallback, message),
+    }
+}
+
 fn island_leaf_for(
     workdir: &Path,
     paragraph_id: &str,
@@ -1213,7 +1226,7 @@ fn island_leaf_for(
         old,
         char_start,
     )
-    .map_err(|error| CollaborationError::new("prose-edit-ambiguous", error.to_string()))?;
+    .map_err(|error| core_failure(error, "prose-edit-ambiguous"))?;
     let Some(span) = span else {
         return Err(CollaborationError::new(
             "cross-leaf-edit",
@@ -1228,7 +1241,7 @@ fn island_leaf_for(
         ));
     };
     docx2typed_core::prose::resolve_leaf(&inventory, &part, paragraph_id, span.first_leaf)
-        .map_err(|error| CollaborationError::new("opaque-paragraph-mutated", error.to_string()))?;
+        .map_err(|error| core_failure(error, "opaque-paragraph-mutated"))?;
     if let Some(index) = leaf_index {
         if index != span.first_leaf {
             return Err(CollaborationError::new(
@@ -4291,5 +4304,38 @@ mod visible_text_tests {
             typed_body_visible_text("<docx-revision id=\"N1\" kind=\"insert\">new</docx-revision>"),
             "new"
         );
+    }
+}
+
+#[cfg(test)]
+mod core_failure_tests {
+    use super::core_failure;
+
+    /// A core domain failure already names its code. Keeping it while dropping
+    /// the duplicate prefix is the point: the diagnostic prints `code: message`,
+    /// and a hardcoded code produced
+    /// `prose-edit-ambiguous: prose-edit-ambiguous: old text occurs twice ...`,
+    /// which the blind agent quoted back verbatim.
+    #[test]
+    fn the_code_the_message_names_is_not_repeated() {
+        let failure = core_failure(
+            docx2typed_core::CoreError::Domain(
+                "opaque-paragraph-mutated: P4: leaf 0 sits inside w:r".to_string(),
+            ),
+            "invalid-edit",
+        );
+        assert_eq!(failure.code, "opaque-paragraph-mutated");
+        assert_eq!(failure.detail, "P4: leaf 0 sits inside w:r");
+    }
+
+    /// A failure that names no code keeps the caller's.
+    #[test]
+    fn a_message_without_a_code_keeps_the_fallback() {
+        let failure = core_failure(
+            docx2typed_core::CoreError::Domain("plain failure".to_string()),
+            "invalid-edit",
+        );
+        assert_eq!(failure.code, "invalid-edit");
+        assert_eq!(failure.detail, "plain failure");
     }
 }
