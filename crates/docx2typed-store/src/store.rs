@@ -235,7 +235,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// WHICH file. That turned an intermittent CI-only failure into an afternoon of
 /// guessing: the message identified neither the file nor the operation, and the
 /// path was known at every call site that produced it.
-fn at(path: &Path, error: io::Error) -> StoreError {
+pub(crate) fn at(path: &Path, error: io::Error) -> StoreError {
     StoreError::Io(io::Error::new(
         error.kind(),
         format!("{}: {error}", path.display()),

@@ -6,6 +6,7 @@
 //! package — copy-if-unchanged per frozen PRD decisions 13/14/15. It never
 //! recompresses.
 
+use crate::store::at;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -151,26 +152,74 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     Err(last.expect("a transient failure was recorded"))
 }
 
+/// Apply a ChangeSet into `target`, which must already exist.
+///
+/// Shared by both publish paths: the in-place one, where there is nothing to
+/// protect, and the staged one, where the previous workdir must survive a
+/// partial apply.
+fn apply_change_set(
+    target: &Path,
+    change_set: &docx2typed_core::ChangeSet,
+) -> Result<(), StoreError> {
+    for asset in &change_set.assets {
+        let path = target.join(asset_path(asset));
+        match asset {
+            Asset::Bytes(_, bytes) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| at(parent, error))?;
+                }
+                fs::write(&path, bytes).map_err(|error| at(&path, error))?;
+            }
+            Asset::CopySource { source, .. } => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| at(parent, error))?;
+                }
+                fs::copy(source, &path).map_err(|error| at(source, error))?;
+            }
+            Asset::Remove(_) => {
+                let result = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+                match result {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(at(&path, error)),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl WorkdirStore {
     pub fn new() -> Self {
         WorkdirStore
     }
 
-    /// Materialize a (possibly partial) `ChangeSet` into `dir`.
+    /// Materialize a `ChangeSet` into `dir`.
     ///
-    /// Staging contract (Gap 1): the ChangeSet is treated as a DELTA applied on
-    /// top of a seeded copy of the existing workdir. The staging directory is
-    /// first populated byte-for-byte from the current workdir (via `copy_workdir`)
-    /// and only then has the ChangeSet applied to it; the populated staging dir
-    /// is renamed over `dir` in one step. Consequences:
-    ///   * a ChangeSet that names one asset leaves every other existing asset
-    ///     in place (no silent deletion);
-    ///   * a ChangeSet that fails partway through leaves the previous workdir
-    ///     untouched, because nothing is published until the whole apply
-    ///     succeeds.
+    /// Two publish paths, chosen by whether there is anything to protect:
     ///
-    /// Copy-over-empty is deliberate: the empty-staging alternative would force
-    /// every caller to pass a COMPLETE set or risk wiping the workdir.
+    /// * **The workdir does not exist** — nothing can be damaged, so the ChangeSet is
+    ///   applied in place. This is the extract case, and it matters that it takes no
+    ///   RENAME: a directory rename on Windows fails intermittently while a scanner
+    ///   holds a handle on a freshly written file. Measured: the extract in
+    ///   `review_crate` failed that way on windows-latest, a different test each run,
+    ///   47 of 48 passing, `os error 3` or `os error 5`, no path in the message —
+    ///   because the failing call was the rename of a staging directory that had just
+    ///   been written. It reproduces locally at `--test-threads=8` (6 of 6) and never
+    ///   at `--test-threads=2`, which is why it looked CI-only.
+    /// * **The workdir exists** — the ChangeSet is applied to a staging copy seeded
+    ///   byte-for-byte from the current workdir, and that copy is renamed over `dir`
+    ///   in one step. So a ChangeSet that names one asset leaves every other existing
+    ///   asset in place, and a ChangeSet that fails partway leaves the previous
+    ///   workdir untouched.
+    ///
+    /// Seeding from the existing workdir rather than staging over an empty one is
+    /// deliberate: the empty-staging alternative would force every caller to pass a
+    /// COMPLETE set or risk wiping the workdir.
     pub fn commit_workdir(
         &self,
         dir: &Path,
@@ -178,6 +227,12 @@ impl WorkdirStore {
     ) -> Result<(), StoreError> {
         let root = resolve_path(dir);
         let parent = root.parent().unwrap_or_else(|| Path::new("."));
+
+        if !root.exists() {
+            fs::create_dir_all(&root).map_err(|error| at(&root, error))?;
+            return apply_change_set(&root, change_set);
+        }
+
         fs::create_dir_all(parent)?;
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let staging = parent.join(format!(
@@ -186,75 +241,37 @@ impl WorkdirStore {
             counter
         ));
         let _ = fs::remove_dir_all(&staging);
-        fs::create_dir(&staging)?;
-
-        if root.exists() {
-            self.copy_workdir(&root, &staging)?;
-        }
-
-        let apply_result = (|| {
-            for asset in &change_set.assets {
-                let target = staging.join(asset_path(asset));
-                match asset {
-                    Asset::Bytes(_, bytes) => {
-                        if let Some(parent) = target.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        fs::write(&target, bytes)?;
-                    }
-                    Asset::CopySource { source, .. } => {
-                        if let Some(parent) = target.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        fs::copy(source, &target)?;
-                    }
-                    Asset::Remove(_) => {
-                        let result = if target.is_dir() {
-                            fs::remove_dir_all(&target)
-                        } else {
-                            fs::remove_file(&target)
-                        };
-                        match result {
-                            Ok(()) => {}
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = apply_result {
+        fs::create_dir(&staging).map_err(|error| at(&staging, error))?;
+        if let Err(error) = self.copy_workdir(&root, &staging) {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
+        if let Err(error) = apply_change_set(&staging, change_set) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        // Preserve the engine-owned workspace identity across a baseline
+        // replacement so re-extracting keeps family/workspace ids stable.
         let identity_path = root.join("workspace.json");
         if identity_path.is_file() {
             let _ = fs::copy(&identity_path, staging.join("workspace.json"));
         }
 
-        if root.exists() {
-            let backup = parent.join(format!(
-                ".docx2typed-commit-old-{}-{}.tmp",
-                std::process::id(),
-                counter
-            ));
-            let _ = fs::remove_dir_all(&backup);
-            if let Err(error) = rename_with_retry(&root, &backup) {
-                let _ = fs::remove_dir_all(&staging);
-                return Err(error.into());
-            }
-            if let Err(error) = rename_with_retry(&staging, &root) {
-                let _ = rename_with_retry(&backup, &root);
-                return Err(error.into());
-            }
-            let _ = fs::remove_dir_all(&backup);
-        } else {
-            if let Err(error) = rename_with_retry(&staging, &root) {
-                let _ = fs::remove_dir_all(&staging);
-                return Err(error.into());
-            }
+        let backup = parent.join(format!(
+            ".docx2typed-commit-old-{}-{}.tmp",
+            std::process::id(),
+            counter
+        ));
+        let _ = fs::remove_dir_all(&backup);
+        if let Err(error) = rename_with_retry(&root, &backup) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(at(&root, error).into());
         }
+        if let Err(error) = rename_with_retry(&staging, &root) {
+            let _ = rename_with_retry(&backup, &root);
+            return Err(at(&staging, error).into());
+        }
+        let _ = fs::remove_dir_all(&backup);
         Ok(())
     }
 
