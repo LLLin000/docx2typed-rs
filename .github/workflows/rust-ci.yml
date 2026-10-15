@@ -221,6 +221,15 @@ jobs:
             if (-not $a.match_pinned) { throw "embedded asset mismatch: $($a.name)" }
           }
           Write-Host "CLI smoke OK: $($d.name), $($d.embedded_assets.Count) embedded assets pinned"
+      - name: Agent surface acceptance
+        shell: bash
+        run: |
+          # docs/specs/08_agent_surface.md §6: acceptance is the WORKFLOW, not the
+          # tool calls. These drive open -> find -> edit -> save -> status the way
+          # an agent does and read the built DOCX back rather than trusting a
+          # success flag, plus the failure modes that are injectable from outside.
+          cargo test --test agent_surface
+
       - name: MCP smoke (engine_info + tools/list)
         shell: bash
         run: |

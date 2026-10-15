@@ -92,7 +92,25 @@ If something cannot be expressed that way, that is a finding to report, not a si
 
 ## 6. Acceptance
 
-The existing suite is the acceptance, re-pointed: `qualification/facade_task_suite.py`'s 19 natural-language tasks over 8 kinds must reach the same document state **through the five-tool surface**. A task that passes by calling the old tools proves nothing about the new interface.
+Two suites, two subjects — and the split is deliberate:
+
+- **`rust-tests/agent_surface.rs`** is the SURFACE's acceptance, and it is a CI
+  gate. It drives the workflow the way an agent does and asserts the FILE, not a
+  success flag: open -> find -> edit -> save -> status, then the built DOCX is
+  read back and its text checked. Plus the failure modes that are injectable from
+  outside: a blocked batch changes no document content, a replay does not apply
+  twice, a reused id with different edits is refused, re-opening a DOCX does not
+  rebuild the baseline, and find reports its coverage.
+- **`qualification/facade_task_suite.py`**'s 19 natural-language tasks remain the
+  ENGINE's acceptance. They drive the engine's own tools, which are still served
+  by name, so they still prove what they always proved.
+
+**The 19 tasks are NOT yet re-pointed at the surface**, and it is not a
+mechanical translation: their call lists are written against the engine's tools
+(including `commit_sync`, which the surface absorbs) and their payload checks are
+indexed by call position (`results[index + 2]`), so merging calls shifts every
+index and the assertions have to be rewritten per task rather than remapped. That
+is the remaining work, and it is named here rather than quietly skipped.
 
 Additionally:
 
