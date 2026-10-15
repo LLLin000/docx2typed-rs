@@ -233,7 +233,11 @@ jobs:
           # docs/specs/08_agent_surface.md §6: a task passes only when the
           # exported document reaches the expected state, and the surface has to
           # reach it too — not just the engine underneath.
-          python qualification/facade_task_suite.py --surface
+          # Windows' default stdout is cp1252, and this suite prints task names
+          # that are Chinese: without this it dies on `UnicodeDecodeError` before
+          # reporting a single result. The env var is the fix; the shell is bash
+          # on both runners, so it is the Python side that needs telling.
+          PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python qualification/facade_task_suite.py --surface
 
       - name: MCP smoke (engine_info + tools/list)
         shell: bash
