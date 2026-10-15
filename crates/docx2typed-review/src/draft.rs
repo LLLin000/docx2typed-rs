@@ -1562,7 +1562,13 @@ fn require_unprotected(
     {
         return Err(CollaborationError::new(
             "invalid-structure",
-            format!("{verb}: {paragraph_id} ({reason})"),
+            format!(
+                "{verb}: {paragraph_id} ({reason}). A new paragraph is synthesised from its \
+                 anchor's opening and pPr, so the anchor has to be plain prose. Anchor on a \
+                 neighbouring paragraph instead — one without tracked revisions, section \
+                 properties, bookmarks or an opaque interior — or replace an existing \
+                 paragraph rather than adding one. Nothing was written."
+            ),
         ));
     }
     Ok(())

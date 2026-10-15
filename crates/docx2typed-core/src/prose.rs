@@ -3360,7 +3360,11 @@ pub fn validate_structure(template: &Path, edits: &StructureEdits) -> Result<(),
         if let Some(reason) = structure_reason(&part, &inventory, &paragraph.inherit, start, end) {
             return Err(CoreError::Domain(format!(
                 "invalid-structure: new paragraph cannot inherit protected structure: {} \
-                 (inherits {}: {reason})",
+                 (inherits {}: {reason}). A new paragraph is synthesised from its anchor's \
+                 opening and pPr, so the anchor has to be plain prose. Anchor on a neighbouring \
+                 paragraph instead — one without tracked revisions, section properties, \
+                 bookmarks or an opaque interior — or replace an existing paragraph rather than \
+                 adding one. Nothing was written.",
                 paragraph.paragraph_id, paragraph.inherit
             )));
         }
