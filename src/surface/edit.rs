@@ -174,7 +174,13 @@ pub(crate) fn apply_and_sync(
             Edit::Replace(request) => requests.push(request.clone()),
             Edit::InsertAfter { handle, text } => {
                 let anchor = paragraph_of(target, handle)?;
-                let inserted = draft::insert_paragraph(target, &anchor, text, Some(&anchor))
+                // `anchor` is the POSITION. Naming it as the inherit source too
+                // made the engine refuse whenever that paragraph carried
+                // revisions or anchors — a decision the caller cannot see and
+                // cannot act on, since the surface hands out no handle for a
+                // paragraph the search did not match. Passing `None` lets the
+                // engine choose a source that works and keep the position.
+                let inserted = draft::insert_paragraph(target, &anchor, text, None)
                     .map_err(|error| MutationError::new(error.code, error.detail))?;
                 structural
                     .push(json!({ "kind": "insert_after", "anchor": anchor, "result": inserted }));

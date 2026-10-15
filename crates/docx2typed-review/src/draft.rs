@@ -1337,18 +1337,63 @@ pub fn insert_paragraph(
     // copies its inherit paragraph's opening and pPr, so that paragraph
     // must be plain prose (no section properties, revisions, anchors, or
     // opaque interiors).
-    require_unprotected(
+    // A protected anchor is the engine's problem, not the caller's. The caller
+    // asked for a POSITION; `inherit` only decides which paragraph's opening and
+    // pPr the new one is synthesised from, and that is an implementation detail
+    // they cannot see. So pick the nearest paragraph before the anchor that CAN
+    // carry one, keep the requested position, and say which was used. Measured on
+    // a real patent: refusing instead cost a restricted agent fourteen attempts
+    // at anchors (P17 refused, P18 refused, P19 accepted) because nothing told it
+    // the paragraph one along was fine — and the handle it would have needed to
+    // take that advice is not something the surface hands out.
+    // Only when the caller did NOT name an inherit source. An explicit
+    // `inherit` is an instruction, and silently substituting another paragraph
+    // would be ignoring it — the engine-level tools keep that refusal. The
+    // surface's `insert_after` names a POSITION, not a source, so there the
+    // engine owns the choice.
+    let mut inherit_from = resolved_inherit.clone();
+    if let Err(refusal) = require_unprotected(
         workdir,
-        &resolved_inherit,
+        &inherit_from,
         "new paragraph cannot inherit protected structure",
-    )?;
+    ) {
+        // An explicit `inherit` is an instruction: substituting another
+        // paragraph would be ignoring it, so the refusal stands. When the
+        // caller named only a POSITION, the source is the engine's choice —
+        // pick the nearest paragraph before the anchor that can carry one and
+        // keep the position. Measured on a real patent: refusing there cost a
+        // restricted agent fourteen attempts at anchors (P17 refused, P18
+        // refused, P19 accepted), and the handle it would have needed to take
+        // that advice is not something the surface hands out.
+        if inherit.is_some() {
+            return Err(refusal);
+        }
+        let mut candidates: Vec<String> = Vec::new();
+        for block in &blocks {
+            match marker_of(block).map(|(_, id, _)| id) {
+                Some(id) if id == resolved_inherit => break,
+                Some(id) if id.starts_with('P') && !id.contains('.') => candidates.push(id),
+                _ => {}
+            }
+        }
+        match candidates
+            .into_iter()
+            .rev()
+            .find(|id| docx2typed_core::prose::paragraph_protection(workdir, id).ok() == Some(None))
+        {
+            Some(id) => inherit_from = id,
+            // Nothing in the document can carry a new paragraph: the refusal
+            // stands, and now it is the whole truth.
+            None => return Err(refusal),
+        }
+    }
     let temp = next_temp_id(&blocks);
-    let block = format!("<!--@new temp=\"{temp}\" inherit=\"{resolved_inherit}\"/>\n{text}");
+    let block = format!("<!--@new temp=\"{temp}\" inherit=\"{inherit_from}\"/>\n{text}");
     blocks.insert(index + 1, block);
     write_draft(workdir, &header, &blocks)?;
     Ok(serde_json::json!({
         "temp_id": temp,
-        "inherit": resolved_inherit,
+        "inherit": inherit_from,
         "draft": "dirty",
         "next": "commit_sync allocates the formal paragraph ID",
     }))
