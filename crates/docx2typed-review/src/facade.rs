@@ -224,8 +224,13 @@ pub fn stage_edits(
                 // as one edit. Asking the commit path itself, rather than a
                 // second opinion about it, is what keeps this phase from
                 // promising an edit that the next phase refuses.
-                let span_problem =
-                    draft::check_editable_span(workdir, &resolved.paragraph_id, &old_text).err();
+                let span_problem = draft::check_editable_span(
+                    workdir,
+                    &resolved.paragraph_id,
+                    &old_text,
+                    resolved.start,
+                )
+                .err();
                 let capability = if old_text == new_text || span_problem.is_some() {
                     Capability::Unsupported
                 } else {

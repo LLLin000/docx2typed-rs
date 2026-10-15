@@ -439,6 +439,21 @@ pub fn match_leaf_span(
     from_leaf: usize,
     old: &str,
 ) -> Result<Option<LeafSpanMatch>, CoreError> {
+    match_leaf_span_at(inventory, part, paragraph_id, from_leaf, old, None)
+}
+
+/// [`match_leaf_span`], with the span's paragraph-level char offset when the
+/// caller has one. An anchored call cannot be ambiguous: exactly one start can
+/// carry the offset, so the search verifies that start instead of scanning for
+/// the text and refusing when it occurs twice.
+pub fn match_leaf_span_at(
+    inventory: &ProseInventory,
+    part: &str,
+    paragraph_id: &str,
+    from_leaf: usize,
+    old: &str,
+    char_start: Option<usize>,
+) -> Result<Option<LeafSpanMatch>, CoreError> {
     if old.is_empty() {
         return Ok(None);
     }
@@ -460,9 +475,27 @@ pub fn match_leaf_span(
         .position(|leaf| leaf.leaf_index >= from_leaf)
         .unwrap_or(leaves.len());
 
+    // Paragraph-level offset of each leaf's first char, so an anchored call can
+    // turn the caller's offset into a position inside the accumulator.
+    let mut prefix: Vec<usize> = Vec::with_capacity(leaves.len());
+    let mut running = 0usize;
+    for leaf in &leaves {
+        prefix.push(running);
+        running += leaf.text.chars().count();
+    }
+
     let mut found: Option<LeafSpanMatch> = None;
     for start in start_at..leaves.len() {
         let first_chars = leaves[start].text.chars().count();
+        // The anchored span starts inside this leaf, or this start is not its
+        // business.
+        let anchored_head = match char_start {
+            Some(want) if want >= prefix[start] && want < prefix[start] + first_chars => {
+                Some(want - prefix[start])
+            }
+            Some(_) => continue,
+            None => None,
+        };
         let mut accumulated = String::new();
         let mut before_last = 0usize;
         for end in start..leaves.len() {
@@ -470,8 +503,15 @@ pub fn match_leaf_span(
                 before_last += leaves[end - 1].text.chars().count();
             }
             accumulated.push_str(&leaves[end].text);
-            let Some(byte_pos) = accumulated.find(old) else {
-                continue;
+            let byte_pos = match anchored_head {
+                Some(head) => match accumulated.char_indices().nth(head) {
+                    Some((byte_pos, _)) if accumulated[byte_pos..].starts_with(old) => byte_pos,
+                    _ => continue,
+                },
+                None => match accumulated.find(old) {
+                    Some(byte_pos) => byte_pos,
+                    None => continue,
+                },
             };
             let head = accumulated[..byte_pos].chars().count();
             let covered = old.chars().count();
@@ -1141,13 +1181,15 @@ fn extract_paragraph(
             let name = child_node.name.as_str();
             match name {
                 "pPr" => {}
-                "proofErr" => opaques.push(OpaqueBlock {
-                    part_key: part_key.to_string(),
-                    paragraph_id: paragraph_id.to_string(),
-                    tag: child_node.raw_name.clone(),
-                    start: child_node.open_start,
-                    end: child_node.end,
-                }),
+                // `proofErr` marks a proofing range (spelling/grammar): zero
+                // length, no text, no run — Word writes it into paragraphs
+                // routinely. Counting it as a locked interior locked the WHOLE
+                // paragraph (`editable = opaques.is_empty()`), so a real patent
+                // reported 12 of 20 matches uneditable for a spell-check marker,
+                // and the blind agent's answer was to leave the tool and edit the
+                // XML by hand. An island edit rewrites runs only, so the marker
+                // survives byte-for-byte without being named here.
+                "proofErr" => {}
                 "r" => process_run(
                     child_node,
                     nodes,
@@ -1386,9 +1428,32 @@ pub fn resolve_leaf(
             ))
         })?;
     if !leaf.editable {
+        // Name what is locked and give the way out. The refusal alone told the
+        // agent nothing it could act on, so its answer on a real patent was to
+        // leave the tool and edit the XML by hand — which loses the byte
+        // fidelity, the revision records and the verification the tool exists
+        // for. The sibling `cross-leaf-edit` refusal already names its route;
+        // this one now does too.
+        let locked: Vec<&str> = inventory
+            .opaques
+            .iter()
+            .filter(|block| block.paragraph_id == paragraph_id)
+            .map(|block| block.tag.as_str())
+            .collect();
+        let what = if locked.is_empty() {
+            "a non-editable surface (deletion revision or an unmodelled run)".to_string()
+        } else {
+            format!(
+                "{} — this is where a field, an equation or a drawing lives",
+                locked.join(", ")
+            )
+        };
         return Err(CoreError::Domain(format!(
-            "opaque-paragraph-mutated: {paragraph_id}: leaf {leaf_index} is inside \
-             locked structure (opaque field/math/drawing interior or non-editable surface)"
+            "opaque-paragraph-mutated: {paragraph_id}: leaf {leaf_index} sits inside {what}. \
+             The tool never rewrites a locked interior. Replace the whole paragraph instead: \
+             document_edit with kind=delete for {paragraph_id}, then kind=insert_after carrying \
+             the text you want — that route needs no run match and preserves everything outside \
+             the paragraph byte-for-byte."
         )));
     }
     Ok(leaf)
@@ -4526,6 +4591,76 @@ mod tests {
             .join(name)
     }
 
+    /// A handle names an exact span, so the applier must resolve THAT span. With
+    /// the search alone the pick is silent: a needle that occurs twice inside one
+    /// leaf resolves to the FIRST occurrence, whichever the caller meant. On a
+    /// real patent that is what drove a blind agent off the tool and into the XML
+    /// (9 of 13 uneditable matches); the anchored call resolves the occurrence
+    /// the handle named.
+    #[test]
+    fn an_anchored_span_resolves_the_occurrence_the_handle_named() {
+        let inventory = enumerate_package(&fixture("complex.docx")).expect("enumerate");
+        let leaf = inventory
+            .leaves
+            .iter()
+            .find(|leaf| {
+                leaf.text
+                    .chars()
+                    .next()
+                    .is_some_and(|first| leaf.text.matches(first).count() >= 2)
+            })
+            .expect("a leaf repeating its own first character");
+        let needle: String = leaf.text.chars().next().map(String::from).unwrap();
+        let first_at = leaf.text.find(&needle).unwrap();
+        let second_at =
+            leaf.text[first_at + needle.len()..].find(&needle).unwrap() + first_at + needle.len();
+        // Paragraph-level offset of the SECOND occurrence: every char of the
+        // paragraph's earlier leaves, then the position inside this one.
+        let mut prefix = 0usize;
+        for other in &inventory.leaves {
+            if other.part_key == leaf.part_key && other.paragraph_id == leaf.paragraph_id {
+                if other.leaf_index == leaf.leaf_index {
+                    break;
+                }
+                prefix += other.text.chars().count();
+            }
+        }
+        let inside = leaf.text[..second_at].chars().count();
+        let before = |span: &LeafSpanMatch| span.prefix.chars().count();
+
+        let unanchored = match_leaf_span(
+            &inventory,
+            &leaf.part_key,
+            &leaf.paragraph_id,
+            leaf.leaf_index,
+            &needle,
+        )
+        .expect("search")
+        .expect("found");
+        assert_eq!(
+            before(&unanchored),
+            leaf.text[..first_at].chars().count(),
+            "without an anchor the search silently picks the first occurrence"
+        );
+
+        let anchored = match_leaf_span_at(
+            &inventory,
+            &leaf.part_key,
+            &leaf.paragraph_id,
+            0,
+            &needle,
+            Some(prefix + inside),
+        )
+        .expect("anchored search")
+        .expect("the anchored span resolves");
+        assert_eq!(
+            before(&anchored),
+            inside,
+            "the anchored span starts at the offset the handle named"
+        );
+        assert_eq!(anchored.first_leaf, leaf.leaf_index);
+    }
+
     fn ids(inventory: &ProseInventory) -> Vec<String> {
         inventory
             .paragraphs
@@ -4769,8 +4904,10 @@ mod tests {
     #[test]
     fn editable_surface_flags_match_python() {
         let inventory = enumerate_package(&fixture("complex.docx")).expect("enumerate");
-        // P4 (drawing), P10 (proofErr), P12 (fldSimple), P15 (math) are
-        // locked; plain prose paragraphs are editable.
+        // P4 (drawing), P12 (fldSimple), P15 (math) are locked; plain prose
+        // paragraphs are editable. P10 is a deliberate divergence from the
+        // Python reference: it carries only a `proofErr` marker, and this build
+        // keeps such a paragraph editable.
         let locked: Vec<&str> = inventory
             .paragraphs
             .iter()
@@ -4781,9 +4918,15 @@ mod tests {
             locked.contains(&"P4"),
             "drawing paragraph locked: {locked:?}"
         );
+        // `proofErr` marks a proofing range — zero length, no text, no run — and
+        // Word writes it into paragraphs routinely. Counting it as a locked
+        // interior locked the WHOLE paragraph, so on a real patent 12 of 20
+        // matches reported uneditable for a spell-check marker and the agent's
+        // answer was to leave the tool and edit the XML by hand. An island edit
+        // rewrites runs only, so the marker survives without being named.
         assert!(
-            locked.contains(&"P10"),
-            "proofErr paragraph locked: {locked:?}"
+            !locked.contains(&"P10"),
+            "proofErr paragraph stays editable: {locked:?}"
         );
         assert!(
             locked.contains(&"P12"),

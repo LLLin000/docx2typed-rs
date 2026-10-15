@@ -1148,8 +1148,18 @@ pub fn check_editable_span(
     workdir: &Path,
     paragraph_id: &str,
     old: &str,
+    start: usize,
 ) -> Result<(), CollaborationError> {
-    island_leaf_for(workdir, paragraph_id, old, None).map(|_| ())
+    // The leaf the span sits in, from the span itself — the same resolution the
+    // commit path uses. Passing `None` here searched from the paragraph's FIRST
+    // run, so a phrase occurring twice in one paragraph was refused as
+    // `prose-edit-ambiguous` by the staging phase while the commit, which is
+    // handed the leaf, would have applied it. Measured on a real patent: 9 of 13
+    // uneditable matches were this, and the agent's response to the refusal was
+    // to leave the tool and edit the XML by hand — which loses the byte
+    // fidelity, the revision records and the verification the tool exists for.
+    let leaf = leaf_index_for_span(workdir, paragraph_id, start, old.chars().count());
+    island_leaf_for(workdir, paragraph_id, old, leaf, Some(start)).map(|_| ())
 }
 
 fn island_leaf_for(
@@ -1157,6 +1167,7 @@ fn island_leaf_for(
     paragraph_id: &str,
     old: &str,
     leaf_index: Option<usize>,
+    char_start: Option<usize>,
 ) -> Result<Option<(String, usize)>, CollaborationError> {
     // A paragraph synthesised in this session has no baseline leaf to rewrite:
     // it is rendered from the structure sidecar at build time. That is true the
@@ -1187,11 +1198,22 @@ fn island_leaf_for(
         .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
         .count();
     // An explicit ordinal is the caller's address; without one the search starts
-    // at the paragraph's first run.
-    let from_leaf = leaf_index.unwrap_or(0);
-    let span =
-        docx2typed_core::prose::match_leaf_span(&inventory, &part, paragraph_id, from_leaf, old)
-            .map_err(|error| CollaborationError::new("prose-edit-ambiguous", error.to_string()))?;
+    // at the paragraph's first run. An anchored span carries its own address, so
+    // a stale ordinal must not hide it.
+    let from_leaf = if char_start.is_some() {
+        0
+    } else {
+        leaf_index.unwrap_or(0)
+    };
+    let span = docx2typed_core::prose::match_leaf_span_at(
+        &inventory,
+        &part,
+        paragraph_id,
+        from_leaf,
+        old,
+        char_start,
+    )
+    .map_err(|error| CollaborationError::new("prose-edit-ambiguous", error.to_string()))?;
     let Some(span) = span else {
         return Err(CollaborationError::new(
             "cross-leaf-edit",
@@ -1233,7 +1255,8 @@ fn record_island_operation(
         new,
         leaf_index,
     } = edit;
-    let Some((part, leaf_index)) = island_leaf_for(workdir, paragraph_id, old, leaf_index)? else {
+    let Some((part, leaf_index)) = island_leaf_for(workdir, paragraph_id, old, leaf_index, None)?
+    else {
         return Ok(());
     };
     append_island_edits(
@@ -2112,7 +2135,7 @@ fn plan_patch(
                 }
                 // The build's island record must land inside ONE text leaf, so
                 // the leaf is resolved (read-only) with the rest of validation.
-                match island_leaf_for(workdir, paragraph_id, old, *leaf_index) {
+                match island_leaf_for(workdir, paragraph_id, old, *leaf_index, anchored_chars) {
                     Ok(Some((_part, resolved_leaf))) => {
                         // Defer: merge with any other occurrence in this leaf
                         // so one whole-leaf edit carries them all. The leaf walk
