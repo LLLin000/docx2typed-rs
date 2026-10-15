@@ -265,11 +265,11 @@ impl WorkdirStore {
         let _ = fs::remove_dir_all(&backup);
         if let Err(error) = rename_with_retry(&root, &backup) {
             let _ = fs::remove_dir_all(&staging);
-            return Err(at(&root, error).into());
+            return Err(at(&root, error));
         }
         if let Err(error) = rename_with_retry(&staging, &root) {
             let _ = rename_with_retry(&backup, &root);
-            return Err(at(&staging, error).into());
+            return Err(at(&staging, error));
         }
         let _ = fs::remove_dir_all(&backup);
         Ok(())
