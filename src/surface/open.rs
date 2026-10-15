@@ -157,5 +157,26 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
         .unwrap_or_else(|| json!({}));
     data["workdir"] = json!(workdir.to_string_lossy());
     data["reopened"] = json!(already_open);
+    // Whether this workdir can be built at all — answered HERE, not only when
+    // `document_save` finally refuses. A document carrying committed typed edits
+    // with no record in the edit sidecars cannot be rebuilt (the replay would
+    // drop them), and learning that after a dozen edits is a trap: the work
+    // looks fine right up to the one call that produces a file. Measured on a
+    // real patent, an agent ground through fourteen `document_edit` attempts and
+    // never reached the save that held the answer.
+    if !workdir.join("islands.json").is_file()
+        && !workdir
+            .join(docx2typed_core::prose::STRUCTURE_FILE)
+            .is_file()
+        && docx2typed_review::draft::has_unrecorded_typed_edits(&workdir).unwrap_or(false)
+    {
+        data["cannot_build"] = json!({
+            "code": "edits-not-implemented",
+            "why": "this workdir holds committed typed edits that are not recorded in the edit \
+                    sidecars (islands.json / structure.json); a build would replay the template \
+                    and drop them",
+            "next": "build with the Python reference engine — no edit made here can fix it",
+        });
+    }
     session.success("document_open", data, build_commit)
 }
