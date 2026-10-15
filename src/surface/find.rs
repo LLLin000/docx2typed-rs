@@ -90,7 +90,7 @@ pub fn document_find(session: &mut McpSession, args: &Value, build_commit: &str)
         );
     };
     let mut search_args = json!({ "query": query });
-    for key in ["scope", "limit"] {
+    for key in ["scope", "limit", "offset"] {
         if let Some(value) = args.get(key) {
             if !value.is_null() {
                 search_args[key] = value.clone();
@@ -154,6 +154,24 @@ pub fn document_find(session: &mut McpSession, args: &Value, build_commit: &str)
         .iter()
         .filter(|entry| entry["verdict"]["editable"] == json!(true))
         .count();
+    // The search's own coverage numbers, kept. `limit` bounds matching BLOCKS,
+    // not occurrences, and a caller that sees only `matches.len()` cannot tell a
+    // complete answer from the first page of one. That distinction matters most
+    // for the thing an agent is usually asked to do to a patent — unify a term
+    // across the whole document — where silently seeing the first twenty
+    // matching paragraphs looks exactly like having seen them all.
+    let total_matches = data.get("total_matches").cloned().unwrap_or(Value::Null);
+    let total_blocks = data.get("total_blocks").cloned().unwrap_or(Value::Null);
+    let returned_blocks = data.get("returned_blocks").cloned().unwrap_or(Value::Null);
+    let offset = data.get("offset").cloned().unwrap_or(json!(0));
+    let complete = match (
+        returned_blocks.as_u64(),
+        total_blocks.as_u64(),
+        offset.as_u64(),
+    ) {
+        (Some(returned), Some(total), Some(offset)) => offset + returned >= total,
+        _ => false,
+    };
     session.success(
         "document_find",
         json!({
@@ -165,6 +183,23 @@ pub fn document_find(session: &mut McpSession, args: &Value, build_commit: &str)
                 // as one span is not a match it can pass to document_edit.
                 "editable": editable,
                 "not_editable": matches.len() - editable,
+                // The document-wide numbers, so `matches` is never mistaken for
+                // the whole answer.
+                "total_matches": total_matches,
+                "total_blocks": total_blocks,
+                "returned_blocks": returned_blocks,
+                "offset": offset,
+                "complete": complete,
+            },
+            "next": if complete {
+                Value::Null
+            } else {
+                json!({
+                    "action": "continue-search",
+                    "why": "more matching paragraphs exist than this page returned",
+                    "call": { "query": query, "offset": offset.as_u64().unwrap_or(0)
+                        + returned_blocks.as_u64().unwrap_or(0) },
+                })
             },
         }),
         build_commit,

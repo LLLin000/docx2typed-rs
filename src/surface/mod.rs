@@ -25,6 +25,8 @@
 //! See `docs/specs/08_agent_surface.md`.
 
 mod edit;
+
+pub(crate) use edit::apply_and_sync;
 mod find;
 mod open;
 mod save;
@@ -101,17 +103,13 @@ pub fn schema(name: &str) -> Option<Value> {
             "type": "object",
             "properties": {
                 "output": {"type": "string"},
-                "author": {"type": ["string", "null"], "default": null},
-                "date": {"type": ["string", "null"], "default": null},
             },
             "required": ["output"],
             "additionalProperties": false,
         }),
         "document_status" => json!({
             "type": "object",
-            "properties": {
-                "verbose": {"type": ["boolean", "null"], "default": null},
-            },
+            "properties": {},
             "required": [],
             "additionalProperties": false,
         }),

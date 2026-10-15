@@ -1,6 +1,9 @@
 # 08 — The agent surface: five tools, not fifty-three
 
-Status: **design settled, implementation not started.**
+Status: **implemented and shipped in 0.2.1.** The five tools are live; the
+engine's other 48 stay callable by name and are not advertised. The acceptance in
+§6 — the workflow end to end through the five, plus fault injection — is the
+gate that still has to hold, and it is run as a test rather than asserted here.
 
 ## 1. Why this exists
 

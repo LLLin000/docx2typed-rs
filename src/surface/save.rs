@@ -34,6 +34,16 @@ pub fn document_save(session: &mut McpSession, args: &Value, build_commit: &str)
         );
     }
 
+    // A draft that has not been settled cannot be built (`edit-dirty`), and
+    // settling it has exactly one correct answer, so the engine takes the step
+    // rather than telling the caller to. This can only be non-empty for a
+    // workdir a LEGACY tool left dirty — `document_edit` always settles — but an
+    // agent should not have to know which tool left it that way.
+    let settled = session.settle_draft(build_commit);
+    if let Some(failure) = settled {
+        return failure;
+    }
+
     // The build transport requires a caller-supplied operation id; on this
     // surface the caller should not have to know that, and an id it never sees
     // is one it cannot reuse by mistake.

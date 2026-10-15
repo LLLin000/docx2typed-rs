@@ -92,12 +92,25 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
     let workdir = if is_workdir(&source) {
         source
     } else if source.is_file() {
-        // A document. Extracting it creates a family, which needs no proof of
-        // continuity; the binding question only arises for a document that is
-        // already in a family, and `workspace_adopt` answers it.
-        match extract_beside(session, &source, build_commit) {
-            Ok(workdir) => workdir,
-            Err(failure) => return failure,
+        // A document. If this document has ALREADY been opened, its workdir is
+        // beside it, and extracting again is not a no-op: it rebuilds the
+        // baseline (measured: `baseline.json` epoch 1 -> 2 on a second open of
+        // the same DOCX), and once the workdir carries committed edits the
+        // rebuild is refused as `workdir-not-at-baseline`. The observable
+        // failure was "the document opened, I edited it, and now it will not
+        // open again" — so the workdir is found first and extraction happens
+        // only when there is nothing to open.
+        let existing = workdir_for(&source);
+        if is_workdir(&existing) {
+            existing
+        } else {
+            // Extracting creates a family, which needs no proof of continuity;
+            // the binding question only arises for a document already in a
+            // family, and `workspace_adopt` answers it.
+            match extract_beside(session, &source, build_commit) {
+                Ok(workdir) => workdir,
+                Err(failure) => return failure,
+            }
         }
     } else {
         return session.failure(
@@ -129,7 +142,10 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
         }
     }
     let opened = session.workdir_open(&open_args, build_commit);
-    if !already_open && opened.get("isError").and_then(Value::as_bool) == Some(true) {
+    // Any internal failure is passed through, unconditionally. Skipping this on
+    // a re-open hid it: a workdir whose metadata had gone bad would report a
+    // success with no session behind it.
+    if opened.get("isError").and_then(Value::as_bool) == Some(true) {
         return opened;
     }
     // Report the workdir: it is the thing a later call addresses, and for a

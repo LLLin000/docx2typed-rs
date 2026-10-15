@@ -80,6 +80,12 @@ path = "rust-tests/govern.rs"
 name = "review60"
 path = "rust-tests/review60.rs"
 
+# The five-tool agent surface, end to end: docs/specs/08_agent_surface.md §6 says
+# the acceptance is the workflow, not the tool calls.
+[[test]]
+name = "agent_surface"
+path = "rust-tests/agent_surface.rs"
+
 [[test]]
 name = "structure"
 path = "rust-tests/structure.rs"

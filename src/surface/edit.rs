@@ -1,25 +1,32 @@
 //! `document_edit` — change the document; the engine does the rest.
 //!
-//! One transaction: resolve every handle, apply, sync, and write NOTHING if any
-//! edit cannot be applied.
+//! ONE transaction: resolve every handle, apply, sync, and publish — or write
+//! nothing at all. The caller says `{handle, replace_with}`, which is the
+//! facade's own request shape, so there is no translation to get wrong and no
+//! second key spelling to discover. A real session guessed `{old, new}` at a
+//! tool that wanted `{handle, replace_with}` and had to try again.
 //!
-//! The caller says `{handle, replace_with}`, which is the facade's own request
-//! shape — so there is no translation layer to get wrong, and no second key
-//! spelling to discover. A real session guessed `{old, new}` at a tool that
-//! wanted `{handle, replace_with}` and had to try again.
+//! Both halves run inside ONE store mutation. That is not decoration: with
+//! `generation: true` the closure is handed a COPY of the workdir's current
+//! generation, and the store publishes it or discards it as a unit. Applying the
+//! edit and then syncing it as two separate calls left a window where the draft
+//! had moved and the canonical document had not — a failure the caller was told
+//! was "nothing was written". Running them in one closure closes that window: a
+//! refusal anywhere leaves the workdir exactly as it was.
 //!
-//! The sync is not the caller's job. A real session hit
-//! `paragraph-has-uncommitted-length-change` twice: it edited a paragraph, then
-//! edited it again, and the second edit was refused because the first had not
-//! been synced. There is exactly one correct moment to sync, the engine knows
-//! it, so the engine takes it — and the facade's own `next` field, which told
-//! the caller to run `commit_sync` themselves, is not something an agent should
-//! ever have to read.
+//! The same closure also gives the retry property. The store's ledger check runs
+//! BEFORE the closure, so a repeat with the same `operation_id` replays the
+//! original result and never touches a handle — which matters, because after a
+//! successful edit those handles are stale and a naive re-run would refuse
+//! instead of replaying. The reference requires a caller-supplied id; here it is
+//! optional and minted when absent, returned in the result so a caller that lost
+//! the response still has something stable to retry with.
 
 use crate::mcp::McpSession;
 use docx2typed_protocol::new_operation_id;
-use docx2typed_review::draft::EditTracking;
+use docx2typed_review::draft::{self, EditTracking};
 use docx2typed_review::facade::{self, EditRequest};
+use docx2typed_review::{collab, server::MutationError};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -75,24 +82,100 @@ fn requests_from(
     Ok(requests)
 }
 
-/// `document_edit` — apply the edits, sync them, and report what happened.
+/// Apply the edits and settle them, against one generation of the workdir.
+///
+/// This is the body `commit_sync` runs, composed here rather than called
+/// through its handler: the handler opens its own store mutation, and nesting
+/// one inside another is not a transaction, it is two.
+pub(crate) fn apply_and_sync(
+    target: &Path,
+    requests: &[EditRequest],
+    tracking: EditTracking<'_>,
+) -> Result<Value, MutationError> {
+    // No requests means "settle what is there" — the save path uses it, and it
+    // must not open an empty facade batch, which the facade refuses by design.
+    let edited = if requests.is_empty() {
+        Value::Null
+    } else {
+        facade::edit(target, requests, false, tracking)
+            .map_err(|error| MutationError::new(error.code, error.detail))?
+    };
+    if !requests.is_empty() && edited.get("outcome").and_then(Value::as_str) != Some("committed") {
+        // The facade stages every target before it applies any, so a blocked
+        // batch has written nothing. Report it and let the caller decide; the
+        // generation it returns is the one it started from.
+        return Ok(json!({ "edit": edited, "synced": Value::Null }));
+    }
+
+    // Bootstrap the review session BEFORE `apply_projection` rewrites typed.md.
+    // The bootstrap pins the current typed.md hash as the C0 baseline; doing it
+    // after the rewrite would pin the post-commit hash and `publish_current`
+    // would then see `actual == pinned` and refuse `current-not-changed` even
+    // though the draft had edits.
+    collab::ensure_session(target).map_err(|error| MutationError::new(error.code, error.detail))?;
+    let changed = draft::apply_projection_with_options(
+        target,
+        tracking.tracked,
+        tracking.author,
+        tracking.date,
+    )
+    .map_err(|error| MutationError::new(error.code, error.detail))?;
+    if changed.is_empty() {
+        return Ok(json!({
+            "edit": edited,
+            "synced": {
+                "changed_paragraph_ids": [],
+                "state": "clean",
+                "current_snapshot": Value::Null,
+            },
+        }));
+    }
+    let parent = collab::document_state(target)
+        .ok()
+        .and_then(|state| {
+            state
+                .get("current_snapshot")
+                .and_then(|snapshot| snapshot.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let published = collab::publish_current(
+        target,
+        &parent,
+        tracking.author.unwrap_or("agent"),
+        &changed,
+        None,
+    )
+    .map_err(|error| MutationError::new(error.code, error.detail))?;
+    Ok(json!({
+        "edit": edited,
+        "synced": {
+            "changed_paragraph_ids": changed,
+            "state": "clean",
+            "current_snapshot": published.get("current_snapshot").cloned().unwrap_or(Value::Null),
+        },
+    }))
+}
+
+/// `document_edit` — apply the edits and settle them, in one transaction.
 pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str) -> Value {
-    let Some(workdir) = session.open_workdir().map(str::to_string) else {
+    if session.open_workdir().is_none() {
         return session.failure(
             "document_edit",
             "workdir-not-open",
             "no document is open; call document_open first",
             build_commit,
         );
-    };
+    }
     let requests = match requests_from(session, args, build_commit) {
         Ok(requests) => requests,
         Err(failure) => return failure,
     };
-    // Optional, and minted when absent. The reference requires a caller-supplied
-    // id; requiring it here made an agent learn an idempotency protocol before
-    // it could make its first edit. Minting one and returning it keeps the retry
-    // property — a repeat replays byte-exactly — without the ceremony.
+    // Optional, and minted when absent, so a caller does not have to learn an
+    // idempotency protocol before making its first edit. It IS returned, which
+    // is what makes it usable: a caller that lost the response can retry with
+    // the id it never chose.
     let operation_id = args
         .get("operation_id")
         .and_then(Value::as_str)
@@ -103,27 +186,61 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-
+    let tracked = session.tracking();
+    let author = session.authoring().map(str::to_string);
+    let date = session.stamp().map(str::to_string);
     let tracking = EditTracking {
-        tracked: session.tracking(),
-        author: session.authoring(),
-        date: session.stamp(),
+        tracked,
+        author: author.as_deref(),
+        date: date.as_deref(),
     };
-    let edited = match facade::edit(Path::new(&workdir), &requests, dry_run, tracking) {
-        Ok(value) => value,
-        Err(error) => {
-            return session.failure("document_edit", &error.code, &error.detail, build_commit)
-        }
+
+    if dry_run {
+        // Nothing is written, so nothing needs a transaction or a ledger entry.
+        let workdir = session.open_workdir().unwrap_or_default().to_string();
+        let preview = match facade::edit(Path::new(&workdir), &requests, true, tracking) {
+            Ok(value) => value,
+            Err(error) => {
+                return session.failure("document_edit", &error.code, &error.detail, build_commit)
+            }
+        };
+        return session.success(
+            "document_edit",
+            json!({ "operation_id": operation_id, "dry_run": true, "edit": preview }),
+            build_commit,
+        );
+    }
+
+    // The operation id goes through the args so the store's ledger sees it: a
+    // repeat replays before the closure runs, so a stale handle cannot make a
+    // retry fail where the first attempt succeeded.
+    let mut mutation_args = json!({ "operation_id": operation_id, "edits": args.get("edits") });
+    mutation_args["edits"] = args.get("edits").cloned().unwrap_or(Value::Null);
+    let applied = session.edit_mutation(
+        &mutation_args,
+        requests.clone(),
+        tracked,
+        author.clone(),
+        date.clone(),
+        build_commit,
+    );
+
+    let Some(envelope) = applied.get("structuredContent") else {
+        return applied;
     };
-    // A blocked batch wrote nothing — the facade stages every target before it
-    // applies any, so one unusable handle leaves C0 intact — and it must NOT be
-    // reported as success. Reporting it as success is the exact lie this surface
-    // exists to remove: the caller reads `success`, believes the document
-    // changed, and carries on from a state that never happened.
-    let edit_outcome = edited.get("outcome").and_then(Value::as_str).unwrap_or("");
+    if envelope.get("outcome").and_then(Value::as_str) != Some("success") {
+        return applied;
+    }
+    let data = envelope.get("data").cloned().unwrap_or_else(|| json!({}));
+    let edit_outcome = data
+        .get("edit")
+        .and_then(|edit| edit.get("outcome"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if edit_outcome == "blocked" {
-        let reasons: Vec<String> = edited
-            .get("blocked_targets")
+        let reasons: Vec<String> = data
+            .get("edit")
+            .and_then(|edit| edit.get("blocked_targets"))
             .and_then(Value::as_array)
             .map(|targets| {
                 targets
@@ -145,95 +262,14 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
             build_commit,
         );
     }
-    if edit_outcome != "committed" {
-        // `staged` under `dry_run`: validated, nothing written, and the caller
-        // asked for exactly that.
-        return session.success(
-            "document_edit",
-            json!({
-                "operation_id": operation_id,
-                "dry_run": dry_run,
-                "edit": edited,
-            }),
-            build_commit,
-        );
-    }
-
-    // Sync now, so a second edit to the same paragraph does not need a manual
-    // commit between them. The facade's `next` tells the caller to do this
-    // themselves; on this surface that step does not exist.
-    let synced = session.commit_sync(
-        &json!({ "operation_id": format!("{operation_id}-sync") }),
-        build_commit,
-    );
-    let sync_envelope = synced
-        .get("structuredContent")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let sync_outcome = sync_envelope
-        .get("outcome")
-        .and_then(Value::as_str)
-        .unwrap_or("failure");
-    if sync_outcome != "success" {
-        // `current-not-changed` from the sync is only honest when the draft
-        // really matches the canonical document. When it does not, the engine
-        // has dropped this edit and is about to let the caller believe it
-        // landed — the one failure this surface exists to remove. Measured on a
-        // second edit to the same paragraph: `edit.md` read
-        // `前缀中文区块甲区块区域内容后缀` while `typed.md` still read
-        // `前缀中文区块区域内容`, and the caller was told "success".
-        if sync_refused_because_unchanged(&sync_envelope) && draft_differs_from_canonical(&workdir)
-        {
-            return session.failure(
-                "document_edit",
-                "edit-not-synced",
-                "the edit was applied to the draft but the canonical document did not change, \
-                 so it was dropped rather than saved. The usual cause is a handle from before \
-                 the previous edit: re-run document_find and edit with a fresh handle",
-                build_commit,
-            );
-        }
-        return synced;
-    }
-
     session.success(
         "document_edit",
         json!({
             "operation_id": operation_id,
-            "dry_run": dry_run,
-            "edit": edited,
-            "synced": synced
-                .get("structuredContent")
-                .and_then(|envelope| envelope.get("data"))
-                .cloned()
-                .unwrap_or_else(|| json!({})),
+            "dry_run": false,
+            "edit": data.get("edit").cloned().unwrap_or(Value::Null),
+            "synced": data.get("synced").cloned().unwrap_or(Value::Null),
         }),
         build_commit,
     )
-}
-
-/// Did the sync refuse on the grounds that the canonical text was unchanged?
-fn sync_refused_because_unchanged(envelope: &Value) -> bool {
-    envelope
-        .get("diagnostics")
-        .and_then(Value::as_array)
-        .is_some_and(|diagnostics| {
-            diagnostics.iter().any(|diagnostic| {
-                diagnostic.get("code").and_then(Value::as_str) == Some("current-not-changed")
-            })
-        })
-}
-
-/// Does the draft carry changes the canonical projection does not?
-///
-/// A byte comparison of the two rendered files, which is the question the sync
-/// claims to have answered. Cheap, and it is the only thing that distinguishes
-/// "nothing to sync" from "the sync lost the edit".
-fn draft_differs_from_canonical(workdir: &str) -> bool {
-    let read = |name: &str| std::fs::read(Path::new(workdir).join(name)).ok();
-    match (read("edit.md"), read("typed.md")) {
-        (Some(draft), Some(canonical)) => draft != canonical,
-        // Unreadable is not evidence of agreement; do not manufacture a refusal.
-        _ => false,
-    }
 }

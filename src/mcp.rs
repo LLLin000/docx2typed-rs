@@ -697,6 +697,82 @@ impl McpSession {
         }
     }
 
+    /// One `document_edit` as a SINGLE store mutation.
+    ///
+    /// The facade's apply and `commit_sync`'s settle run inside one closure, so
+    /// the store hands them a copy of the current generation and publishes or
+    /// discards it as a unit. Two separate mutations left a window where the
+    /// draft had moved and the canonical document had not — a failure reported
+    /// as "nothing was written" while the draft carried the edit. The ledger
+    /// also sees this as one operation, so a repeat replays before the closure
+    /// runs and a stale handle cannot make a retry fail where the first attempt
+    /// succeeded.
+    /// Settle a draft the caller did not settle, or report why it cannot be.
+    ///
+    /// Returns `None` when the draft was already settled or has now been, and
+    /// the failure envelope when settling was refused. The same body
+    /// `document_edit` runs, for the same reason: one implementation, one
+    /// verdict, and no path on which a caller can be told a document is ready
+    /// when its draft was never applied.
+    pub(crate) fn settle_draft(&self, build_commit: &str) -> Option<Value> {
+        let workdir = self.workdir.clone()?;
+        let dirty = docx2typed_review::draft::diff_preview(Path::new(&workdir))
+            .ok()
+            .and_then(|data| data.get("changed_paragraph_ids").cloned())
+            .and_then(|ids| ids.as_array().map(|ids| !ids.is_empty()))
+            .unwrap_or(false);
+        if !dirty {
+            return None;
+        }
+        let tracked = self.track;
+        let author = self.author.clone();
+        let date = self.date.clone();
+        let args = json!({ "operation_id": docx2typed_protocol::new_operation_id() });
+        let result = self.draft_tool_with_boundary(
+            "commit_sync",
+            &args,
+            build_commit,
+            true,
+            move |target| {
+                crate::surface::apply_and_sync(
+                    target,
+                    &[],
+                    docx2typed_review::draft::EditTracking {
+                        tracked,
+                        author: author.as_deref(),
+                        date: date.as_deref(),
+                    },
+                )
+            },
+        );
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            return Some(result);
+        }
+        None
+    }
+
+    pub(crate) fn edit_mutation(
+        &self,
+        args: &Value,
+        requests: Vec<docx2typed_review::facade::EditRequest>,
+        tracked: bool,
+        author: Option<String>,
+        date: Option<String>,
+        build_commit: &str,
+    ) -> Value {
+        self.draft_tool_with_boundary("document_edit", args, build_commit, false, move |target| {
+            crate::surface::apply_and_sync(
+                target,
+                &requests,
+                docx2typed_review::draft::EditTracking {
+                    tracked,
+                    author: author.as_deref(),
+                    date: date.as_deref(),
+                },
+            )
+        })
+    }
+
     pub(crate) fn commit_sync(&self, args: &Value, build_commit: &str) -> Value {
         let tracked = self.track;
         let author = self.author.clone();
@@ -2379,6 +2455,14 @@ fn domain_code_from_message(message: &str) -> String {
 /// payload (the same value the line protocol wraps in `OK <json>`).
 /// The declared parameters of one tool, from the frozen schema.
 fn declared_parameters(tool: &str) -> Option<BTreeSet<String>> {
+    // The agent surface first. Its schemas live in `crate::surface` because they
+    // are new and the frozen bundle is a published contract; reading only the
+    // bundle meant a surface tool had NO declared parameters, so `unknown
+    // argument` was never raised for one and a typo'd key was silently ignored.
+    if let Some(schema) = crate::surface::schema(tool) {
+        let properties = schema.get("properties")?.as_object()?;
+        return Some(properties.keys().cloned().collect());
+    }
     let schemas: Value = serde_json::from_str(docx2typed_app::embedded::MCP_SCHEMAS_JSON).ok()?;
     let properties = schemas.get(tool)?.get("properties")?.as_object()?;
     Some(properties.keys().cloned().collect())
