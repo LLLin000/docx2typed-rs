@@ -1275,6 +1275,7 @@ fn record_island_operation(
     append_island_edits(
         workdir,
         &[docx2typed_core::prose::IslandEdit {
+            char_start: None,
             part,
             paragraph_id: paragraph_id.to_string(),
             leaf_index,
@@ -2361,7 +2362,7 @@ fn plan_patch(
         // A leaf the walk cannot map is a refusal, never a half-recorded edit:
         // an island with an empty `old` would silently do nothing at build time
         // while the call still reported success.
-        let (record_old, record_new) =
+        let (record_start, record_old, record_new) =
             merged_leaf_island(workdir, &paragraph_id, leaf_index, &spans).ok_or_else(|| {
                 // The two cases are worth telling apart. An offset that cannot
                 // be mapped usually means the paragraph already carries an
@@ -2394,6 +2395,10 @@ fn plan_patch(
             part: "document".to_string(),
             paragraph_id,
             leaf_index,
+            // The offset the recorded text begins at — the run's start when the
+            // island stays inside one run, the first replacement's otherwise.
+            // That, not the first replacement's offset, is what addresses `old`.
+            char_start: Some(record_start),
             old: record_old,
             new: record_new,
             tracked: tracking.tracked,
@@ -2476,12 +2481,16 @@ fn run_offsets(workdir: &Path, paragraph_id: &str) -> Option<(String, Vec<RunSli
 /// as it stands, and that run as it should read. Only a region that crosses
 /// runs is recorded as the covered range itself, because the applier has to
 /// rebuild every run it touched and `old` is how it finds them.
+/// Returns `(start, old, new)`: the paragraph offset `old` begins at, so the
+/// island can address its span instead of searching for the text. One island
+/// carries every replacement in its leaf, and the merged text can occur twice in
+/// that leaf, so a text-only search refuses a batch the applier could place.
 fn merged_leaf_island(
     workdir: &Path,
     paragraph_id: &str,
     leaf_index: usize,
     spans: &[LeafReplacement],
-) -> Option<(String, String)> {
+) -> Option<(usize, String, String)> {
     let (_part, runs) = run_offsets(workdir, paragraph_id)?;
     let mut ordered: Vec<&LeafReplacement> = spans.iter().collect();
     ordered.sort_by_key(|(start, _, _)| *start);
@@ -2524,7 +2533,7 @@ fn merged_leaf_island(
             next.extend_from_slice(&chars[end..]);
             chars = next;
         }
-        return Some((run_text, chars.into_iter().collect()));
+        return Some((run_start, run_text, chars.into_iter().collect()));
     }
 
     // More than one run: record the covered region itself. Text between two
@@ -2552,7 +2561,7 @@ fn merged_leaf_island(
     if old.is_empty() && new.is_empty() {
         return None;
     }
-    Some((old, new))
+    Some((first, old, new))
 }
 
 /// The run carrying the character at paragraph offset `offset`: its ordinal,
@@ -3217,6 +3226,7 @@ pub fn document_replace(
                     part: "document".to_string(),
                     paragraph_id: pid.to_string(),
                     leaf_index: leaf.leaf_index,
+                    char_start: None,
                     old: old_text,
                     new: new_text,
                     tracked: tracking.tracked,
@@ -3552,6 +3562,7 @@ pub fn apply_projection_with_options(
                 part: "document".to_string(),
                 paragraph_id: id.clone(),
                 leaf_index: 0,
+                char_start: None,
                 old: old_body.clone(),
                 new: new_body.clone(),
                 tracked,

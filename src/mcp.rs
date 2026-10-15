@@ -2459,7 +2459,7 @@ fn domain_code_from_message(message: &str) -> String {
 /// Dispatch one tool call against the session; returns the CallToolResult
 /// payload (the same value the line protocol wraps in `OK <json>`).
 /// The declared parameters of one tool, from the frozen schema.
-fn declared_parameters(tool: &str) -> Option<BTreeSet<String>> {
+pub(crate) fn declared_parameters(tool: &str) -> Option<BTreeSet<String>> {
     // The agent surface first. Its schemas live in `crate::surface` because they
     // are new and the frozen bundle is a published contract; reading only the
     // bundle meant a surface tool had NO declared parameters, so `unknown

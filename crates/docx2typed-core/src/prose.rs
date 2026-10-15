@@ -53,6 +53,14 @@ pub struct IslandEdit {
     pub leaf_index: usize,
     /// Decoded text to find (must be a substring of the leaf's text).
     pub old: String,
+    /// Char offset of `old` inside the paragraph's visible text, when the edit
+    /// came from a handle. One island carries every replacement that lands in
+    /// its leaf, and the merged text can occur twice in that leaf, so the
+    /// applier must locate the span by this offset instead of searching for the
+    /// text. Measured on a real patent: an 81-replacement batch committed
+    /// cleanly only once the offset addressed the span.
+    #[serde(default)]
+    pub char_start: Option<usize>,
     /// Replacement text (XML-escaped on write).
     pub new: String,
     /// Generate a tracked OOXML delete+insert pair instead of a direct swap.
@@ -1465,18 +1473,22 @@ pub fn resolve_leaf(
 ///
 /// The edit may cross text runs — Word splits a paragraph's text into one run
 /// per formatting change, so text a human typed in Word usually does — and this
-/// resolves it with `match_leaf_span`, the same resolver `apply_edits` uses, so
-/// validation and application cannot disagree about which runs an edit covers.
+/// resolves it with the same resolver `apply_edits` uses, including the edit's
+/// own offset, so validation and application cannot disagree about which runs an
+/// edit covers. They did disagree: one island carries every replacement in its
+/// leaf, its merged text can occur twice in that leaf, and a text-only search
+/// here refused an 81-replacement batch the applier could place.
 pub fn validate_edit(template: &Path, edit: &IslandEdit) -> Result<(), CoreError> {
     let part = edit.part.clone();
     let part_bytes = read_part(template, &part)?;
     let inventory = enumerate_package(template)?;
-    let Some(span) = match_leaf_span(
+    let Some(span) = match_leaf_span_at(
         &inventory,
         &part,
         &edit.paragraph_id,
         edit.leaf_index,
         &edit.old,
+        edit.char_start,
     )?
     else {
         return Err(CoreError::Domain(format!(
@@ -1550,12 +1562,13 @@ pub fn apply_edits(template: &Path, edits: &[IslandEdit]) -> Result<Vec<u8>, Cor
             // change, so an edit a human made in Word usually crosses runs. The
             // match is re-derived here from the recorded anchor and `old`, which
             // is also what proves the sidecar and the template still agree.
-            let span = match_leaf_span(
+            let span = match_leaf_span_at(
                 &inventory,
                 part,
                 &edit.paragraph_id,
                 edit.leaf_index,
                 &edit.old,
+                edit.char_start,
             )?;
             let Some(span) = span else {
                 return Err(CoreError::Domain(format!(
@@ -4988,6 +5001,7 @@ mod tests {
     fn island_edit_patches_only_the_leaf_bytes() {
         let template = fixture("table.docx");
         let edit = IslandEdit {
+            char_start: None,
             part: "document".to_string(),
             paragraph_id: "T0.R1.C1.P0".to_string(),
             leaf_index: 0,
@@ -5035,6 +5049,7 @@ mod tests {
         let template = fixture("complex.docx");
         // P12 is the fldSimple paragraph: locked.
         let edit = IslandEdit {
+            char_start: None,
             part: "document".to_string(),
             paragraph_id: "P12".to_string(),
             leaf_index: 0,
@@ -5052,6 +5067,7 @@ mod tests {
     fn island_edit_rejects_missing_old() {
         let template = fixture("plain.docx");
         let edit = IslandEdit {
+            char_start: None,
             part: "document".to_string(),
             paragraph_id: "P0".to_string(),
             leaf_index: 0,
@@ -5070,6 +5086,7 @@ mod tests {
         let template = fixture("plain.docx");
         // P5 text is "重复句子内容 重复句子内容。" — old occurs twice.
         let edit = IslandEdit {
+            char_start: None,
             part: "document".to_string(),
             paragraph_id: "P5".to_string(),
             leaf_index: 0,

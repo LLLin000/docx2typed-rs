@@ -74,6 +74,13 @@ pub fn schema(name: &str) -> Option<Value> {
                 "query": {"type": "string"},
                 "scope": {"type": ["string", "null"], "default": null},
                 "limit": {"type": ["integer", "null"], "default": null},
+                // The engine pages by block and its own `next.call` names this
+                // parameter when a page is short, so a schema without it made the
+                // tool refuse the call it had just told the caller to make.
+                // Measured: an agent following that instruction got
+                // `unknown argument \`offset\`` and, on a real patent, never
+                // reached the 15 of 35 blocks the first page left out.
+                "offset": {"type": ["integer", "null"], "default": null},
             },
             "required": ["query"],
             "additionalProperties": false,
@@ -144,5 +151,30 @@ pub fn dispatch(session: &mut McpSession, tool: &str, args: &Value, build_commit
             &format!("{other} is not part of the agent surface"),
             build_commit,
         ),
+    }
+}
+
+#[cfg(test)]
+mod schema_forwarding_tests {
+    /// Every key the surface forwards must be declared, because an undeclared
+    /// key is refused before the forward ever happens — and the engine's own
+    /// `next.call` names `offset` when a search page is short. A schema without
+    /// it made `document_find` refuse the very call it had just recommended:
+    /// measured on a real patent, the agent never reached the 15 of 35 blocks
+    /// the first page left out.
+    #[test]
+    fn every_forwarded_key_is_declared() {
+        for (tool, forwarded) in [
+            ("document_find", ["scope", "limit", "offset"]),
+            ("document_open", ["author", "date", "track"]),
+        ] {
+            let declared = crate::mcp::declared_parameters(tool).expect("schema");
+            for key in forwarded {
+                assert!(
+                    declared.contains(key),
+                    "{tool} forwards `{key}` but does not declare it: {declared:?}"
+                );
+            }
+        }
     }
 }

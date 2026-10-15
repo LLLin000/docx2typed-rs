@@ -1040,6 +1040,7 @@ impl Engine {
             )]));
         };
         let edit = docx2typed_core::prose::IslandEdit {
+            char_start: None,
             part,
             paragraph_id,
             leaf_index,

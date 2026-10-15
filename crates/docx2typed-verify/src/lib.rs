@@ -518,6 +518,11 @@ pub struct IslandEdit {
     pub part: String,
     pub paragraph_id: String,
     pub leaf_index: usize,
+    /// The paragraph offset `old` begins at, when the edit came from a handle.
+    /// Part of the edit's claim like everything else here, so the verifier has
+    /// to see it — and read it, because a merged island's text can occur twice
+    /// in its leaf and a text-only search would refuse it.
+    pub char_start: Option<usize>,
     pub old: String,
     pub new: String,
     pub tracked: bool,
@@ -543,6 +548,10 @@ fn load_islands(workdir: &Path) -> Option<Vec<IslandEdit>> {
         let part = edit.get("part")?.as_str()?.to_string();
         let paragraph_id = edit.get("paragraph_id")?.as_str()?.to_string();
         let leaf_index = edit.get("leaf_index")?.as_u64()? as usize;
+        let char_start = edit
+            .get("char_start")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize);
         let old = edit.get("old")?.as_str()?.to_string();
         let new = edit.get("new")?.as_str()?.to_string();
         let tracked = edit
@@ -554,6 +563,7 @@ fn load_islands(workdir: &Path) -> Option<Vec<IslandEdit>> {
                 part,
                 paragraph_id,
                 leaf_index,
+                char_start,
                 old,
                 new,
                 tracked,
@@ -2221,11 +2231,34 @@ fn edit_run_ranges(
             edit.leaf_index, edit.paragraph_id
         ));
     }
+    // Paragraph-level offset of each run's first char, so an island that records
+    // its own offset can be resolved at that offset. This crate stays
+    // independent of the applier on purpose — that is what makes it a check —
+    // but it must read the same input: one island carries every replacement in
+    // its leaf, and its merged text can occur twice in that leaf, which a
+    // text-only search refuses.
+    let mut prefix: Vec<usize> = Vec::with_capacity(leaves.len());
+    let mut running = 0usize;
+    for leaf in &leaves {
+        prefix.push(running);
+        let (text, _) = decode_text(&part[leaf.text_start..leaf.text_end])?;
+        running += text.chars().count();
+    }
+
     let mut found: Option<Vec<(usize, usize)>> = None;
     for start in edit.leaf_index..leaves.len() {
         let first = &leaves[start];
         let (_, first_chars) = decode_text(&part[first.text_start..first.text_end])?;
         let first_len = first_chars.len();
+        // The recorded offset starts inside this run, or this start is not its
+        // business.
+        let anchored_head = match edit.char_start {
+            Some(want) if want >= prefix[start] && want < prefix[start] + first_len => {
+                Some(want - prefix[start])
+            }
+            Some(_) => continue,
+            None => None,
+        };
         let mut accumulated = String::new();
         let mut before_last = 0usize;
         for end in start..leaves.len() {
@@ -2236,8 +2269,17 @@ fn edit_run_ranges(
             }
             let (text, _) = decode_text(&part[leaves[end].text_start..leaves[end].text_end])?;
             accumulated.push_str(&text);
-            let Some(byte_pos) = accumulated.find(&edit.old) else {
-                continue;
+            let byte_pos = match anchored_head {
+                Some(head) => match accumulated.char_indices().nth(head) {
+                    Some((byte_pos, _)) if accumulated[byte_pos..].starts_with(&edit.old) => {
+                        byte_pos
+                    }
+                    _ => continue,
+                },
+                None => match accumulated.find(&edit.old) {
+                    Some(byte_pos) => byte_pos,
+                    None => continue,
+                },
             };
             let head = accumulated[..byte_pos].chars().count();
             let covered = edit.old.chars().count();
