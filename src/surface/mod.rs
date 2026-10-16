@@ -64,6 +64,11 @@ pub fn schema(name: &str) -> Option<Value> {
                 "author": {"type": ["string", "null"], "default": null},
                 "date": {"type": ["string", "null"], "default": null},
                 "track": {"type": ["boolean", "null"], "default": null},
+                // One connection drives one workdir. Leaving it to open another
+                // is a decision the caller makes explicitly, and this is where
+                // it makes it — the refusal it replaces costs nothing to take,
+                // because a workdir keeps its state on disk.
+                "release_current": {"type": ["boolean", "null"], "default": null},
             },
             "required": ["source"],
             "additionalProperties": false,
@@ -177,7 +182,10 @@ mod schema_forwarding_tests {
     fn every_forwarded_key_is_declared() {
         for (tool, forwarded) in [
             ("document_find", &["scope", "limit", "offset"][..]),
-            ("document_open", &["author", "date", "track"][..]),
+            (
+                "document_open",
+                &["author", "date", "track", "release_current"][..],
+            ),
             ("document_edit", &["edits"][..]),
             ("document_save", &["output"][..]),
         ] {

@@ -2532,16 +2532,27 @@ fn plan_patch(
             }
         }
         let view = &view_cache.as_ref().expect("just loaded").1;
-        let Some((record_start, record_old, record_new, replaced_leaves)) =
-            merged_leaf_island(view, leaf_index, &spans)
-        else {
-            return Err(unmappable_paragraph(
-                workdir,
-                &paragraph_id,
-                leaf_index,
-                &spans,
-            ));
-        };
+        let (record_start, record_old, record_new, replaced_leaves) =
+            match merged_leaf_island(view, leaf_index, &spans) {
+                Some(LeafIsland::Record(start, old, new, replaced)) => (start, old, new, replaced),
+                Some(LeafIsland::Unchanged(replaced)) => {
+                    // The text the caller has arrived at is the text the template
+                    // holds, so nothing is recorded and the islands that were
+                    // composed into it are dropped with it.
+                    for absorbed_leaf in replaced {
+                        absorbed.push((paragraph_id.clone(), absorbed_leaf));
+                    }
+                    continue;
+                }
+                None => {
+                    return Err(unmappable_paragraph(
+                        workdir,
+                        &paragraph_id,
+                        leaf_index,
+                        &spans,
+                    ))
+                }
+            };
         for absorbed_leaf in replaced_leaves {
             absorbed.push((paragraph_id.clone(), absorbed_leaf));
         }
@@ -2722,10 +2733,19 @@ impl LeafView {
     }
 }
 
-/// One island record, before it becomes a sidecar entry: where its `old` starts
-/// in the caller's space, what the template holds there, what the caller reads
-/// there now, and the leaves whose own pending islands it replaces.
-type LeafIsland = (usize, String, String, Vec<usize>);
+/// What one leaf-group of replacements becomes.
+enum LeafIsland {
+    /// One island record, before it becomes a sidecar entry: where its `old`
+    /// starts in the caller's space, what the template holds there, what the
+    /// caller reads there now, and the leaves whose own pending islands it
+    /// replaces.
+    Record(usize, String, String, Vec<usize>),
+    /// Nothing to record: the text the caller has arrived at is the text the
+    /// template already holds. The leaves named here still have to give up their
+    /// pending islands, because those describe changes the document no longer
+    /// carries.
+    Unchanged(Vec<usize>),
+}
 
 /// The record covers WHOLE leaves, on both sides: `old` as the template holds
 /// them, `new` as the caller reads them with this call's spans applied. Whole
@@ -2787,7 +2807,22 @@ fn merged_leaf_island(
         .filter(|leaf| leaf.pending)
         .map(|leaf| leaf.leaf_index)
         .collect();
-    Some((covered[0].draft_start, old, new, absorbed))
+    // An edit can arrive back where the template already was — a sequence that
+    // grows a run and then trims it does exactly that. Nothing is recorded, and
+    // recording it anyway is worse than useless: an island that rewrites a leaf
+    // with the text it already has makes the build produce the template byte for
+    // byte, which the verifier refuses as `edited-package-distinct`. A sequence
+    // found this; one edit cannot, because a replacement whose new text equals its
+    // target is refused earlier as `replace-is-a-noop`.
+    if new == old {
+        return Some(LeafIsland::Unchanged(absorbed));
+    }
+    Some(LeafIsland::Record(
+        covered[0].draft_start,
+        old,
+        new,
+        absorbed,
+    ))
 }
 
 /// `text` with every span that starts inside it applied, spans addressed by

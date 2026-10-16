@@ -492,6 +492,20 @@ impl McpSession {
         self.workdir.as_deref()
     }
 
+    /// Stop driving the workdir this session is bound to, and say which one it
+    /// was.
+    ///
+    /// Nothing on disk changes: a workdir keeps its baseline, its sidecars and
+    /// its draft, and opening it again resumes exactly where it stood. Only the
+    /// binding is released, so a caller that has to move on to another document
+    /// can — the alternative, refusing until a second server process exists, is
+    /// not something the five tools can express. The engine-level contract stays
+    /// strict (`workdir_open` refuses a different workdir); the surface asks for
+    /// this explicitly on the caller's behalf.
+    pub(crate) fn release_workdir(&mut self) -> Option<String> {
+        self.workdir.take()
+    }
+
     /// The operation engine, for the surface to run one op without a tool hop.
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine

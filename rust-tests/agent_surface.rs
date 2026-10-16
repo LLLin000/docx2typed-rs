@@ -702,6 +702,230 @@ fn a_save_publishes_only_what_it_verified() {
 }
 
 #[test]
+fn an_edit_sequence_across_calls_keeps_one_island_per_leaf_and_one_version() {
+    let (dir, workdir) = opened("sequence");
+    let out = dir.join("sequenced.docx");
+    let wd = Path::new(&workdir);
+
+    // 1-3: two edits in the same leaf in two calls (the leaf is rewritten twice),
+    // then a dry run that must change nothing at all.
+    let first = handle(&workdir, "中文区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": first, "replace_with": "中文区块区域内容" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let after_first = content_digest(wd);
+    assert_islands_cover_distinct_leaves(wd);
+
+    let second = handle(&workdir, "中文区块区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": second, "replace_with": "中文区域内容A" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_islands_cover_distinct_leaves(wd);
+
+    let third = handle(&workdir, "中文区域内容A");
+    let before_dry = content_digest(wd);
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "dry_run": true, "edits": [
+                { "kind": "insert_after", "handle": third.clone(), "text": "不会写入的一段。" }
+            ] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(
+        content_digest(wd),
+        before_dry,
+        "a dry run changed the workdir"
+    );
+    assert_ne!(after_first, before_dry, "the second edit did not land");
+
+    // 4-5: a save that has to publish the composed edits as one version.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let built = built_text(&out);
+    assert!(built.contains("中文区域内容A"), "{built}");
+    assert!(!built.contains("不会写入的一段。"), "{built}");
+
+    // 6-7: keep editing after the save, then save again over the same path.
+    let fourth = handle(&workdir, "中文区域内容A");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": fourth, "replace_with": "中文区域内容" }] }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+    let rebuilt = built_text(&out);
+    assert!(rebuilt.contains("中文区域内容"), "{rebuilt}");
+    assert!(!rebuilt.contains("中文区域内容A"), "{rebuilt}");
+    assert_islands_cover_distinct_leaves(wd);
+
+    // 8-9: a batch that cannot be applied, then continuing as if it never was.
+    // The refusal must leave the workdir exactly as it found it.
+    let before_refusal = content_digest(wd);
+    let good = handle(&workdir, "中文区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [
+                { "handle": good.clone(), "replace_with": "X" },
+                { "handle": "ref_bogus", "replace_with": "Y" },
+            ] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "failure", "{:?}", replies[1]);
+    assert_eq!(
+        content_digest(wd),
+        before_refusal,
+        "a refused batch changed the workdir"
+    );
+
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": good, "replace_with": "中文区块区域内容" }] }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+    assert!(built_text(&out).contains("中文区块区域内容"));
+
+    // And the published set is one version: the document says so about itself.
+    let replies = mcp(&[("document_open", json!({ "source": out.to_string_lossy() }))]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(
+        data(&replies[0])["sidecars"]["state"],
+        "consistent",
+        "the sequence published a document whose evidence is not its own: {:?}",
+        data(&replies[0])["sidecars"]
+    );
+}
+
+/// One island per leaf, across every call the sequence made.
+fn assert_islands_cover_distinct_leaves(workdir: &Path) {
+    let islands = std::fs::read_to_string(workdir.join("islands.json")).expect("islands.json");
+    let parsed: Value = serde_json::from_str(&islands).expect("islands json");
+    let edits = parsed["edits"].as_array().expect("edits");
+    let mut leaves: Vec<(String, u64)> = edits
+        .iter()
+        .map(|edit| {
+            (
+                edit["paragraph_id"].as_str().unwrap_or("").to_string(),
+                edit["leaf_index"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    leaves.sort();
+    let mut unique = leaves.clone();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        leaves.len(),
+        "two islands address one leaf, which the build cannot splice: {islands}"
+    );
+}
+
+#[test]
+fn a_session_can_leave_a_workdir_without_losing_its_work() {
+    let (dir, first) = opened("release-first");
+    let second_source = dir.join("second.docx");
+    std::fs::copy(fixture("styled"), &second_source).expect("copy fixture");
+    let second_workdir = dir.join("second.docx2typed");
+    let target = handle(&first, "中文区域内容");
+
+    // ONE connection throughout: the binding belongs to the session, and a new
+    // process has none — which is also why this is a surface question and not an
+    // engine one.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": first })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": target, "replace_with": "中文区块区域内容" }] }),
+        ),
+        // A second document on the same connection: refused, and the refusal
+        // names the call that works.
+        (
+            "document_open",
+            json!({ "source": second_source.to_string_lossy() }),
+        ),
+        // Saying so leaves the first and opens the second.
+        (
+            "document_open",
+            json!({ "source": second_source.to_string_lossy(), "release_current": true }),
+        ),
+        // And going back finds the edit where it was: releasing a binding costs
+        // nothing, because the workdir keeps its own state.
+        (
+            "document_open",
+            json!({ "source": first, "release_current": true }),
+        ),
+        ("document_find", json!({ "query": "中文区块区域内容" })),
+    ]);
+
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(
+        outcome(&replies[2]),
+        "failure",
+        "a second document was opened without releasing the first: {:?}",
+        replies[2]
+    );
+    assert_eq!(code(&replies[2]), "workdir-already-open");
+    let why = envelope(&replies[2])
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .and_then(|diagnostics| diagnostics.first())
+        .and_then(|diagnostic| diagnostic.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        why.contains("release_current"),
+        "the refusal does not name the call that would work: {why}"
+    );
+
+    assert_eq!(outcome(&replies[3]), "success", "{:?}", replies[3]);
+    assert_eq!(
+        data(&replies[3])["released"]["workdir"].as_str(),
+        Some(first.as_str()),
+        "the reply does not say which workdir it left: {:?}",
+        data(&replies[3])["released"]
+    );
+    assert!(
+        second_workdir.is_dir(),
+        "the second document was not opened at all"
+    );
+
+    assert_eq!(outcome(&replies[4]), "success", "{:?}", replies[4]);
+    assert_eq!(
+        data(&replies[5])["counts"]["occurrences"].as_u64(),
+        Some(1),
+        "leaving the workdir lost the edit that was in it: {:?}",
+        data(&replies[5])
+    );
+}
+
+#[test]
 fn an_opened_document_reports_whether_its_evidence_is_its_own() {
     let (dir, workdir) = opened("sidecar-set");
     let target = handle(&workdir, "中文区域内容");

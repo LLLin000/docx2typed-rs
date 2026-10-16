@@ -41,6 +41,38 @@ fn is_workdir(path: &Path) -> bool {
     path.is_dir() && path.join("typed.md").is_file()
 }
 
+/// Two paths that name the same directory.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// What a workdir was carrying when the session left it.
+///
+/// Reported, not judged: the point of releasing a binding is that nothing is
+/// lost, and the two things a caller needs to know are which workdir it was and
+/// whether anything was still unsettled in it. A refused release (`release_current`
+/// absent) does not report this at all — the caller has not left yet.
+fn workdir_state(session: &McpSession, workdir: &str, build_commit: &str) -> Value {
+    // Called while the workdir is still bound, so this reports the one being
+    // left rather than whatever is bound next.
+    let reported = session.workdir_status(build_commit);
+    let data = reported
+        .get("structuredContent")
+        .and_then(|envelope| envelope.get("data"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut state = json!({
+        "workdir": workdir,
+        "next": data.get("next").cloned().unwrap_or(Value::Null),
+    });
+    for key in ["draft", "freshness", "review_state"] {
+        if let Some(value) = data.get(key) {
+            state[key] = value.clone();
+        }
+    }
+    state
+}
+
 /// Extract `source` into a workdir beside it, then report where it went.
 fn extract_beside(
     session: &McpSession,
@@ -94,6 +126,45 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
     } else {
         None
     };
+    // One connection drives one workdir, and this is where a caller gets to
+    // move on. The refusal below is the same one the engine makes, in the
+    // caller's vocabulary: it names the call that releases the binding, and it
+    // says what that call does NOT do — a workdir keeps its baseline, sidecars
+    // and draft on disk, so nothing is lost by leaving it.
+    let bound = session.open_workdir().map(str::to_string);
+    let mut released: Option<Value> = None;
+    if let Some(open) = bound {
+        let target_workdir = if is_workdir(&source) {
+            source.clone()
+        } else {
+            workdir_for(&source)
+        };
+        let same = canonical(Path::new(&open)) == canonical(&target_workdir);
+        if !same {
+            let reported = workdir_state(session, &open, build_commit);
+            if args
+                .get("release_current")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                session.release_workdir();
+                released = Some(reported);
+            } else {
+                return session.failure(
+                    "document_open",
+                    "workdir-already-open",
+                    &format!(
+                        "this session already drives {open}, and it opens one workdir at a time. \
+                         Call document_open again with release_current: true to leave it and open \
+                         {} — nothing is lost by that: {open} keeps its baseline, its sidecars and \
+                         its draft on disk, and opening it again resumes exactly where it stood",
+                        source.display()
+                    ),
+                    build_commit,
+                );
+            }
+        }
+    }
     let workdir = if is_workdir(&source) {
         source
     } else if source.is_file() {
@@ -168,6 +239,13 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
         // whatever it is — it says the evidence may not be read as this
         // document's provenance.
         data["sidecars"] = sidecars;
+    }
+    if let Some(released) = released {
+        // Which workdir was left, and what it was carrying. Stated in the reply
+        // because the caller asked to leave it: a release that loses nothing is
+        // still a change of subject, and an agent that forgets where it was has
+        // no way to ask later.
+        data["released"] = released;
     }
     // Whether this workdir can be built at all — answered HERE, not only when
     // `document_save` finally refuses. A document carrying committed typed edits
