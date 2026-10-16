@@ -3415,7 +3415,19 @@ pub fn validate_structure(template: &Path, edits: &StructureEdits) -> Result<(),
         // than dropping it.
         let _ = (start, end);
         if let Some(anchor) = &paragraph.insert_before {
-            if range_of(anchor).is_none() {
+            // The anchor may be a paragraph this structure is about to insert:
+            // two paragraphs sent "after the same one" chain, because the second
+            // is recorded before the first — that is where the draft put it. It
+            // has no range in the template yet, and demanding one refused the
+            // workdir at build time, permanently: every later save failed with
+            // `unknown insert_before paragraph`, and nothing on the caller's side
+            // could undo it. A real sequence found this by inserting twice.
+            let in_template = range_of(anchor).is_some();
+            let in_structure = edits
+                .new_paragraphs
+                .iter()
+                .any(|other| other.paragraph_id == *anchor);
+            if !in_template && !in_structure {
                 return Err(CoreError::Domain(format!(
                     "invalid-structure: unknown insert_before paragraph: {anchor}"
                 )));
@@ -3858,24 +3870,58 @@ fn splice_structure(
         let (_, start, end) = &located[index];
         spans.push((*start, *end, Vec::new()));
     }
-    for paragraph in &edits.new_paragraphs {
+    // Where each synthesised paragraph goes. An anchor may be a paragraph of the
+    // template, a paragraph that a delete is removing (fall forward to the next
+    // survivor), or a paragraph this structure is about to insert — two
+    // paragraphs sent "after the same one" chain, and the chain has to resolve to
+    // the place the anchor itself will be. A chain that leads back to itself is a
+    // refusal: resolving it is a hang, not an answer.
+    let anchor_offset = |anchor: &str| -> Result<usize, CoreError> {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut current = anchor.to_string();
+        loop {
+            if !seen.insert(current.clone()) {
+                return Err(CoreError::Domain(format!(
+                    "invalid-structure: insert_before paragraphs form a cycle at {current}"
+                )));
+            }
+            if let Some(mut index) = index_of.get(current.as_str()).copied() {
+                loop {
+                    let (id, start, _) = &located[index];
+                    if !deleted.contains(id.as_str()) {
+                        return Ok(*start);
+                    }
+                    index += 1;
+                    if index >= located.len() {
+                        return Ok(append_at);
+                    }
+                }
+            }
+            match edits
+                .new_paragraphs
+                .iter()
+                .find(|paragraph| paragraph.paragraph_id == current)
+            {
+                Some(pending) => match &pending.insert_before {
+                    Some(next) => current = next.clone(),
+                    None => return Ok(append_at),
+                },
+                None => {
+                    return Err(CoreError::Domain(format!(
+                        "invalid-structure: unknown insert_before paragraph: {current}"
+                    )))
+                }
+            }
+        }
+    };
+    for paragraph in edits.new_paragraphs.iter().rev() {
+        // Reversed: a stable sort keeps this order for paragraphs that land at
+        // the same offset, and there the LATER one comes first — it was sent
+        // "after the same paragraph" and the draft already showed the earlier
+        // one there.
         let at = match &paragraph.insert_before {
             None => append_at,
-            Some(anchor) => {
-                // The anchor may itself have been deleted since the insert
-                // was committed: fall forward to the next surviving one.
-                let mut target = None;
-                let mut index = index_of.get(anchor.as_str()).copied();
-                while let Some(current) = index {
-                    let (id, start, _) = &located[current];
-                    if !deleted.contains(id.as_str()) {
-                        target = Some(*start);
-                        break;
-                    }
-                    index = Some(current + 1);
-                }
-                target.unwrap_or(append_at)
-            }
+            Some(anchor) => anchor_offset(anchor)?,
         };
         spans.push((
             at,

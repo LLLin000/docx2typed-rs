@@ -611,6 +611,9 @@ impl StructureEdits {
 /// One recorded synthesised paragraph.
 #[derive(Clone, Debug, Default)]
 pub struct NewParagraph {
+    /// The id the structure gave it — the same id an `insert_before` anchor may
+    /// name, which is how two paragraphs sent after the same one chain.
+    pub id: String,
     pub inherit: String,
     pub body: String,
     pub insert_before: Option<String>,
@@ -650,6 +653,7 @@ fn load_structure(workdir: &Path) -> Option<StructureEdits> {
             })
             .unwrap_or_default();
         structure.new_paragraphs.push(NewParagraph {
+            id: entry.get("paragraph_id")?.as_str()?.to_string(),
             inherit: entry.get("inherit")?.as_str()?.to_string(),
             body: entry.get("body")?.as_str()?.to_string(),
             insert_before: entry
@@ -1065,22 +1069,52 @@ fn structure_spans(
         let (_, start, end) = &located[index];
         spans.push((*start, *end, Vec::new()));
     }
-    for paragraph in &structure.new_paragraphs {
+    // Where each synthesised paragraph goes. The anchor may be a paragraph of the
+    // template, one a delete is removing (fall forward), or one this structure is
+    // about to insert itself — two paragraphs sent "after the same one" chain,
+    // and the chain resolves to where the anchor goes. A chain that leads back to
+    // itself is refused: resolving it is a hang, not an answer.
+    let anchor_offset = |anchor: &str| -> Result<usize, String> {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut current = anchor.to_string();
+        loop {
+            if !seen.insert(current.clone()) {
+                return Err(format!(
+                    "insert_before paragraphs form a cycle at {current}"
+                ));
+            }
+            if let Some(mut index) = index_of.get(current.as_str()).copied() {
+                loop {
+                    let (id, start, _) = &located[index];
+                    if !deleted.contains(id.as_str()) {
+                        return Ok(*start);
+                    }
+                    index += 1;
+                    if index >= located.len() {
+                        return Ok(append_at);
+                    }
+                }
+            }
+            match structure
+                .new_paragraphs
+                .iter()
+                .find(|paragraph| paragraph.id == current)
+            {
+                Some(pending) => match &pending.insert_before {
+                    Some(next) => current = next.clone(),
+                    None => return Ok(append_at),
+                },
+                None => return Err(format!("unknown insert_before paragraph: {current}")),
+            }
+        }
+    };
+    // Reversed: the sort below is stable, and paragraphs landing at the same
+    // offset belong in reverse order of recording — the later one was sent "after
+    // the same paragraph" and the draft already showed the earlier one there.
+    for paragraph in structure.new_paragraphs.iter().rev() {
         let at = match &paragraph.insert_before {
             None => append_at,
-            Some(anchor) => {
-                let mut target = None;
-                let mut index = index_of.get(anchor.as_str()).copied();
-                while let Some(current) = index {
-                    let (id, start, _) = &located[current];
-                    if !deleted.contains(id.as_str()) {
-                        target = Some(*start);
-                        break;
-                    }
-                    index = Some(current + 1);
-                }
-                target.ok_or_else(|| format!("unknown insert_before paragraph: {anchor}"))?
-            }
+            Some(anchor) => anchor_offset(anchor)?,
         };
         spans.push((at, at, render_new_paragraph(part, &located, paragraph)?));
     }
@@ -2655,6 +2689,7 @@ mod tests {
         let part = b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:pPr><w:jc w:val=\"center\"/><w:spacing w:after=\"120\"/><w:sectPr/><w:pPrChange w:id=\"1\"/></w:pPr><w:r><w:rPr><w:rPrChange w:id=\"2\"/><w:b/></w:rPr><w:t>x</w:t></w:r></w:p></w:body></w:document>";
         let located = locate_paragraphs(part, "document").unwrap();
         let paragraph = NewParagraph {
+            id: "N1".to_string(),
             inherit: located[0].0.clone(),
             body: "hello".to_string(),
             insert_before: None,
