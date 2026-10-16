@@ -1169,12 +1169,19 @@ fn sequence_fuzz() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3);
+    // An independent interval, so a green sweep is not only a statement about the
+    // sequences one range happens to generate: `SEQUENCE_FUZZ_SEED_BASE=10001`
+    // runs 10001..=10000+seeds.
+    let base: u64 = std::env::var("SEQUENCE_FUZZ_SEED_BASE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
     let steps: usize = std::env::var("SEQUENCE_FUZZ_STEPS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(8);
 
-    for seed in 1..=seeds {
+    for seed in base..base + seeds {
         let registered = KNOWN_FAILURES
             .iter()
             .find(|(known, _, _)| *known == seed)
@@ -1337,6 +1344,183 @@ fn hold_without_delete(path: &Path) -> std::fs::File {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .open(path)
         .expect("open without delete sharing")
+}
+
+/// The verification stage, injected from outside: build an artifact, change a
+/// byte inside its package, and ask the verifier about it. The path being the same
+/// proves the path, not the bytes — this is the check that has to catch it, and it
+/// runs as its own call, the way the surface runs it before publishing.
+#[test]
+fn a_tampered_artifact_is_refused_by_the_verification() {
+    let (dir, workdir) = opened("tampered");
+    let target = handle(&workdir, "中文区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": target, "replace_with": "中文区块区域内容" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+
+    let built = dir.join("built.docx");
+    let status = Command::new(bin())
+        .args(["build", &workdir, "--output", built.to_str().expect("path")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("build");
+    assert!(status.success(), "the build itself failed");
+    assert!(built.is_file(), "no artifact to verify");
+
+    // The verifier accepts the artifact the build produced.
+    let verified = Command::new(bin())
+        .args(["verify", &workdir, built.to_str().expect("path"), "--json"])
+        .output()
+        .expect("verify");
+    let stdout = String::from_utf8_lossy(&verified.stdout);
+    assert!(
+        stdout.contains("success"),
+        "the built artifact did not verify: {stdout}"
+    );
+
+    // Now change the package: rewrite one paragraph's text inside the archive.
+    let tampered = dir.join("tampered.docx");
+    rewrite_document_text(&built, &tampered, "中文区块区域内容X");
+    assert_ne!(
+        std::fs::read(&built).expect("built"),
+        std::fs::read(&tampered).expect("tampered"),
+        "the tampering did nothing, so this test would prove nothing"
+    );
+
+    let verified = Command::new(bin())
+        .args([
+            "verify",
+            &workdir,
+            tampered.to_str().expect("path"),
+            "--json",
+        ])
+        .output()
+        .expect("verify");
+    let stdout = String::from_utf8_lossy(&verified.stdout);
+    assert!(
+        stdout.contains("\"outcome\":\"failure\""),
+        "a tampered artifact verified: {stdout}"
+    );
+    assert!(
+        stdout.contains("edited-part-exact")
+            || stdout.contains("parts-match-template-except-edited")
+            || stdout.contains("edited-package-distinct"),
+        "the refusal does not say which check caught it: {stdout}"
+    );
+}
+
+/// Copy a DOCX, replacing one text in `word/document.xml`.
+fn rewrite_document_text(source: &Path, target: &Path, replacement: &str) {
+    use std::io::Write;
+    let bytes = std::fs::read(source).expect("source package");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+    let destination = std::fs::File::create(target).expect("target");
+    let mut writer = zip::ZipWriter::new(destination);
+    let options = zip::write::SimpleFileOptions::default();
+    for index in 0..archive.len() {
+        let mut member = archive.by_index(index).expect("member");
+        let name = member.name().to_string();
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut member, &mut content).expect("read member");
+        if name == "word/document.xml" {
+            let text = String::from_utf8_lossy(&content).to_string();
+            let changed = text.replacen("中文区块区域内容", replacement, 1);
+            assert_ne!(
+                changed, text,
+                "the text to tamper with was not in the package"
+            );
+            content = changed.into_bytes();
+        }
+        writer.start_file(name, options).expect("start member");
+        writer.write_all(&content).expect("write member");
+    }
+    writer.finish().expect("finish package");
+}
+
+/// A publication that could not finish leaves work behind; the next call
+/// recovers, the repair reaches a consistent version, and repeating it changes
+/// nothing — the two properties that make a recovery worth having (reachable, and
+/// idempotent).
+#[test]
+#[cfg(windows)]
+fn a_stranded_publication_recovers_and_a_second_recovery_changes_nothing() {
+    let (dir, workdir) = opened("stranded");
+    let out = dir.join("stranded.docx");
+    let first = handle(&workdir, "中文区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": first, "replace_with": "中文区块区域内容" }] }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+    let good = std::fs::read(&out).expect("published");
+
+    // A publication that fails at its last step: what a killed process leaves
+    // behind is a journal and no publication.
+    let second = handle(&workdir, "中文区块区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": second, "replace_with": "中文区块区域内容B" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let guard = hold_without_delete(&out);
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    drop(guard);
+    assert_ne!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(
+        std::fs::read(&out).expect("still there"),
+        good,
+        "the failed publication replaced the version that was there"
+    );
+
+    // Recovery: the same call again, now that nothing holds the target.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let recovered = std::fs::read(&out).expect("recovered");
+    assert!(built_text(&out).contains("中文区块区域内容B"));
+    let replies = mcp(&[(
+        "document_open",
+        json!({ "source": out.to_string_lossy(), "release_current": true }),
+    )]);
+    assert_eq!(
+        data(&replies[0])["sidecars"]["state"],
+        "consistent",
+        "recovery left a set that is not one version: {:?}",
+        data(&replies[0])["sidecars"]
+    );
+
+    // Idempotent: running it again produces the same bytes, not a second effect.
+    let replies = mcp(&[
+        (
+            "document_open",
+            json!({ "source": workdir, "release_current": true }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(
+        std::fs::read(&out).expect("again"),
+        recovered,
+        "a second recovery produced different bytes"
+    );
 }
 
 #[test]

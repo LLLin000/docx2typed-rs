@@ -277,6 +277,59 @@ pub fn document_save(session: &mut McpSession, args: &Value, build_commit: &str)
         );
     }
 
+    // The window between verifying and publishing is the one place a third party
+    // could swap the staged file for another one — the path being the same proves
+    // the path, not the bytes. So the bytes are hashed again and compared with the
+    // hash the verification recorded.
+    //
+    // What this claims, exactly: a staged file that changed at any point BEFORE
+    // this read is caught, and the publication is refused. It does not claim that
+    // nothing can change between this read and the rename — that would take a file
+    // handle protocol, and for a single-process local tool the remaining window is
+    // not worth it. It is a check, not a transaction.
+    // The verification wrote its evidence beside the staged build, and that
+    // evidence names the bytes it verified (`payload.outputs.docx.sha256`). A
+    // verification that left no evidence is not one this step may trust, so that
+    // is a refusal rather than a shrug.
+    let evidence = format!("{staging}.verify.evidence.json");
+    let Some(expected) = recorded_docx_sha256(Path::new(&evidence)) else {
+        discard_build(&staging);
+        return session.failure(
+            "document_save",
+            "verification-evidence-missing",
+            &format!(
+                "the verification of the staged build left no evidence to check the publication \
+                 against ({evidence}); nothing was published"
+            ),
+            build_commit,
+        );
+    };
+    match docx2typed_protocol::file_sha256(Path::new(&staging)) {
+        Ok(actual) if actual == expected => {}
+        Ok(actual) => {
+            discard_build(&staging);
+            return session.failure(
+                "document_save",
+                "staged-artifact-changed",
+                &format!(
+                    "the verified build has changed on disk before it could be published: the \
+                     verification saw {expected}, the file now hashes to {actual}. Nothing was \
+                     published, so {output} still holds whatever it held before"
+                ),
+                build_commit,
+            );
+        }
+        Err(error) => {
+            discard_build(&staging);
+            return session.failure(
+                "document_save",
+                "staged-artifact-unreadable",
+                &format!("the verified build could not be read back before publishing: {error}"),
+                build_commit,
+            );
+        }
+    }
+
     // The last step, and the only one the caller sees.
     if let Err(error) = publish_build(&staging, output) {
         discard_build(&staging);

@@ -4023,6 +4023,16 @@ pub fn apply_projection_with_options(
                     // Changed: render from the current node tree. Falling back
                     // to the draft dialect is the OLD lossy route, and it is
                     // reported, never taken silently.
+                    // The body comes from the map keyed by the ids the BUILD
+                    // produced (`BuildOutput.document_ids`) — identity, not
+                    // position. A draft-vs-projection text comparison was tried
+                    // here as a second check and removed: the two dialects reduce
+                    // to different strings for legitimate paragraphs, because they
+                    // spell zero-width inline tokens differently (the typed view
+                    // writes a tab as `\t`, the draft as a token with no text), and
+                    // a check that refuses valid work is worse than no check. The
+                    // defect it was meant to catch is fixed where it lived and
+                    // pinned by a deterministic test.
                     match current_markup.get(&id) {
                         Some(tree_body) => tree_body.clone(),
                         None => {
