@@ -208,15 +208,19 @@ pub(crate) fn apply_and_sync(
                 // cannot act on, since the surface hands out no handle for a
                 // paragraph the search did not match. Passing `None` lets the
                 // engine choose a source that works and keep the position.
-                let inserted = draft::insert_paragraph(target, &anchor, text, None, *format)
-                    .map_err(|error| MutationError::new(error.code, error.detail))?;
+                let inserted = surface_next_step(
+                    draft::insert_paragraph(target, &anchor, text, None, *format)
+                        .map_err(|error| MutationError::new(error.code, error.detail))?,
+                );
                 structural
                     .push(json!({ "kind": "insert_after", "anchor": anchor, "result": inserted }));
             }
             Edit::Delete { handle } => {
                 let paragraph = paragraph_of(target, handle)?;
-                let deleted = draft::delete_paragraph(target, &paragraph)
-                    .map_err(|error| MutationError::new(error.code, error.detail))?;
+                let deleted = surface_next_step(
+                    draft::delete_paragraph(target, &paragraph)
+                        .map_err(|error| MutationError::new(error.code, error.detail))?,
+                );
                 structural.push(
                     json!({ "kind": "delete", "paragraph_id": paragraph, "result": deleted }),
                 );
@@ -290,6 +294,29 @@ pub(crate) fn apply_and_sync(
             "current_snapshot": published.get("current_snapshot").cloned().unwrap_or(Value::Null),
         },
     }))
+}
+
+/// A structural reply, with the engine's `next` replaced by the one the surface
+/// can actually take.
+///
+/// The draft owns these answers in its own vocabulary — "commit_sync allocates
+/// the formal paragraph ID", "diff_preview to inspect style ownership, then
+/// commit_sync" — and neither tool is mounted: the commit already happened
+/// inside this call, so telling the caller to run it names a step that does not
+/// exist for them. A blind agent quoted the advice back as a defect, correctly.
+/// The engine-level reply keeps its own wording for the CLI and the tests; what
+/// the agent reads is this.
+fn surface_next_step(reply: Value) -> Value {
+    let Value::Object(mut map) = reply else {
+        return reply;
+    };
+    if map.contains_key("next") {
+        map.insert(
+            "next".to_string(),
+            json!("document_save writes the file when you are done editing"),
+        );
+    }
+    Value::Object(map)
 }
 
 /// The paragraph a handle addresses.

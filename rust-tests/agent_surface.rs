@@ -518,6 +518,29 @@ fn a_dry_run_checks_a_structural_edit_instead_of_calling_it_empty() {
         before,
         "a dry run wrote to the document"
     );
+
+    // The same edit, written for real. Its reply carries the engine's own
+    // vocabulary one level down (`result.next`), and the engine's step names
+    // — `commit_sync`, `diff_preview` — are not mounted on this surface: the
+    // commit happened inside this call. A blind agent quoted that advice back
+    // as a defect, so what the agent reads names a step it has.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [
+                { "kind": "insert_after", "handle": target, "text": "新增的一段。" }
+            ] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let written = serde_json::to_string(data(&replies[1])).expect("reply as text");
+    for absent in ["commit_sync", "diff_preview", "workdir_open", "facade_edit"] {
+        assert!(
+            !written.contains(absent),
+            "the reply tells the agent to call `{absent}`, which is not mounted: {written}"
+        );
+    }
 }
 
 #[test]
