@@ -107,6 +107,17 @@ pub fn schema(name: &str) -> Option<Value> {
                             "handle": {"type": "string"},
                             "replace_with": {"type": ["string", "null"], "default": null},
                             "text": {"type": ["string", "null"], "default": null},
+                            // How much of the anchor's formatting the new
+                            // paragraph takes. `safe_inherit` is the default and
+                            // copies only what may be copied — no revision
+                            // record, no section break, no unknown property.
+                            // `none` writes the paragraph with no inherited
+                            // properties at all.
+                            "format_policy": {
+                                "type": ["string", "null"],
+                                "enum": ["safe_inherit", "none", null],
+                                "default": null,
+                            },
                         },
                         "required": ["handle"],
                         "additionalProperties": false,
@@ -165,16 +176,42 @@ mod schema_forwarding_tests {
     #[test]
     fn every_forwarded_key_is_declared() {
         for (tool, forwarded) in [
-            ("document_find", ["scope", "limit", "offset"]),
-            ("document_open", ["author", "date", "track"]),
+            ("document_find", &["scope", "limit", "offset"][..]),
+            ("document_open", &["author", "date", "track"][..]),
+            ("document_edit", &["edits"][..]),
+            ("document_save", &["output"][..]),
         ] {
             let declared = crate::mcp::declared_parameters(tool).expect("schema");
             for key in forwarded {
                 assert!(
-                    declared.contains(key),
+                    declared.contains(*key),
                     "{tool} forwards `{key}` but does not declare it: {declared:?}"
                 );
             }
         }
+    }
+
+    /// The same rule one level down. An edit object is validated against its own
+    /// schema, and that schema is closed — so a per-edit key the code reads but
+    /// the schema omits is refused before the read, exactly like a top-level one.
+    /// `format_policy` was taught to `document_edit` and not declared here, and
+    /// the tool rejected the parameter it had just been given a way to honour.
+    #[test]
+    fn every_per_edit_key_is_declared() {
+        let schema = crate::surface::schema("document_edit").expect("schema");
+        let item = &schema["properties"]["edits"]["items"];
+        let declared = item["properties"].as_object().expect("edit properties");
+        for key in ["kind", "handle", "replace_with", "text", "format_policy"] {
+            assert!(
+                declared.contains_key(key),
+                "document_edit reads `{key}` off an edit but does not declare it: {:?}",
+                declared.keys().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            item["additionalProperties"],
+            serde_json::json!(false),
+            "an open edit schema would let a mistyped key reach the engine as a silent default"
+        );
     }
 }

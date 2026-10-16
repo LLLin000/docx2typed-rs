@@ -641,6 +641,25 @@ fn draft_inherit(blocks: &[String], id: &str) -> Option<String> {
     })
 }
 
+/// The format policy of a synthesised paragraph, from its draft marker. Absent
+/// means the default, so a draft written before the attribute existed keeps the
+/// behaviour it had.
+fn draft_format_policy(blocks: &[String], id: &str) -> docx2typed_core::prose::FormatPolicy {
+    blocks
+        .iter()
+        .find_map(|block| {
+            let (_, block_id, marker) = marker_of(block)?;
+            (block_id == id)
+                .then(|| marker_attr(&marker, "format"))
+                .flatten()
+        })
+        .and_then(|value| match value.as_str() {
+            "none" => Some(docx2typed_core::prose::FormatPolicy::None),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// The insertion anchor of a synthesised paragraph: the next following
 /// surviving baseline paragraph in draft order, else None (append) —
 /// mirror of Python's `_paragraph_placements`.
@@ -1310,6 +1329,7 @@ pub fn insert_paragraph(
     after_id: &str,
     text: &str,
     inherit: Option<&str>,
+    format: docx2typed_core::prose::FormatPolicy,
 ) -> Result<Value, CollaborationError> {
     if after_id.starts_with('T')
         || after_id.starts_with('B')
@@ -1351,52 +1371,48 @@ pub fn insert_paragraph(
     // would be ignoring it — the engine-level tools keep that refusal. The
     // surface's `insert_after` names a POSITION, not a source, so there the
     // engine owns the choice.
-    let mut inherit_from = resolved_inherit.clone();
-    if let Err(refusal) = require_unprotected(
-        workdir,
-        &inherit_from,
-        "new paragraph cannot inherit protected structure",
-    ) {
-        // An explicit `inherit` is an instruction: substituting another
-        // paragraph would be ignoring it, so the refusal stands. When the
-        // caller named only a POSITION, the source is the engine's choice —
-        // pick the nearest paragraph before the anchor that can carry one and
-        // keep the position. Measured on a real patent: refusing there cost a
-        // restricted agent fourteen attempts at anchors (P17 refused, P18
-        // refused, P19 accepted), and the handle it would have needed to take
-        // that advice is not something the surface hands out.
-        if inherit.is_some() {
-            return Err(refusal);
-        }
-        let mut candidates: Vec<String> = Vec::new();
-        for block in &blocks {
-            match marker_of(block).map(|(_, id, _)| id) {
-                Some(id) if id == resolved_inherit => break,
-                Some(id) if id.starts_with('P') && !id.contains('.') => candidates.push(id),
-                _ => {}
-            }
-        }
-        match candidates
-            .into_iter()
-            .rev()
-            .find(|id| docx2typed_core::prose::paragraph_protection(workdir, id).ok() == Some(None))
-        {
-            Some(id) => inherit_from = id,
-            // Nothing in the document can carry a new paragraph: the refusal
-            // stands, and now it is the whole truth.
-            None => return Err(refusal),
-        }
-    }
+    // Position and format are two questions, and Safe Paragraph Synthesis
+    // answers the second one in the builder: the anchor supplies POSITION, and
+    // only the properties that may be copied are copied. So a paragraph carrying
+    // tracked revisions, comment anchors or a drawing is a perfectly good anchor
+    // — none of those is formatting — and this path no longer refuses it.
+    //
+    // What the caller cannot see is the SECTION. Inserting after a paragraph
+    // that carries `sectPr` puts the new paragraph in the NEXT section, so the
+    // page layout it lands in may differ from the anchor's even though the
+    // position is exactly right. That difference is reported, not refused: it is
+    // a fact about the document, not an error in the request.
+    let inherit_from = resolved_inherit.clone();
+    let lands_in_next_section =
+        docx2typed_core::prose::paragraph_protection(workdir, &inherit_from)
+            .ok()
+            .flatten()
+            .is_some_and(|reason| reason == "section properties");
     let temp = next_temp_id(&blocks);
-    let block = format!("<!--@new temp=\"{temp}\" inherit=\"{inherit_from}\"/>\n{text}");
+    // The policy rides the marker only when it is not the default, so an
+    // ordinary insert writes the same draft it always did.
+    let format_attr = match format {
+        docx2typed_core::prose::FormatPolicy::SafeInherit => String::new(),
+        docx2typed_core::prose::FormatPolicy::None => " format=\"none\"".to_string(),
+    };
+    let block =
+        format!("<!--@new temp=\"{temp}\" inherit=\"{inherit_from}\"{format_attr}/>\n{text}");
     blocks.insert(index + 1, block);
     write_draft(workdir, &header, &blocks)?;
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "temp_id": temp,
         "inherit": inherit_from,
         "draft": "dirty",
         "next": "commit_sync allocates the formal paragraph ID",
-    }))
+    });
+    if lands_in_next_section {
+        result["notes"] = serde_json::json!([format!(
+            "{inherit_from} carries the section break, so the new paragraph lands in the NEXT \
+             section: the position is right, but the page layout around it may differ from the \
+             anchor's. Insert after a paragraph inside the section you meant instead."
+        )]);
+    }
+    Ok(result)
 }
 
 /// The `delete_paragraph` tool body: remove the block, append a delete
@@ -3587,6 +3603,7 @@ pub fn apply_projection_with_options(
                     part: "document".to_string(),
                     paragraph_id: id.clone(),
                     inherit: draft_inherit(&blocks, temp).unwrap_or_default(),
+                    format_policy: draft_format_policy(&blocks, temp),
                     body: new_body.clone(),
                     insert_before: next_live_paragraph(&blocks, temp),
                 });
@@ -3643,6 +3660,7 @@ pub fn apply_projection_with_options(
                     part: "document".to_string(),
                     paragraph_id: id.clone(),
                     inherit: id.clone(),
+                    format_policy: docx2typed_core::prose::FormatPolicy::default(),
                     body: new_body.clone(),
                     insert_before: next_anchor,
                 });

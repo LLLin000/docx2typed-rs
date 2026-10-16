@@ -648,8 +648,18 @@ impl McpSession {
         self.draft_tool("insert_paragraph", args, build_commit, move |target| {
             draft::ensure_projection(target)
                 .map_err(|error| MutationError::new(error.code, error.detail))?;
-            draft::insert_paragraph(target, &after_id, &text, inherit.as_deref())
-                .map_err(|error| MutationError::new(error.code, error.detail))
+            // The engine-level tool keeps the default: `format_policy` is
+            // exposed on the agent surface (`document_edit`), and the frozen
+            // schema bundle this tool declares against is a published contract
+            // that a fix PR does not get to widen.
+            draft::insert_paragraph(
+                target,
+                &after_id,
+                &text,
+                inherit.as_deref(),
+                docx2typed_core::prose::FormatPolicy::SafeInherit,
+            )
+            .map_err(|error| MutationError::new(error.code, error.detail))
         })
     }
 

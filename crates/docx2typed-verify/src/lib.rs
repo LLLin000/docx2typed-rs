@@ -609,11 +609,20 @@ impl StructureEdits {
 }
 
 /// One recorded synthesised paragraph.
-#[derive(Clone, Debug)]
-struct NewParagraph {
-    inherit: String,
-    body: String,
-    insert_before: Option<String>,
+#[derive(Clone, Debug, Default)]
+pub struct NewParagraph {
+    pub inherit: String,
+    pub body: String,
+    pub insert_before: Option<String>,
+    pub format_policy: FormatPolicy,
+}
+
+/// How a synthesised paragraph takes formatting from its anchor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FormatPolicy {
+    #[default]
+    SafeInherit,
+    None,
 }
 
 const STRUCTURE_SCHEMA: &str = "docx2typed-structure-1";
@@ -632,6 +641,14 @@ fn load_structure(workdir: &Path) -> Option<StructureEdits> {
         if entry.get("part").and_then(|v| v.as_str()) != Some("document") {
             return None;
         }
+        let format_policy = entry
+            .get("format_policy")
+            .and_then(|value| value.as_str())
+            .map(|value| match value {
+                "none" => FormatPolicy::None,
+                _ => FormatPolicy::SafeInherit,
+            })
+            .unwrap_or_default();
         structure.new_paragraphs.push(NewParagraph {
             inherit: entry.get("inherit")?.as_str()?.to_string(),
             body: entry.get("body")?.as_str()?.to_string(),
@@ -639,6 +656,7 @@ fn load_structure(workdir: &Path) -> Option<StructureEdits> {
                 .get("insert_before")
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
+            format_policy,
         });
     }
     for entry in value.get("deleted_paragraphs")?.as_array()? {
@@ -704,6 +722,154 @@ fn first_run_rpr(paragraph: &[u8], nodes: &[LightNode], root: usize) -> Option<S
     walk(paragraph, nodes, root)
 }
 
+/// The `w:pPr` children a synthesised paragraph may inherit (mirror of Core).
+const SAFE_PPR_CHILDREN: [&str; 27] = [
+    "pStyle",
+    "keepNext",
+    "keepLines",
+    "pageBreakBefore",
+    "widowControl",
+    "numPr",
+    "suppressLineNumbers",
+    "shd",
+    "tabs",
+    "suppressAutoHyphens",
+    "kinsoku",
+    "wordWrap",
+    "overflowPunct",
+    "topLinePunct",
+    "autoSpaceDE",
+    "autoSpaceDN",
+    "bidi",
+    "adjustRightInd",
+    "snapToGrid",
+    "spacing",
+    "ind",
+    "contextualSpacing",
+    "mirrorIndents",
+    "jc",
+    "textAlignment",
+    "outlineLvl",
+    "rPr",
+];
+
+const REFUSED_PPR_CHILDREN: [&str; 5] = ["sectPr", "pPrChange", "rPrChange", "divId", "cnfStyle"];
+
+const SAFE_RPR_CHILDREN: [&str; 36] = [
+    "rStyle",
+    "rFonts",
+    "b",
+    "bCs",
+    "i",
+    "iCs",
+    "caps",
+    "smallCaps",
+    "strike",
+    "dstrike",
+    "outline",
+    "shadow",
+    "emboss",
+    "imprint",
+    "noProof",
+    "snapToGrid",
+    "vanish",
+    "webHidden",
+    "color",
+    "spacing",
+    "w",
+    "kern",
+    "position",
+    "sz",
+    "szCs",
+    "highlight",
+    "u",
+    "effect",
+    "bdr",
+    "shd",
+    "fitText",
+    "vertAlign",
+    "rtl",
+    "cs",
+    "em",
+    "lang",
+];
+
+const REFUSED_RPR_CHILDREN: [&str; 7] = [
+    "rPrChange",
+    "ins",
+    "del",
+    "moveFrom",
+    "moveTo",
+    "eastAsianLayout",
+    "specVanish",
+];
+
+pub fn safe_property_block(
+    xml: &[u8],
+    nodes: &[LightNode],
+    node: &LightNode,
+    allow: &[&str],
+    refuse: &[&str],
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    let mut out = xml[node.open_start..node.open_end].to_vec();
+    for &child in &node.children {
+        let child_node = &nodes[child];
+        let name = child_node.name.as_str();
+        if refuse.contains(&name) {
+            continue;
+        }
+        if name == "rPr" {
+            let inner_xml = &xml[child_node.open_start..child_node.end];
+            let inner_nodes = build_light_tree(&scan_tags(inner_xml))?;
+            if let Some(inner_root) = inner_nodes.first() {
+                let filtered = safe_property_block(
+                    inner_xml,
+                    &inner_nodes,
+                    inner_root,
+                    &SAFE_RPR_CHILDREN,
+                    &REFUSED_RPR_CHILDREN,
+                    what,
+                )?;
+                out.extend_from_slice(&filtered);
+            }
+            continue;
+        }
+        if name == "numPr" {
+            let mut inner = xml[child_node.open_start..child_node.open_end].to_vec();
+            for &grandchild in &child_node.children {
+                let g = &nodes[grandchild];
+                match g.name.as_str() {
+                    "ilvl" | "numId" => inner.extend_from_slice(&xml[g.open_start..g.end]),
+                    "ins" | "del" | "moveFrom" | "moveTo" | "numPrChange" => {}
+                    other => {
+                        return Err(format!(
+                            "invalid-structure: {what} carries `numPr/{other}`, which this build does not know how \
+                             to inherit safely; nothing was written"
+                        ))
+                    }
+                }
+            }
+            if child_node.end != child_node.open_end {
+                inner.extend_from_slice(&xml[child_node.close_start..child_node.end]);
+            }
+            out.extend_from_slice(&inner);
+            continue;
+        }
+        if !allow.contains(&name) {
+            return Err(format!(
+                "invalid-structure: {what} carries `{name}`, which this build does not know how to inherit safely; \
+                 nothing was written"
+            ));
+        }
+        out.extend_from_slice(&xml[child_node.open_start..child_node.end]);
+    }
+    if node.end != node.open_end {
+        out.extend_from_slice(&xml[node.close_start..node.end]);
+    }
+    Ok(out)
+}
+
 /// Render one synthesised `w:p` from the inherit paragraph (independent port
 /// of the writer: opening tag with ephemeral attributes stripped, `pPr`
 /// verbatim, one run carrying the inherited run properties).
@@ -728,18 +894,49 @@ fn render_new_paragraph(
         // `<w:p .../>` cannot be reopened: drop the `/`.
         opening.pop();
     }
-    let ppr = nodes[root]
-        .children
-        .iter()
-        .find(|&&child| nodes[child].name == "pPr")
-        .map(|&child| &inherit[nodes[child].open_start..nodes[child].end])
-        .unwrap_or_default();
-    let rpr = first_run_rpr(inherit, &nodes, root).unwrap_or_default();
+    let (ppr, rpr) = if paragraph.format_policy == FormatPolicy::None {
+        (Vec::new(), Vec::new())
+    } else {
+        let what = format!("paragraph {}'s properties", paragraph.inherit);
+        let ppr = match nodes[root]
+            .children
+            .iter()
+            .find(|&&child| nodes[child].name == "pPr")
+        {
+            Some(&child) => safe_property_block(
+                inherit,
+                &nodes,
+                &nodes[child],
+                &SAFE_PPR_CHILDREN,
+                &REFUSED_PPR_CHILDREN,
+                &what,
+            )?,
+            None => Vec::new(),
+        };
+        let rpr_raw = first_run_rpr(inherit, &nodes, root).unwrap_or_default();
+        let rpr = if rpr_raw.is_empty() {
+            Vec::new()
+        } else {
+            let rnodes = build_light_tree(&scan_tags(rpr_raw.as_bytes()))?;
+            match rnodes.first() {
+                Some(node) => safe_property_block(
+                    rpr_raw.as_bytes(),
+                    &rnodes,
+                    node,
+                    &SAFE_RPR_CHILDREN,
+                    &REFUSED_RPR_CHILDREN,
+                    &what,
+                )?,
+                None => Vec::new(),
+            }
+        };
+        (ppr, rpr)
+    };
     let mut out = strip_ephemeral_p_attrs(&opening);
-    out.extend_from_slice(ppr);
+    out.extend_from_slice(&ppr);
     if !paragraph.body.is_empty() {
         out.extend_from_slice(b"<w:r>");
-        out.extend_from_slice(rpr.as_bytes());
+        out.extend_from_slice(&rpr);
         let space = if needs_xml_space(&paragraph.body) {
             " xml:space=\"preserve\""
         } else {
@@ -1668,7 +1865,7 @@ fn locate_leaf(
 }
 
 /// Minimal element tree over a tag list (independent of Core).
-struct LightNode {
+pub struct LightNode {
     name: String,
     open_start: usize,
     open_end: usize,
@@ -2380,5 +2577,82 @@ fn decode_entity(entity: &str) -> Option<char> {
             let code = digits.strip_suffix(';')?;
             char::from_u32(code.parse().ok()?)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_synthesis_filters_refused_properties() {
+        let xml = b"<w:pPr><w:sectPr/><w:pPrChange w:id=\"1\"/><w:jc w:val=\"center\"/><w:spacing w:after=\"120\"/></w:pPr>";
+        let nodes = build_light_tree(&scan_tags(xml)).unwrap();
+        let root = &nodes[0];
+        let out = safe_property_block(
+            xml,
+            &nodes,
+            root,
+            &SAFE_PPR_CHILDREN,
+            &REFUSED_PPR_CHILDREN,
+            "p",
+        )
+        .unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains("sectPr"));
+        assert!(!s.contains("pPrChange"));
+        assert!(s.contains("jc"));
+        assert!(s.contains("spacing"));
+
+        let rxml = b"<w:rPr><w:rPrChange w:id=\"2\"/><w:b/></w:rPr>";
+        let rnodes = build_light_tree(&scan_tags(rxml)).unwrap();
+        let rout = safe_property_block(
+            rxml,
+            &rnodes,
+            &rnodes[0],
+            &SAFE_RPR_CHILDREN,
+            &REFUSED_RPR_CHILDREN,
+            "r",
+        )
+        .unwrap();
+        let rs = String::from_utf8_lossy(&rout);
+        assert!(!rs.contains("rPrChange"));
+        assert!(rs.contains("<w:b"));
+    }
+
+    #[test]
+    fn format_policy_none_inherits_nothing() {
+        let part = b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:pPr><w:jc w:val=\"center\"/><w:spacing w:after=\"120\"/><w:sectPr/><w:pPrChange w:id=\"1\"/></w:pPr><w:r><w:rPr><w:rPrChange w:id=\"2\"/><w:b/></w:rPr><w:t>x</w:t></w:r></w:p></w:body></w:document>";
+        let located = locate_paragraphs(part, "document").unwrap();
+        let paragraph = NewParagraph {
+            inherit: located[0].0.clone(),
+            body: "hello".to_string(),
+            insert_before: None,
+            format_policy: FormatPolicy::None,
+        };
+        let out = render_new_paragraph(part, &located, &paragraph).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains("jc"));
+        assert!(!s.contains("spacing"));
+        assert!(!s.contains("sectPr"));
+        assert!(!s.contains("pPrChange"));
+        assert!(!s.contains("rPrChange"));
+        assert!(!s.contains("<w:b"));
+    }
+    #[test]
+    fn safe_synthesis_unknown_child_errors() {
+        let xml = b"<w:pPr><w:foo/></w:pPr>";
+        let nodes = build_light_tree(&scan_tags(xml)).unwrap();
+        let root = &nodes[0];
+        let err = safe_property_block(
+            xml,
+            &nodes,
+            root,
+            &SAFE_PPR_CHILDREN,
+            &REFUSED_PPR_CHILDREN,
+            "p",
+        )
+        .unwrap_err();
+        assert!(err.contains("foo"));
     }
 }

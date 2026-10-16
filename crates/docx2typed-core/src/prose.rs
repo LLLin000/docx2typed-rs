@@ -3177,6 +3177,22 @@ const EPHEMERAL_P_ATTRS: [&str; 7] = [
 
 /// One synthesised paragraph: rendered from the `inherit` baseline
 /// paragraph and spliced before `insert_before` (None = append).
+/// How much of the inherit paragraph's formatting a new paragraph takes.
+///
+/// `safe_inherit` is the default and the only one an agent normally needs: the
+/// allowlist in `safe_property_block` copies the formatting and leaves every
+/// revision record, section break and unknown property behind. `none` exists for
+/// the case where even that is unwanted — the paragraph is written with no
+/// inherited properties at all, which is what Word does for a paragraph typed
+/// into an empty document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatPolicy {
+    #[default]
+    SafeInherit,
+    None,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NewParagraph {
     /// Part key ("document"); container parts are out of scope.
@@ -3192,6 +3208,10 @@ pub struct NewParagraph {
     /// Baseline id the new paragraph is spliced before; None = append.
     #[serde(default)]
     pub insert_before: Option<String>,
+    /// How much formatting to take from `inherit`. Defaults to `safe_inherit`,
+    /// so a sidecar written before this field existed keeps its old behaviour.
+    #[serde(default)]
+    pub format_policy: FormatPolicy,
 }
 
 /// One removed baseline paragraph: not rendered, so its `w:p` disappears.
@@ -3357,17 +3377,14 @@ pub fn validate_structure(template: &Path, edits: &StructureEdits) -> Result<(),
         if !paragraph.inherit.starts_with('P') {
             return Err(container_paragraph_error(&paragraph.inherit));
         }
-        if let Some(reason) = structure_reason(&part, &inventory, &paragraph.inherit, start, end) {
-            return Err(CoreError::Domain(format!(
-                "invalid-structure: new paragraph cannot inherit protected structure: {} \
-                 (inherits {}: {reason}). A new paragraph is synthesised from its anchor's \
-                 opening and pPr, so the anchor has to be plain prose. Anchor on a neighbouring \
-                 paragraph instead — one without tracked revisions, section properties, \
-                 bookmarks or an opaque interior — or replace an existing paragraph rather than \
-                 adding one. Nothing was written.",
-                paragraph.paragraph_id, paragraph.inherit
-            )));
-        }
+        // The anchor's own structure is no longer a reason to refuse: Safe
+        // Paragraph Synthesis copies only the properties that may be copied
+        // (`safe_property_block`), so a field, a bookmark or the section break
+        // stays where it is and never reaches the new paragraph. What is still
+        // checked is that the anchor EXISTS and is a body paragraph — above —
+        // and the renderer refuses any property it does not recognise rather
+        // than dropping it.
+        let _ = (start, end);
         if let Some(anchor) = &paragraph.insert_before {
             if range_of(anchor).is_none() {
                 return Err(CoreError::Domain(format!(
@@ -3432,6 +3449,184 @@ fn body_append_offset(xml: &[u8]) -> Result<usize, CoreError> {
 /// Render one synthesised `w:p`: the inherit paragraph's opening tag with
 /// ephemeral attributes stripped, its `pPr` verbatim, and one run carrying
 /// the inherit paragraph's run properties (`typed_docx.py`
+/// The `w:pPr` children a synthesised paragraph may inherit.
+///
+/// An ALLOWLIST, not a blacklist. A child this build does not recognise is
+/// REFUSED rather than dropped: silently losing a property produces a paragraph
+/// that looks right and is not, and the caller never learns which one it lost.
+/// Measured on a real patent: `insert_after` refused fourteen times because the
+/// anchor carried tracked revisions, while the revisions themselves were never
+/// the problem — only the paragraph mark's own revision was.
+const SAFE_PPR_CHILDREN: [&str; 27] = [
+    "pStyle",
+    "keepNext",
+    "keepLines",
+    "pageBreakBefore",
+    "widowControl",
+    "numPr",
+    "suppressLineNumbers",
+    "shd",
+    "tabs",
+    "suppressAutoHyphens",
+    "kinsoku",
+    "wordWrap",
+    "overflowPunct",
+    "topLinePunct",
+    "autoSpaceDE",
+    "autoSpaceDN",
+    "bidi",
+    "adjustRightInd",
+    "snapToGrid",
+    "spacing",
+    "ind",
+    "contextualSpacing",
+    "mirrorIndents",
+    "jc",
+    "textAlignment",
+    "outlineLvl",
+    "rPr",
+];
+
+/// `w:pPr` children that are never inherited, each for its own reason.
+///
+/// `sectPr` would give the new paragraph a SECOND section break — the layout of
+/// the document changes. `pPrChange` / `rPrChange` are revision records: copying
+/// one makes the new paragraph claim a change a human made to a DIFFERENT
+/// paragraph. `framePr` positions a text frame, `divId` / `cnfStyle` belong to
+/// HTML-flavoured producers — none of them is formatting a new paragraph should
+/// silently wear.
+const REFUSED_PPR_CHILDREN: [&str; 5] = ["sectPr", "pPrChange", "rPrChange", "divId", "cnfStyle"];
+
+/// The `w:rPr` children a synthesised paragraph or run may inherit.
+const SAFE_RPR_CHILDREN: [&str; 36] = [
+    "rStyle",
+    "rFonts",
+    "b",
+    "bCs",
+    "i",
+    "iCs",
+    "caps",
+    "smallCaps",
+    "strike",
+    "dstrike",
+    "outline",
+    "shadow",
+    "emboss",
+    "imprint",
+    "noProof",
+    "snapToGrid",
+    "vanish",
+    "webHidden",
+    "color",
+    "spacing",
+    "w",
+    "kern",
+    "position",
+    "sz",
+    "szCs",
+    "highlight",
+    "u",
+    "effect",
+    "bdr",
+    "shd",
+    "fitText",
+    "vertAlign",
+    "rtl",
+    "cs",
+    "em",
+    "lang",
+];
+
+/// `w:rPr` children that are never inherited: the same revision records, plus
+/// the revision wrappers that turn a run into a tracked change.
+const REFUSED_RPR_CHILDREN: [&str; 7] = [
+    "rPrChange",
+    "ins",
+    "del",
+    "moveFrom",
+    "moveTo",
+    "eastAsianLayout",
+    "specVanish",
+];
+
+/// One property block (`w:pPr` or `w:rPr`) taken through the allowlist.
+///
+/// `xml` is the whole part; `node` indexes into `nodes`. The open tag is kept
+/// verbatim, refused children are dropped on purpose, and an unknown child is a
+/// refusal — never a silent omission.
+fn safe_property_block(
+    xml: &[u8],
+    nodes: &[ElementNode],
+    node: &ElementNode,
+    allow: &[&str],
+    refuse: &[&str],
+    what: &str,
+) -> Result<Vec<u8>, CoreError> {
+    let mut out = xml[node.open_start..node.open_end].to_vec();
+    for &child in &node.children {
+        let child_node = &nodes[child];
+        let name = child_node.name.as_str();
+        if refuse.contains(&name) {
+            continue;
+        }
+        if name == "rPr" {
+            // The paragraph mark's own run properties. Formatting belongs to the
+            // new paragraph; a revision wrapper on that mark does not — copying
+            // one makes the new paragraph claim a change made to another one.
+            let inner_nodes = build_tree(&scan_tags(&xml[child_node.open_start..child_node.end]))?;
+            if let Some(inner_root) = inner_nodes.first() {
+                let filtered = safe_property_block(
+                    &xml[child_node.open_start..child_node.end],
+                    &inner_nodes,
+                    inner_root,
+                    allow,
+                    refuse,
+                    what,
+                )?;
+                out.extend_from_slice(&filtered);
+            }
+            continue;
+        }
+        if name == "numPr" {
+            // A numbering reference is formatting, but it points at a
+            // definition elsewhere: keep the reference, drop any revision
+            // wrapper inside it, and refuse the rest rather than guess.
+            let mut inner = xml[child_node.open_start..child_node.open_end].to_vec();
+            for &grandchild in &child_node.children {
+                let g = &nodes[grandchild];
+                match g.name.as_str() {
+                    "ilvl" | "numId" => inner.extend_from_slice(&xml[g.open_start..g.end]),
+                    "ins" | "del" | "moveFrom" | "moveTo" | "numPrChange" => {}
+                    other => {
+                        return Err(CoreError::Domain(format!(
+                            "invalid-structure: {what} carries `numPr/{other}`, which this build \
+                             does not know how to inherit safely; nothing was written"
+                        )))
+                    }
+                }
+            }
+            if child_node.self_closing {
+                continue;
+            }
+            inner.extend_from_slice(&xml[child_node.close_start..child_node.end]);
+            out.extend_from_slice(&inner);
+            continue;
+        }
+        if !allow.contains(&name) {
+            return Err(CoreError::Domain(format!(
+                "invalid-structure: {what} carries `{name}`, which this build does not know how \
+                 to inherit safely; nothing was written. Inherit from a paragraph whose \
+                 properties are plain, or report this as a gap rather than working around it"
+            )));
+        }
+        out.extend_from_slice(&xml[child_node.open_start..child_node.end]);
+    }
+    if !node.self_closing {
+        out.extend_from_slice(&xml[node.close_start..node.end]);
+    }
+    Ok(out)
+}
+
 /// `_render_paragraph` + `_new_paragraph_opening`).
 fn render_new_paragraph(
     part: &[u8],
@@ -3461,23 +3656,58 @@ fn render_new_paragraph(
         // `<w:p .../>` cannot be reopened: drop the `/` to keep the tag open.
         opening.pop();
     }
-    let ppr = root
+    // Safe Paragraph Synthesis: the anchor supplies POSITION and FORMAT, and
+    // only the format that may be copied is copied. A paragraph carrying tracked
+    // revisions is a perfectly good anchor — its revisions are simply not part
+    // of the format — which is why the decision here is per-property rather than
+    // per-paragraph.
+    let what = format!("paragraph {}'s properties", paragraph.inherit);
+    let inherit_properties = paragraph.format_policy == FormatPolicy::SafeInherit;
+    let ppr = match root
         .children
         .iter()
         .find(|&&child| nodes[child].name == "pPr")
-        .map(|&child| &inherit[nodes[child].open_start..nodes[child].end])
-        .unwrap_or_default();
-    let rpr = inventory
+        .filter(|_| inherit_properties)
+    {
+        Some(&child) => safe_property_block(
+            inherit,
+            &nodes,
+            &nodes[child],
+            &SAFE_PPR_CHILDREN,
+            &REFUSED_PPR_CHILDREN,
+            &what,
+        )?,
+        None => Vec::new(),
+    };
+    let rpr = match inventory
         .leaves
         .iter()
         .find(|leaf| leaf.paragraph_id == paragraph.inherit && leaf.leaf_index == 0)
-        .map(|leaf| leaf.rpr.as_str())
-        .unwrap_or("");
+        .map(|leaf| leaf.rpr.clone())
+        .filter(|_| inherit_properties)
+        .filter(|rpr| !rpr.is_empty())
+    {
+        Some(rpr) => {
+            let nodes = build_tree(&scan_tags(rpr.as_bytes()))?;
+            match nodes.first() {
+                Some(node) => safe_property_block(
+                    rpr.as_bytes(),
+                    &nodes,
+                    node,
+                    &SAFE_RPR_CHILDREN,
+                    &REFUSED_RPR_CHILDREN,
+                    &what,
+                )?,
+                None => Vec::new(),
+            }
+        }
+        None => Vec::new(),
+    };
     let mut out = strip_ephemeral_p_attrs(&opening);
-    out.extend_from_slice(ppr);
+    out.extend_from_slice(&ppr);
     if !paragraph.body.is_empty() {
         out.extend_from_slice(b"<w:r>");
-        out.extend_from_slice(rpr.as_bytes());
+        out.extend_from_slice(&rpr);
         let space = if needs_xml_space(&paragraph.body) {
             " xml:space=\"preserve\""
         } else {
@@ -4710,6 +4940,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let edits = StructureEdits {
             new_paragraphs: vec![NewParagraph {
+                format_policy: FormatPolicy::default(),
                 part: "document".to_string(),
                 paragraph_id: "N1".to_string(),
                 inherit: "P0".to_string(),
@@ -4734,6 +4965,7 @@ mod tests {
         let template = fixture("plain.docx");
         let edits = StructureEdits {
             new_paragraphs: vec![NewParagraph {
+                format_policy: FormatPolicy::default(),
                 part: "document".to_string(),
                 paragraph_id: "N1".to_string(),
                 inherit: "P0".to_string(),

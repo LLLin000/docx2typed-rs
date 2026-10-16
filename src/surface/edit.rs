@@ -38,8 +38,14 @@ use std::path::Path;
 /// argument, and an unknown kind is refused naming the allowed ones.
 pub(crate) enum Edit {
     Replace(EditRequest),
-    InsertAfter { handle: String, text: String },
-    Delete { handle: String },
+    InsertAfter {
+        handle: String,
+        text: String,
+        format: docx2typed_core::prose::FormatPolicy,
+    },
+    Delete {
+        handle: String,
+    },
 }
 
 impl Edit {
@@ -128,9 +134,27 @@ fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<
                         build_commit,
                     ));
                 };
+                let format = match edit.get("format_policy").and_then(Value::as_str) {
+                    None | Some("safe_inherit") => {
+                        docx2typed_core::prose::FormatPolicy::SafeInherit
+                    }
+                    Some("none") => docx2typed_core::prose::FormatPolicy::None,
+                    Some(other) => {
+                        return Err(session.failure(
+                            "document_edit",
+                            "invalid-arguments",
+                            &format!(
+                                "edit #{number} has format_policy `{other}`; the allowed values \
+                                 are safe_inherit (the default) and none"
+                            ),
+                            build_commit,
+                        ))
+                    }
+                };
                 parsed.push(Edit::InsertAfter {
                     handle: handle.to_string(),
                     text: text.to_string(),
+                    format,
                 });
             }
             "delete" => parsed.push(Edit::Delete {
@@ -172,7 +196,11 @@ pub(crate) fn apply_and_sync(
     for edit in edits {
         match edit {
             Edit::Replace(request) => requests.push(request.clone()),
-            Edit::InsertAfter { handle, text } => {
+            Edit::InsertAfter {
+                handle,
+                text,
+                format,
+            } => {
                 let anchor = paragraph_of(target, handle)?;
                 // `anchor` is the POSITION. Naming it as the inherit source too
                 // made the engine refuse whenever that paragraph carried
@@ -180,7 +208,7 @@ pub(crate) fn apply_and_sync(
                 // cannot act on, since the surface hands out no handle for a
                 // paragraph the search did not match. Passing `None` lets the
                 // engine choose a source that works and keep the position.
-                let inserted = draft::insert_paragraph(target, &anchor, text, None)
+                let inserted = draft::insert_paragraph(target, &anchor, text, None, *format)
                     .map_err(|error| MutationError::new(error.code, error.detail))?;
                 structural
                     .push(json!({ "kind": "insert_after", "anchor": anchor, "result": inserted }));
