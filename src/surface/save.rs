@@ -14,6 +14,7 @@
 use crate::mcp::McpSession;
 use docx2typed_protocol::new_operation_id;
 use serde_json::{json, Value};
+use std::path::Path;
 
 /// The files a save produces beside the document: the package itself and the
 /// evidence, verification and ledger sidecars the build writes next to it.
@@ -32,25 +33,154 @@ fn discard_build(path: &str) {
     }
 }
 
-/// Move a verified build to the path the caller asked for, sidecars included.
+/// The bytes one already-published sidecar claims the document has, when it
+/// claims anything.
 ///
-/// The rename of the package is the moment the save becomes visible; the
-/// sidecars follow it, because a document published without the evidence that
-/// describes it is a different artifact from the one that was verified.
+/// The build's evidence and the verification's evidence both record
+/// `payload.outputs.docx.sha256`, so a document and its sidecars can be checked
+/// against each other instead of trusted as a group. The operation ledger
+/// records operations rather than an artifact hash, and answers `None`.
+pub(crate) fn recorded_docx_sha256(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("payload")?
+        .get("outputs")?
+        .get("docx")?
+        .get("sha256")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Move a verified build to the path the caller asked for.
+///
+/// **Sidecars first, the document last.** The document is the artifact; the
+/// sidecars are evidence about it, and the rename that puts the document in place
+/// is the moment the save becomes visible. An interruption before that rename
+/// leaves the version that was already there — never a new document with evidence
+/// from some other build. The reverse order (document first, then three renames)
+/// can be interrupted with the new document in place and one or more old sidecars
+/// beside it, which is a mixed version that reads like one release.
+///
+/// A sidecar that cannot be renamed stops the save before the document is
+/// touched, and the caller is told which one.
 fn publish_build(staging: &str, output: &str) -> Result<(), String> {
-    std::fs::rename(staging, output).map_err(|error| {
-        format!("{output} could not be replaced with the verified build: {error}")
-    })?;
     for suffix in SIDECARS {
         let from = format!("{staging}{suffix}");
-        if !std::path::Path::new(&from).is_file() {
+        if !Path::new(&from).is_file() {
             continue;
         }
         std::fs::rename(&from, format!("{output}{suffix}")).map_err(|error| {
-            format!("{output} was written, but its {suffix} could not be: {error}")
+            format!(
+                "the document was NOT published: its {suffix} could not be put in place \
+                 ({error}), so whatever {output} held is untouched"
+            )
         })?;
     }
-    Ok(())
+    std::fs::rename(staging, output)
+        .map_err(|error| format!("{output} could not be replaced with the verified build: {error}"))
+}
+
+/// Point the published ledger's records at the file they produced.
+///
+/// The build journals the operation it ran, and it ran it at the staging path —
+/// which, once the publication renames the artifact, no longer exists. The
+/// publication is this step's work, so the path it corrects is this step's
+/// business; the staged name is kept beside it as `staged_at`, because that is
+/// where the build's own evidence says it wrote.
+fn repoint_ledger(output: &str, staging: &str) {
+    let path = format!("{output}.operation-ledger.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut ledger) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(records) = ledger.get_mut("records").and_then(Value::as_object_mut) {
+        for record in records.values_mut() {
+            let Some(data) = record
+                .get_mut("envelope")
+                .and_then(|envelope| envelope.get_mut("data"))
+            else {
+                continue;
+            };
+            let at_staging = data
+                .get("output")
+                .and_then(|output| output.get("value"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == staging);
+            if at_staging {
+                data["output"] = json!({ "kind": "absolute", "value": output });
+                data["staged_at"] = json!(staging);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let _ = std::fs::write(&path, format!("{ledger}\n"));
+    }
+}
+
+/// The document and the evidence beside it have to be one version.
+///
+/// Reported, not assumed: every sidecar that records the artifact's bytes is
+/// compared with the bytes that are now on disk, and the names that disagree are
+/// returned. `document_open` reports the same thing about a document it is asked
+/// to open, so a mixed set is never mistaken for a committed one — which is what
+/// an interrupted publication would otherwise leave behind.
+pub(crate) fn sidecars_disagreeing_with(output: &str, published_sha256: &str) -> Vec<String> {
+    let mut disagree = Vec::new();
+    for suffix in SIDECARS {
+        let path = Path::new(&format!("{output}{suffix}")).to_path_buf();
+        if let Some(recorded) = recorded_docx_sha256(&path) {
+            if recorded != published_sha256 {
+                disagree.push(format!("{suffix} records {recorded}"));
+            }
+        }
+    }
+    disagree
+}
+
+/// What the evidence beside a document says about the bytes it has.
+///
+/// Reported by `document_open`, because that is where someone hands over a file
+/// and expects the thing on disk to be one version. `absent` is the ordinary
+/// answer for a document this engine has never written; `mixed` means the
+/// evidence describes some *other* build of it, which an interrupted publication
+/// leaves behind and which nothing else can detect — the sidecars are valid JSON,
+/// about a document that is no longer there.
+pub(crate) fn sidecar_set_state(document: &Path) -> Value {
+    let output = document.to_string_lossy().to_string();
+    let recorded: Vec<(String, String)> = SIDECARS
+        .iter()
+        .filter_map(|suffix| {
+            recorded_docx_sha256(Path::new(&format!("{output}{suffix}")))
+                .map(|sha256| (suffix.to_string(), sha256))
+        })
+        .collect();
+    if recorded.is_empty() {
+        // Nothing beside this document claims to describe it.
+        return json!({ "state": "absent" });
+    }
+    let published = docx2typed_protocol::file_sha256(document).unwrap_or_default();
+    let disagree: Vec<String> = recorded
+        .iter()
+        .filter(|(_, sha256)| *sha256 != published)
+        .map(|(suffix, sha256)| format!("{suffix} records {sha256}"))
+        .collect();
+    if disagree.is_empty() {
+        json!({ "state": "consistent", "docx_sha256": published })
+    } else {
+        json!({
+            "state": "mixed",
+            "why": "the evidence beside this document describes different bytes than the document \
+                    has, so this is not one release — most likely a publication that was \
+                    interrupted between its sidecars and its document",
+            "disagree": disagree,
+            "docx_sha256": published,
+        })
+    }
 }
 
 /// `document_save` — build the output and verify it before saying so.
@@ -160,12 +290,45 @@ pub fn document_save(session: &mut McpSession, args: &Value, build_commit: &str)
             build_commit,
         );
     }
+    repoint_ledger(output, &staging);
+
+    // And the set has to be one version. Every sidecar that records the
+    // artifact's bytes is compared with what was just published; a sidecar from
+    // another build is reported rather than left beside the document, because a
+    // reader cannot tell the difference by looking.
+    let published = match docx2typed_protocol::file_sha256(Path::new(output)) {
+        Ok(sha256) => sha256,
+        Err(error) => {
+            return session.failure(
+                "document_save",
+                "output-unreadable",
+                &format!("{output} was published but could not be read back: {error}"),
+                build_commit,
+            )
+        }
+    };
+    let disagree = sidecars_disagreeing_with(output, &published);
+    if !disagree.is_empty() {
+        return session.failure(
+            "document_save",
+            "output-set-inconsistent",
+            &format!(
+                "{output} holds the package that was just verified, but the evidence beside it \
+                 belongs to another build ([{}]) — that is not one release. Re-run \
+                 document_save to regenerate the sidecars, and do not read that set as a \
+                 committed version in the meantime",
+                disagree.join(", ")
+            ),
+            build_commit,
+        );
+    }
 
     session.success(
         "document_save",
         json!({
             "output": output,
             "operation_id": operation_id,
+            "docx_sha256": published,
             "build": envelope.get("data").cloned().unwrap_or(Value::Null),
             "verified": verify_envelope.get("data").cloned().unwrap_or(Value::Null),
         }),
@@ -221,6 +384,137 @@ mod tests {
             b"evidence"
         );
         assert!(!staging.exists(), "the staging file is still there");
+    }
+
+    /// A sidecar that cannot be put in place stops the save BEFORE the document is
+    /// touched: the version on disk survives a publication that cannot finish,
+    /// which is the whole point of publishing the evidence first.
+    #[test]
+    fn a_publish_that_cannot_place_a_sidecar_leaves_the_document_alone() {
+        let dir = scratch("blocked-sidecar");
+        let staging = dir.0.join("out.docx.building-z");
+        let output = dir.0.join("out.docx");
+        std::fs::write(&staging, b"the new package").expect("staging");
+        std::fs::write(
+            format!("{}.evidence.json", staging.display()),
+            b"new evidence",
+        )
+        .expect("staged evidence");
+        std::fs::write(&output, b"the version that must survive").expect("published version");
+        let blocked = format!("{}.evidence.json", output.display());
+        std::fs::write(&blocked, b"evidence of the surviving version").expect("destination");
+        // Hold the destination open WITHOUT delete sharing: the rename onto it
+        // then fails, which is how a file open in Word behaves. `File::open` is
+        // not enough — Rust asks for FILE_SHARE_DELETE by default, so a rename
+        // over a handle it holds still succeeds.
+        #[cfg(windows)]
+        let guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&blocked)
+                .expect("open without delete sharing")
+        };
+        #[cfg(not(windows))]
+        let guard = std::fs::File::open(&blocked).expect("open");
+
+        let result = publish_build(
+            staging.to_str().expect("path"),
+            output.to_str().expect("path"),
+        );
+
+        drop(guard);
+        if cfg!(windows) {
+            assert!(
+                result.is_err(),
+                "a blocked sidecar must stop the publication: {result:?}"
+            );
+            assert_eq!(
+                std::fs::read(&output).expect("untouched"),
+                b"the version that must survive",
+                "the document was replaced by a publication that could not finish"
+            );
+        }
+    }
+
+    /// A sidecar left beside a document by some other build is reported, not
+    /// trusted: that is what an interrupted publication looks like from outside.
+    #[test]
+    fn evidence_from_another_build_is_reported_as_a_mixed_set() {
+        let dir = scratch("mixed-set");
+        let document = dir.0.join("doc.docx");
+        std::fs::write(&document, b"the document").expect("document");
+        let evidence = format!("{}.evidence.json", document.to_str().expect("path"));
+        std::fs::write(
+            &evidence,
+            serde_json::to_vec(&json!({
+                "schema": "docx2typed-run-evidence-1",
+                "payload": { "outputs": { "docx": { "sha256": "0000" } } },
+            }))
+            .expect("json"),
+        )
+        .expect("evidence");
+        assert_eq!(sidecar_set_state(&document)["state"], "mixed");
+
+        // And the same set, agreeing, is reported as one version.
+        let real = docx2typed_protocol::file_sha256(&document).expect("hash");
+        std::fs::write(
+            format!("{}.verify.evidence.json", document.to_str().expect("path")),
+            serde_json::to_vec(&json!({
+                "schema": "docx2typed-run-evidence-1",
+                "payload": { "outputs": { "docx": { "sha256": real } } },
+            }))
+            .expect("json"),
+        )
+        .expect("verify evidence");
+        std::fs::remove_file(&evidence).expect("remove");
+        assert_eq!(sidecar_set_state(&document)["state"], "consistent");
+
+        // A document nobody wrote evidence for says so rather than guessing.
+        let bare = dir.0.join("bare.docx");
+        std::fs::write(&bare, b"a document from elsewhere").expect("bare");
+        assert_eq!(sidecar_set_state(&bare)["state"], "absent");
+    }
+
+    /// A bounded tail of the publication path: the ledger the build wrote names
+    /// the staging path, and the publication is what knows the artifact's real
+    /// name, so it is the step that corrects it.
+    #[test]
+    fn the_published_ledger_points_at_the_published_file() {
+        let dir = scratch("ledger");
+        let staging = dir.0.join("out.docx.building-l");
+        let output = dir.0.join("out.docx");
+        std::fs::write(&output, b"package").expect("published");
+        std::fs::write(
+            format!("{}.operation-ledger.json", output.display()),
+            serde_json::to_vec(&json!({
+                "schema": "docx2typed-operation-ledger-1",
+                "records": { "op-1": { "envelope": { "data": {
+                    "operation_id": "op-1",
+                    "output": { "kind": "absolute", "value": staging.to_str().expect("path") },
+                } } } },
+            }))
+            .expect("json"),
+        )
+        .expect("ledger");
+
+        repoint_ledger(
+            output.to_str().expect("path"),
+            staging.to_str().expect("path"),
+        );
+
+        let ledger: Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{}.operation-ledger.json", output.display()))
+                .expect("ledger"),
+        )
+        .expect("json");
+        let data = &ledger["records"]["op-1"]["envelope"]["data"];
+        assert_eq!(data["output"]["value"], output.to_str().expect("path"));
+        assert_eq!(data["staged_at"], staging.to_str().expect("path"));
     }
 
     /// A save that fails must leave nothing at the path the caller named, and

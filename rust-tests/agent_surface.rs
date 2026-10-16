@@ -702,6 +702,51 @@ fn a_save_publishes_only_what_it_verified() {
 }
 
 #[test]
+fn an_opened_document_reports_whether_its_evidence_is_its_own() {
+    let (dir, workdir) = opened("sidecar-set");
+    let target = handle(&workdir, "中文区域内容");
+    let out = dir.join("reported.docx");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": target, "replace_with": "中文区块区域内容" }] }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+
+    // The file, opened by the tool that wrote it: one version, and it says so.
+    let replies = mcp(&[("document_open", json!({ "source": out.to_string_lossy() }))]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(
+        data(&replies[0])["sidecars"]["state"],
+        "consistent",
+        "a document just published does not describe itself as one version: {:?}",
+        data(&replies[0])["sidecars"]
+    );
+
+    // Now the evidence beside it belongs to a different build — which is what an
+    // interrupted publication leaves behind, and which nothing but the hashes can
+    // tell apart. It must be reported, not trusted.
+    let evidence = dir.join("reported.docx.evidence.json");
+    let mut recorded: Value =
+        serde_json::from_str(&std::fs::read_to_string(&evidence).expect("evidence"))
+            .expect("evidence json");
+    recorded["payload"]["outputs"]["docx"]["sha256"] = json!("0000000000000000");
+    std::fs::write(&evidence, serde_json::to_vec(&recorded).expect("json")).expect("write");
+
+    let replies = mcp(&[("document_open", json!({ "source": out.to_string_lossy() }))]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(
+        data(&replies[0])["sidecars"]["state"],
+        "mixed",
+        "evidence from another build was accepted as this document's: {:?}",
+        data(&replies[0])["sidecars"]
+    );
+}
+
+#[test]
 fn find_counts_agree_with_the_verdicts_beside_them() {
     let (_dir, workdir) = opened("counts");
     // Two edits in one leaf first: the second one lands in a paragraph whose

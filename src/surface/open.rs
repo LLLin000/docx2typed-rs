@@ -89,6 +89,11 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
         );
     };
     let source = PathBuf::from(source);
+    let sidecar_report = if !is_workdir(&source) && source.is_file() {
+        Some(crate::surface::save::sidecar_set_state(&source))
+    } else {
+        None
+    };
     let workdir = if is_workdir(&source) {
         source
     } else if source.is_file() {
@@ -157,6 +162,13 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
         .unwrap_or_else(|| json!({}));
     data["workdir"] = json!(workdir.to_string_lossy());
     data["reopened"] = json!(already_open);
+    if let Some(sidecars) = sidecar_report {
+        // The document and the evidence beside it, checked against each other.
+        // `mixed` is not a warning about this file's contents — the document is
+        // whatever it is — it says the evidence may not be read as this
+        // document's provenance.
+        data["sidecars"] = sidecars;
+    }
     // Whether this workdir can be built at all — answered HERE, not only when
     // `document_save` finally refuses. A document carrying committed typed edits
     // with no record in the edit sidecars cannot be rebuilt (the replay would
