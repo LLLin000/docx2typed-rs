@@ -630,6 +630,291 @@ fn a_second_edit_in_a_leaf_the_first_rewrote_merges_into_one_island() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Seeded sequences
+//
+// The deterministic sequence above tests the steps someone thought of. This one
+// generates them, so the *order* is not something a human chose — which is where
+// state bugs live (the composed no-op island was found by the deterministic
+// sequence, and the next one is likelier to need a stranger order still).
+//
+// Triage is part of the harness rather than an afterthought:
+//   * a seed reproduces its whole sequence, so the seed IS the repro;
+//   * on failure the shortest failing prefix is found and written, with the call
+//     log, to `target/sequence-fuzz/`;
+//   * `SEQUENCE_FUZZ_SEED=<seed> cargo test --test agent_surface sequence_fuzz`
+//     replays exactly that seed, and stops with the same message.
+//
+// The operations are generated from what the surface reports — the spans it
+// finds in the current text — so every step is legal by construction: a failure
+// is the engine's, not the generator's.
+// ---------------------------------------------------------------------------
+
+/// xorshift64*: small, deterministic, and dependency-free.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
+
+/// The texts a sequence moves between. Mutually non-containing, so "the file
+/// says the current one and not the others" is a real assertion.
+const TARGETS: [&str; 3] = ["中文区域内容", "甲甲甲", "乙乙乙"];
+
+/// One find, with the failure returned instead of panicking.
+fn find_handle(workdir: &str, query: &str) -> Result<String, String> {
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_find", json!({ "query": query, "limit": 5 })),
+    ]);
+    let found = data(&replies[1]);
+    let entry = found
+        .get("matches")
+        .and_then(Value::as_array)
+        .and_then(|matches| matches.first())
+        .ok_or_else(|| format!("no match for {query:?}: {found}"))?;
+    entry
+        .get("occurrences")
+        .and_then(Value::as_array)
+        .and_then(|occurrences| occurrences.first())
+        .or(Some(entry))
+        .and_then(|entry| entry.get("handle"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("no handle for {query:?}: {entry}"))
+}
+
+/// One sequence, from its seed alone.
+///
+/// The log is written into the caller's buffer as the sequence runs, so it
+/// survives the failure it is meant to explain — a log returned only on success
+/// is a log nobody has when they need it.
+fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), String> {
+    let (dir, workdir) = opened(&format!("fuzz-{seed}"));
+    let out = dir.join("fuzzed.docx");
+    let wd = Path::new(&workdir);
+    let mut rng = Rng::new(seed);
+    let mut model = TARGETS[0].to_string();
+    let mut saved_any = false;
+
+    for step in 1..=steps {
+        match rng.below(5) {
+            // Move the span to a different text: longer, shorter, or back to the
+            // one the document came with. The last of those is the shape that
+            // composes a no-op island.
+            0 | 1 => {
+                let target = TARGETS[rng.below(TARGETS.len() as u64) as usize];
+                if target == model {
+                    log.push(format!("{step}: replace skipped, already {target:?}"));
+                    continue;
+                }
+                let handle = find_handle(&workdir, &model)?;
+                let replies = mcp(&[
+                    ("document_open", json!({ "source": workdir })),
+                    (
+                        "document_edit",
+                        json!({ "edits": [{ "handle": handle, "replace_with": target }] }),
+                    ),
+                ]);
+                if outcome(&replies[1]) != "success" {
+                    return Err(format!(
+                        "{step}: replace {model:?} -> {target:?} failed: {:?}",
+                        replies[1]
+                    ));
+                }
+                log.push(format!("{step}: replace {model:?} -> {target:?}"));
+                model = target.to_string();
+                assert_islands_cover_distinct_leaves(wd);
+            }
+            // A dry run: it must change nothing, and it must report the same
+            // verdict the real call would.
+            2 => {
+                let handle = find_handle(&workdir, &model)?;
+                let before = content_digest(wd);
+                let replies = mcp(&[
+                    ("document_open", json!({ "source": workdir })),
+                    (
+                        "document_edit",
+                        json!({ "dry_run": true, "edits": [
+                            { "kind": "insert_after", "handle": handle, "text": "不写入的段落。" }
+                        ] }),
+                    ),
+                ]);
+                if outcome(&replies[1]) != "success" {
+                    return Err(format!("{step}: dry run failed: {:?}", replies[1]));
+                }
+                if content_digest(wd) != before {
+                    return Err(format!("{step}: a dry run changed the workdir"));
+                }
+                log.push(format!("{step}: dry run"));
+            }
+            // A batch that cannot be applied: it must leave the workdir exactly
+            // as it found it.
+            3 => {
+                let handle = find_handle(&workdir, &model)?;
+                let before = content_digest(wd);
+                let replies = mcp(&[
+                    ("document_open", json!({ "source": workdir })),
+                    (
+                        "document_edit",
+                        json!({ "edits": [
+                            { "handle": handle, "replace_with": "X" },
+                            { "handle": "ref_bogus", "replace_with": "Y" },
+                        ] }),
+                    ),
+                ]);
+                if outcome(&replies[1]) == "success" {
+                    return Err(format!("{step}: a batch with a bogus handle succeeded"));
+                }
+                if content_digest(wd) != before {
+                    return Err(format!("{step}: a refused batch changed the workdir"));
+                }
+                log.push(format!("{step}: refused batch"));
+            }
+            // A save: the file has to say what the model says, and nothing else.
+            _ => {
+                let replies = mcp(&[
+                    ("document_open", json!({ "source": workdir })),
+                    ("document_save", json!({ "output": out.to_string_lossy() })),
+                ]);
+                if outcome(&replies[1]) != "success" {
+                    return Err(format!("{step}: save failed: {:?}", replies[1]));
+                }
+                let built = built_text(&out);
+                if !built.contains(&model) {
+                    return Err(format!(
+                        "{step}: the saved file does not carry {model:?}: {built}"
+                    ));
+                }
+                for other in TARGETS.iter().filter(|target| **target != model) {
+                    // Exactly one target is in the document, and it is the model:
+                    // every other text was replaced and must be gone. The targets
+                    // are chosen not to contain one another, so this is a real
+                    // assertion rather than a prefix accident.
+                    if built.contains(other) {
+                        return Err(format!(
+                            "{step}: the saved file still carries {other:?} while the model says \
+                             {model:?}: {built}"
+                        ));
+                    }
+                }
+                assert_islands_cover_distinct_leaves(wd);
+                saved_any = true;
+                log.push(format!("{step}: save -> {model:?}"));
+            }
+        }
+    }
+
+    // One last save, so the artifact on disk is the end state of the sequence.
+    if !saved_any {
+        let replies = mcp(&[
+            ("document_open", json!({ "source": workdir })),
+            ("document_save", json!({ "output": out.to_string_lossy() })),
+        ]);
+        if outcome(&replies[1]) != "success" {
+            return Err(format!("final save failed: {:?}", replies[1]));
+        }
+    }
+    Ok(())
+}
+
+/// Where a failing seed's artifact goes, and how to replay it.
+fn fuzz_artifact_dir() -> PathBuf {
+    repo_root().join("target").join("sequence-fuzz")
+}
+
+#[test]
+fn sequence_fuzz() {
+    // A replay run: one seed, the same code path, the same message.
+    if let Ok(seed) = std::env::var("SEQUENCE_FUZZ_SEED") {
+        let seed: u64 = seed.parse().expect("SEQUENCE_FUZZ_SEED must be a number");
+        let steps: usize = std::env::var("SEQUENCE_FUZZ_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(12);
+        let mut log = Vec::new();
+        if let Err(error) = run_sequence(seed, steps, &mut log) {
+            panic!(
+                "replayed seed {seed} failed at {steps} steps: {error}\nlog:\n{}",
+                log.join("\n")
+            );
+        }
+        return;
+    }
+
+    let seeds: u64 = std::env::var("SEQUENCE_FUZZ_SEEDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4);
+    let steps: usize = std::env::var("SEQUENCE_FUZZ_STEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10);
+
+    for seed in 1..=seeds {
+        let mut log = Vec::new();
+        let Err(error) = run_sequence(seed, steps, &mut log) else {
+            continue;
+        };
+        // Shrink: the shortest prefix that still fails is the repro worth
+        // keeping, and finding it is one replay per length. Ops are generated
+        // from the observed state, so a prefix of the steps is a prefix of the
+        // sequence.
+        let mut shortest = (steps, error.clone());
+        let mut shortest_log = log;
+        for shorter in 1..steps {
+            let mut earlier_log = Vec::new();
+            if let Err(earlier) = run_sequence(seed, shorter, &mut earlier_log) {
+                shortest = (shorter, earlier);
+                shortest_log = earlier_log;
+                break;
+            }
+        }
+        let dir = fuzz_artifact_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let artifact = dir.join(format!("seed-{seed}.json"));
+        std::fs::write(
+            &artifact,
+            serde_json::to_vec_pretty(&json!({
+                "seed": seed,
+                "shortest_failing_steps": shortest.0,
+                "failure": shortest.1,
+                "log": shortest_log,
+                "replay": format!(
+                    "SEQUENCE_FUZZ_SEED={seed} SEQUENCE_FUZZ_STEPS={} cargo test --test \
+                     agent_surface sequence_fuzz",
+                    shortest.0
+                ),
+            }))
+            .expect("artifact json"),
+        )
+        .expect("write artifact");
+        panic!(
+            "seed {seed} failed after {} step(s): {} — the shortest failing sequence and its log \
+             are in {}; replay it with SEQUENCE_FUZZ_SEED={seed} SEQUENCE_FUZZ_STEPS={}",
+            shortest.0,
+            shortest.1,
+            artifact.display(),
+            shortest.0
+        );
+    }
+}
+
 #[test]
 fn a_save_publishes_only_what_it_verified() {
     let (dir, workdir) = opened("save-publish");
@@ -698,6 +983,165 @@ fn a_save_publishes_only_what_it_verified() {
     assert!(
         leftovers.is_empty(),
         "a refused save left a staged build behind: {leftovers:?}"
+    );
+}
+
+/// Hold a file the way Word does: open, but not for delete.
+///
+/// `std::fs::File::open` is not enough — Rust asks for FILE_SHARE_DELETE by
+/// default, so a rename over a handle it holds still succeeds, and a test that
+/// "locked" a file that way would pass without testing anything.
+#[cfg(windows)]
+fn hold_without_delete(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)
+        .expect("open without delete sharing")
+}
+
+#[test]
+#[cfg(windows)]
+fn an_interrupted_publication_is_reported_and_the_old_document_survives() {
+    let (dir, workdir) = opened("interrupted-publish");
+    let out = dir.join("published.docx");
+    let wd = Path::new(&workdir);
+
+    // One clean publication first: this is the version that has to survive.
+    let first = handle(&workdir, "中文区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": first, "replace_with": "中文区块区域内容" }] }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+    let published = std::fs::read(&out).expect("published");
+
+    // A second edit, and then a publication that cannot finish: the document is
+    // held, so the last rename of the publication fails while the evidence has
+    // already been moved into place.
+    let second = handle(&workdir, "中文区块区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": second, "replace_with": "中文区块区域内容B" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let guard = hold_without_delete(&out);
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    drop(guard);
+
+    assert_ne!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(
+        std::fs::read(&out).expect("still there"),
+        published,
+        "an interrupted publication replaced the document it could not finish replacing"
+    );
+    let mut staged: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&*dir).expect("scratch") {
+        let name = entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if name.contains(".building-") {
+            staged.push(name);
+        }
+    }
+    assert!(
+        staged.is_empty(),
+        "a staged build was left behind: {staged:?}"
+    );
+
+    // And the half-state is *detectable*: the evidence beside the surviving
+    // document describes the build that did not land.
+    let replies = mcp(&[("document_open", json!({ "source": out.to_string_lossy() }))]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(
+        data(&replies[0])["sidecars"]["state"],
+        "mixed",
+        "the interrupted publication left a set that claims to be one version: {:?}",
+        data(&replies[0])["sidecars"]
+    );
+
+    // Which is a state the next save clears: it rewrites both halves.
+    let replies = mcp(&[
+        (
+            "document_open",
+            json!({ "source": workdir, "release_current": true }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert!(built_text(&out).contains("中文区块区域内容B"));
+    let replies = mcp(&[(
+        "document_open",
+        json!({ "source": out.to_string_lossy(), "release_current": true }),
+    )]);
+    assert_eq!(
+        data(&replies[0])["sidecars"]["state"],
+        "consistent",
+        "the repaired set still reads as mixed: {:?}",
+        data(&replies[0])["sidecars"]
+    );
+    let _ = wd;
+}
+
+#[test]
+fn a_build_that_cannot_run_leaves_the_published_version_alone() {
+    let (dir, workdir) = opened("build-fails");
+    let out = dir.join("published.docx");
+    let wd = Path::new(&workdir);
+
+    let first = handle(&workdir, "中文区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": first, "replace_with": "中文区块区域内容" }] }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+    let published = std::fs::read(&out).expect("published");
+
+    // Break the build from underneath: the template is what every build is
+    // replayed against, and it is gone. The handle is resolved FIRST — opening a
+    // workdir whose template is missing is itself a refusal, which is a
+    // different finding from the one this test is about.
+    let second = handle(&workdir, "中文区块区域内容");
+    std::fs::rename(wd.join("_template.docx"), wd.join("_template.docx.gone")).expect("move aside");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": second, "replace_with": "中文区块区域内容C" }] }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+
+    assert_ne!(
+        outcome(&replies[2]),
+        "success",
+        "a save reported success with no template to build from: {:?}",
+        replies[2]
+    );
+    assert_eq!(
+        std::fs::read(&out).expect("still there"),
+        published,
+        "a build that could not run damaged the version already published"
     );
 }
 
@@ -822,9 +1266,14 @@ fn an_edit_sequence_across_calls_keeps_one_island_per_leaf_and_one_version() {
     );
 }
 
-/// One island per leaf, across every call the sequence made.
+/// One island per leaf, across every call the sequence made. A workdir that has
+/// recorded nothing yet satisfies it trivially.
 fn assert_islands_cover_distinct_leaves(workdir: &Path) {
-    let islands = std::fs::read_to_string(workdir.join("islands.json")).expect("islands.json");
+    let path = workdir.join("islands.json");
+    if !path.is_file() {
+        return;
+    }
+    let islands = std::fs::read_to_string(&path).expect("islands.json");
     let parsed: Value = serde_json::from_str(&islands).expect("islands json");
     let edits = parsed["edits"].as_array().expect("edits");
     let mut leaves: Vec<(String, u64)> = edits
