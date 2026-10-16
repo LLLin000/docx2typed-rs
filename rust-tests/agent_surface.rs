@@ -541,6 +541,26 @@ fn a_dry_run_checks_a_structural_edit_instead_of_calling_it_empty() {
             "the reply tells the agent to call `{absent}`, which is not mounted: {written}"
         );
     }
+
+    // The replace path relays the engine's own report one level down
+    // (`edit.engine.next`), and it carried the same advice.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [
+                { "handle": handle(&workdir, "中文区域内容"), "replace_with": "中文区块区域内容" }
+            ] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let replaced = serde_json::to_string(data(&replies[1])).expect("reply as text");
+    for absent in ["commit_sync", "diff_preview", "workdir_open", "facade_edit"] {
+        assert!(
+            !replaced.contains(absent),
+            "the replace reply tells the agent to call `{absent}`: {replaced}"
+        );
+    }
 }
 
 #[test]
@@ -678,6 +698,73 @@ fn a_save_publishes_only_what_it_verified() {
     assert!(
         leftovers.is_empty(),
         "a refused save left a staged build behind: {leftovers:?}"
+    );
+}
+
+#[test]
+fn find_counts_agree_with_the_verdicts_beside_them() {
+    let (_dir, workdir) = opened("counts");
+    // Two edits in one leaf first: the second one lands in a paragraph whose
+    // offsets the draft has moved, which is what makes some occurrences of the
+    // query uneditable while the paragraph's first occurrence is not.
+    let first = handle(&workdir, "中文区域内容");
+    let _ = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": first, "replace_with": "中文区块区域内容A" }] }),
+        ),
+    ]);
+    let second = handle(&workdir, "中文区块区域内容A");
+    let _ = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": second, "replace_with": "中文区域内容A中文区域内容" }] }),
+        ),
+    ]);
+
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_find",
+            json!({ "query": "中文区域内容", "limit": 40 }),
+        ),
+    ]);
+    let found = data(&replies[1]);
+    let matches = found["matches"].as_array().expect("matches");
+    let counts = found.get("counts").expect("counts");
+
+    let mut occurrences = 0u64;
+    let mut editable = 0u64;
+    for entry in matches {
+        for occurrence in entry["occurrences"].as_array().unwrap_or(&Vec::new()) {
+            occurrences += 1;
+            if occurrence["verdict"]["editable"] == json!(true) {
+                editable += 1;
+            }
+        }
+    }
+    assert!(occurrences > 0, "the query matched nothing: {found}");
+    assert_eq!(
+        counts["occurrences"].as_u64(),
+        Some(occurrences),
+        "the page count is not the list beside it: {found}"
+    );
+    assert_eq!(
+        counts["editable"].as_u64(),
+        Some(editable),
+        "the editable count is not the list beside it: {found}"
+    );
+    assert_eq!(
+        counts["not_editable"].as_u64(),
+        Some(occurrences - editable),
+        "the not-editable count is not the list beside it: {found}"
+    );
+    assert_eq!(
+        counts["blocks"].as_u64(),
+        Some(matches.len() as u64),
+        "the block count is not the page's shape: {found}"
     );
 }
 

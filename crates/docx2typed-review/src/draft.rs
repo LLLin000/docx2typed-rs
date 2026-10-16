@@ -2050,6 +2050,43 @@ fn replace_at(
     Ok(out)
 }
 
+/// The refusal for a group of replacements that cannot be mapped onto the
+/// paragraph's leaves.
+///
+/// The two cases are worth telling apart. An offset that cannot be mapped often
+/// means the paragraph already carries an edit that changed its length and this
+/// span crosses more than one leaf, where the caller's offsets and the runs no
+/// longer line up: record it anyway and the edit lands in the wrong run. Name the
+/// shape instead of guessing, and name a way out the caller can take.
+fn unmappable_paragraph(
+    workdir: &Path,
+    paragraph_id: &str,
+    leaf_index: usize,
+    spans: &[LeafReplacement],
+) -> CollaborationError {
+    if paragraph_lengths_differ(workdir, paragraph_id) {
+        CollaborationError::new(
+            "paragraph-has-uncommitted-length-change",
+            format!(
+                "{paragraph_id} already carries an edit that changed its length and this \
+                 replacement crosses more than one run, so the offsets in the draft no longer \
+                 address the template's runs the same way. Replace one run at a time (a shorter \
+                 span), or open a copy of the source document as a fresh workdir. Nothing was \
+                 written"
+            ),
+        )
+    } else {
+        CollaborationError::new(
+            "invalid-edit",
+            format!(
+                "{paragraph_id}: cannot map {} replacement(s) onto leaf {leaf_index}; nothing was \
+                 written",
+                spans.len()
+            ),
+        )
+    }
+}
+
 /// Validate EVERY hunk against the in-memory block list, then apply all of them
 /// to a copy of it. Nothing is written here — this is the atomicity mechanism:
 /// a rejected batch fails before the draft is touched, so the outcome is
@@ -2464,6 +2501,11 @@ fn plan_patch(
             .push((start, len, replacement));
     }
     let mut absorbed: Vec<(String, usize)> = Vec::new();
+    // One template read per paragraph, not one per leaf: a batch that replaces
+    // the same phrase eighty times walks eighty leaves, and re-reading and
+    // re-parsing the package for each of them is work the paragraph's own leaves
+    // already answer.
+    let mut view_cache: Option<(String, ParagraphLeaves)> = None;
     for ((paragraph_id, leaf_index), spans) in merged {
         // A leaf the walk cannot map is a refusal, never a half-recorded edit:
         // an island with an empty `old` would silently do nothing at build time
@@ -2473,36 +2515,33 @@ fn plan_patch(
         // carries a pending island (a previous call rewrote it), so this
         // replacement is folded into that island's text instead of being
         // recorded as a second one over the same bytes.
-        let (record_start, record_old, record_new, replaced_leaves) =
-            merged_leaf_island(workdir, &paragraph_id, leaf_index, &spans)?.ok_or_else(|| {
-                // The two cases are worth telling apart. An offset that
-                // cannot be mapped usually means the paragraph already
-                // carries an edit that changed its length and this span
-                // crosses more than one run, where the caller's offsets and
-                // the runs no longer line up: record it and the edit lands
-                // in the wrong run. Name the shape instead of guessing.
-                if paragraph_lengths_differ(workdir, &paragraph_id) {
-                    CollaborationError::new(
-                        "paragraph-has-uncommitted-length-change",
-                        format!(
-                            "{paragraph_id} already carries an edit that changed its length \
-                                 and this replacement crosses more than one run, so the offsets in \
-                                 the draft no longer address the template's runs the same way. \
-                                 Replace one run at a time (a shorter span), or re-extract the \
-                                 document into a fresh workdir. Nothing was written"
-                        ),
-                    )
-                } else {
-                    CollaborationError::new(
-                        "invalid-edit",
-                        format!(
-                            "{paragraph_id}: cannot map {} replacement(s) onto leaf \
-                                 {leaf_index}; nothing was written",
-                            spans.len()
-                        ),
-                    )
+        if view_cache
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != paragraph_id)
+        {
+            match ParagraphLeaves::load(workdir, &paragraph_id) {
+                Ok(view) => view_cache = Some((paragraph_id.clone(), view)),
+                Err(_) => {
+                    return Err(unmappable_paragraph(
+                        workdir,
+                        &paragraph_id,
+                        leaf_index,
+                        &spans,
+                    ))
                 }
-            })?;
+            }
+        }
+        let view = &view_cache.as_ref().expect("just loaded").1;
+        let Some((record_start, record_old, record_new, replaced_leaves)) =
+            merged_leaf_island(view, leaf_index, &spans)
+        else {
+            return Err(unmappable_paragraph(
+                workdir,
+                &paragraph_id,
+                leaf_index,
+                &spans,
+            ));
+        };
         for absorbed_leaf in replaced_leaves {
             absorbed.push((paragraph_id.clone(), absorbed_leaf));
         }
@@ -2706,27 +2745,19 @@ type LeafIsland = (usize, String, String, Vec<usize>);
 /// every replacement in its leaves and the merged text can occur twice in one of
 /// them, so a text-only search refuses a batch the applier could place.
 fn merged_leaf_island(
-    workdir: &Path,
-    paragraph_id: &str,
+    view: &ParagraphLeaves,
     leaf_index: usize,
     spans: &[LeafReplacement],
-) -> Result<Option<LeafIsland>, CollaborationError> {
-    let Some(view) = ParagraphLeaves::load(workdir, paragraph_id).ok() else {
-        return Ok(None);
-    };
+) -> Option<LeafIsland> {
     let mut ordered: Vec<&LeafReplacement> = spans.iter().collect();
     ordered.sort_by_key(|(start, _, _)| *start);
-    let Some(first) = ordered.first().map(|(start, _, _)| *start) else {
-        return Ok(None);
-    };
+    let first = ordered.first().map(|(start, _, _)| *start)?;
 
     let mut cursor = first;
     for (start, len, _) in &ordered {
-        let Some(end) = start.checked_add(*len) else {
-            return Ok(None);
-        };
+        let end = start.checked_add(*len)?;
         if *start < cursor {
-            return Ok(None);
+            return None;
         }
         cursor = end;
     }
@@ -2735,15 +2766,11 @@ fn merged_leaf_island(
     // leaf the last character lands in. Read in the caller's space: a mismatch
     // means the offsets and the leaves have drifted apart, and recording the
     // edit anyway would land it in the wrong leaf.
-    let Some(owner) = view.leaf_at(first) else {
-        return Ok(None);
-    };
+    let owner = view.leaf_at(first)?;
     if owner.leaf_index != leaf_index {
-        return Ok(None);
+        return None;
     }
-    let Some(covered) = view.covered(first, cursor) else {
-        return Ok(None);
-    };
+    let covered = view.covered(first, cursor)?;
 
     let mut old = String::new();
     let mut draft = String::new();
@@ -2751,18 +2778,16 @@ fn merged_leaf_island(
         old.push_str(&leaf.template_text);
         draft.push_str(&leaf.draft_text);
     }
-    let Some(new) = apply_spans(&draft, covered[0].draft_start, &ordered) else {
-        return Ok(None);
-    };
+    let new = apply_spans(&draft, covered[0].draft_start, &ordered)?;
     if old.is_empty() && new.is_empty() {
-        return Ok(None);
+        return None;
     }
     let absorbed: Vec<usize> = covered
         .iter()
         .filter(|leaf| leaf.pending)
         .map(|leaf| leaf.leaf_index)
         .collect();
-    Ok(Some((covered[0].draft_start, old, new, absorbed)))
+    Some((covered[0].draft_start, old, new, absorbed))
 }
 
 /// `text` with every span that starts inside it applied, spans addressed by

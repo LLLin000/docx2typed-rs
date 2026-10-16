@@ -208,19 +208,15 @@ pub(crate) fn apply_and_sync(
                 // cannot act on, since the surface hands out no handle for a
                 // paragraph the search did not match. Passing `None` lets the
                 // engine choose a source that works and keep the position.
-                let inserted = surface_next_step(
-                    draft::insert_paragraph(target, &anchor, text, None, *format)
-                        .map_err(|error| MutationError::new(error.code, error.detail))?,
-                );
+                let inserted = draft::insert_paragraph(target, &anchor, text, None, *format)
+                    .map_err(|error| MutationError::new(error.code, error.detail))?;
                 structural
                     .push(json!({ "kind": "insert_after", "anchor": anchor, "result": inserted }));
             }
             Edit::Delete { handle } => {
                 let paragraph = paragraph_of(target, handle)?;
-                let deleted = surface_next_step(
-                    draft::delete_paragraph(target, &paragraph)
-                        .map_err(|error| MutationError::new(error.code, error.detail))?,
-                );
+                let deleted = draft::delete_paragraph(target, &paragraph)
+                    .map_err(|error| MutationError::new(error.code, error.detail))?;
                 structural.push(
                     json!({ "kind": "delete", "paragraph_id": paragraph, "result": deleted }),
                 );
@@ -296,27 +292,57 @@ pub(crate) fn apply_and_sync(
     }))
 }
 
-/// A structural reply, with the engine's `next` replaced by the one the surface
-/// can actually take.
+/// Rewrite the engine's `next` steps in one reply to the step the surface can
+/// take.
 ///
-/// The draft owns these answers in its own vocabulary — "commit_sync allocates
-/// the formal paragraph ID", "diff_preview to inspect style ownership, then
-/// commit_sync" — and neither tool is mounted: the commit already happened
-/// inside this call, so telling the caller to run it names a step that does not
-/// exist for them. A blind agent quoted the advice back as a defect, correctly.
-/// The engine-level reply keeps its own wording for the CLI and the tests; what
-/// the agent reads is this.
-fn surface_next_step(reply: Value) -> Value {
-    let Value::Object(mut map) = reply else {
-        return reply;
-    };
-    if map.contains_key("next") {
-        map.insert(
-            "next".to_string(),
-            json!("document_save writes the file when you are done editing"),
-        );
+/// The engine answers in its own vocabulary — `data.edit.engine.next` reads
+/// "diff_preview to inspect style ownership, then commit_sync", a synthesised
+/// paragraph's result says "commit_sync allocates the formal paragraph ID" — and
+/// neither tool is mounted, nor is either step outstanding: the commit already
+/// happened inside this call. A blind agent quoted the advice back as a defect,
+/// on the replace path as well as the structural one, so the rewrite covers the
+/// whole reply instead of the fields anyone remembered. The engine's own reply
+/// keeps its wording for the CLI and the tests, where those tools exist.
+fn in_surface_vocabulary(mut data: Value) -> Value {
+    rewrite_next_steps(&mut data);
+    data
+}
+
+fn rewrite_next_steps(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                if key == "next" {
+                    if let Some(step) = entry.as_str() {
+                        if names_an_unmounted_tool(step) {
+                            *entry =
+                                json!("document_save writes the file when you are done editing");
+                            continue;
+                        }
+                    }
+                }
+                rewrite_next_steps(entry);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(rewrite_next_steps),
+        _ => {}
     }
-    Value::Object(map)
+}
+
+/// Does this engine step name a tool the agent surface does not mount?
+fn names_an_unmounted_tool(step: &str) -> bool {
+    const ENGINE_ONLY: [&str; 9] = [
+        "commit_sync",
+        "diff_preview",
+        "workdir_open",
+        "workdir_status",
+        "document_patch",
+        "batch_edit",
+        "facade_edit",
+        "facade_locate",
+        "facade_verify",
+    ];
+    ENGINE_ONLY.iter().any(|tool| step.starts_with(tool))
 }
 
 /// The paragraph a handle addresses.
@@ -446,7 +472,7 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
         if !blocked.is_empty() {
             data["blocked_targets"] = json!(blocked);
         }
-        return session.success("document_edit", data, build_commit);
+        return session.success("document_edit", in_surface_vocabulary(data), build_commit);
     }
 
     // The operation id goes through the args so the store's ledger sees it: a
@@ -507,7 +533,7 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
     }
     session.success(
         "document_edit",
-        json!({
+        in_surface_vocabulary(json!({
             "operation_id": operation_id,
             "dry_run": false,
             // Replacements report through `edit` (the facade's staged targets);
@@ -517,7 +543,7 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
             "edit": data.get("edit").cloned().unwrap_or(Value::Null),
             "structural": data.get("structural").cloned().unwrap_or(Value::Null),
             "synced": data.get("synced").cloned().unwrap_or(Value::Null),
-        }),
+        })),
         build_commit,
     )
 }
