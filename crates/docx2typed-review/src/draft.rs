@@ -1112,6 +1112,12 @@ fn leaf_in_inventory_covers(
 ///
 /// The same walk as [`leaf_in_inventory_covers`], returning the index so a
 /// handle-addressed edit can name its leaf instead of re-searching the text.
+///
+/// The offsets are the caller's, so the walk reads the leaves the caller reads —
+/// a leaf a pending edit already rewrote counts its DRAFT width, and a leaf the
+/// projection drops counts none. Counting the template's widths instead put a
+/// span one leaf over as soon as an earlier edit in the paragraph had changed
+/// its length.
 fn leaf_index_for_span(
     workdir: &Path,
     paragraph_id: &str,
@@ -1121,24 +1127,9 @@ fn leaf_index_for_span(
     if length == 0 {
         return None;
     }
-    let package = fs::read(workdir.join("_template.docx")).ok()?;
-    let inventory = docx2typed_core::prose::enumerate_package_bytes(&package).ok()?;
-    let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)?;
-    let span_end = offset + length;
-    let mut cursor = 0usize;
-    for leaf in inventory
-        .leaves
-        .iter()
-        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
-    {
-        let leaf_start = cursor;
-        let leaf_end = cursor + leaf.text.chars().count();
-        cursor = leaf_end;
-        if offset >= leaf_start && span_end <= leaf_end {
-            return Some(leaf.leaf_index);
-        }
-    }
-    None
+    let view = ParagraphLeaves::load(workdir, paragraph_id).ok()?;
+    view.leaf_for_span(offset, length)
+        .map(|leaf| leaf.leaf_index)
 }
 
 /// The first template run one island edit lands in, or None for a synthesised
@@ -1229,10 +1220,30 @@ fn island_leaf_for(
         .iter()
         .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
         .count();
+    // A leaf a pending island already rewrote reads differently to the caller
+    // than the template holds it: `old` is the text the caller is looking at,
+    // and the text that has to be proven reachable is the leaf's TEMPLATE text,
+    // at the place the caller's space puts it. Probing the caller's text here
+    // found it a character away in the wrong run and recorded the edit there.
+    let view = ParagraphLeaves::load(workdir, paragraph_id)?;
+    let target = match char_start {
+        Some(start) => view.leaf_at(start),
+        None => leaf_index
+            .and_then(|index| view.by_index(index))
+            .or_else(|| view.leaves.first()),
+    };
+    let (needle, anchor, addressed) = match target {
+        Some(leaf) if leaf.pending => (
+            leaf.template_text.as_str(),
+            Some(leaf.draft_start),
+            Some(leaf.leaf_index),
+        ),
+        _ => (old, char_start, None),
+    };
     // An explicit ordinal is the caller's address; without one the search starts
     // at the paragraph's first run. An anchored span carries its own address, so
     // a stale ordinal must not hide it.
-    let from_leaf = if char_start.is_some() {
+    let from_leaf = if anchor.is_some() {
         0
     } else {
         leaf_index.unwrap_or(0)
@@ -1242,8 +1253,8 @@ fn island_leaf_for(
         &part,
         paragraph_id,
         from_leaf,
-        old,
-        char_start,
+        needle,
+        anchor,
     )
     .map_err(|error| core_failure(error, "prose-edit-ambiguous"))?;
     let Some(span) = span else {
@@ -1262,7 +1273,7 @@ fn island_leaf_for(
     };
     docx2typed_core::prose::resolve_leaf(&inventory, &part, paragraph_id, span.first_leaf)
         .map_err(|error| core_failure(error, "opaque-paragraph-mutated"))?;
-    if let Some(index) = leaf_index {
+    if let Some(index) = addressed.or(leaf_index) {
         if index != span.first_leaf {
             return Err(CollaborationError::new(
                 "invalid-edit",
@@ -1313,11 +1324,33 @@ fn append_island_edits(
     workdir: &Path,
     edits: &[docx2typed_core::prose::IslandEdit],
 ) -> Result<(), CollaborationError> {
-    if edits.is_empty() {
+    settle_island_edits(workdir, edits, &[])
+}
+
+/// Append island edits, dropping the ones they absorbed, in one sidecar write.
+///
+/// The drop is not housekeeping: a leaf may hold one island, and an island the
+/// new one was merged into is no longer a separate edit. Leaving both in place
+/// makes the build splice two records over the same bytes, which is how a save
+/// came back with an unclosed `w:t` on a document whose edits had all reported
+/// success.
+fn settle_island_edits(
+    workdir: &Path,
+    edits: &[docx2typed_core::prose::IslandEdit],
+    absorbed: &[(String, usize)],
+) -> Result<(), CollaborationError> {
+    if edits.is_empty() && absorbed.is_empty() {
         return Ok(());
     }
     let mut islands = docx2typed_core::prose::load_islands(workdir)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    if !absorbed.is_empty() {
+        islands.retain(|island| {
+            !absorbed.iter().any(|(paragraph_id, leaf)| {
+                island.paragraph_id == *paragraph_id && island.leaf_index == *leaf
+            })
+        });
+    }
     islands.extend_from_slice(edits);
     docx2typed_core::prose::save_islands(workdir, &islands)
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))
@@ -1573,6 +1606,10 @@ struct PatchPlan {
     blocks: Vec<String>,
     applied: Vec<Value>,
     islands: Vec<docx2typed_core::prose::IslandEdit>,
+    /// Pending islands this plan folds into its own, as `(paragraph, leaf)`.
+    /// They must leave the sidecar when the plan's islands are written, or the
+    /// build splices two records over the same bytes.
+    absorbed: Vec<(String, usize)>,
 }
 
 /// Python `_require_body_structure_mutable`: container and part paragraphs are
@@ -2426,46 +2463,56 @@ fn plan_patch(
             .or_default()
             .push((start, len, replacement));
     }
+    let mut absorbed: Vec<(String, usize)> = Vec::new();
     for ((paragraph_id, leaf_index), spans) in merged {
         // A leaf the walk cannot map is a refusal, never a half-recorded edit:
         // an island with an empty `old` would silently do nothing at build time
         // while the call still reported success.
-        let (record_start, record_old, record_new) =
-            merged_leaf_island(workdir, &paragraph_id, leaf_index, &spans).ok_or_else(|| {
-                // The two cases are worth telling apart. An offset that cannot
-                // be mapped usually means the paragraph already carries an
-                // UNCOMMITTED edit that changed its length: the search reports
-                // draft offsets while the island must address the template's
-                // runs, and once the lengths differ those are different
-                // coordinate spaces. Naming it tells the agent to commit first
-                // instead of guessing.
+        //
+        // The merge handles the case that used to corrupt: the leaf already
+        // carries a pending island (a previous call rewrote it), so this
+        // replacement is folded into that island's text instead of being
+        // recorded as a second one over the same bytes.
+        let (record_start, record_old, record_new, replaced_leaves) =
+            merged_leaf_island(workdir, &paragraph_id, leaf_index, &spans)?.ok_or_else(|| {
+                // The two cases are worth telling apart. An offset that
+                // cannot be mapped usually means the paragraph already
+                // carries an edit that changed its length and this span
+                // crosses more than one run, where the caller's offsets and
+                // the runs no longer line up: record it and the edit lands
+                // in the wrong run. Name the shape instead of guessing.
                 if paragraph_lengths_differ(workdir, &paragraph_id) {
                     CollaborationError::new(
                         "paragraph-has-uncommitted-length-change",
                         format!(
-                            "{paragraph_id} already carries an uncommitted edit that changed its \
-                             length, so draft offsets no longer address the template's runs; run \
-                             commit_sync first, then edit again. Nothing was written"
+                            "{paragraph_id} already carries an edit that changed its length \
+                                 and this replacement crosses more than one run, so the offsets in \
+                                 the draft no longer address the template's runs the same way. \
+                                 Replace one run at a time (a shorter span), or re-extract the \
+                                 document into a fresh workdir. Nothing was written"
                         ),
                     )
                 } else {
                     CollaborationError::new(
                         "invalid-edit",
                         format!(
-                            "{paragraph_id}: cannot map {} replacement(s) onto leaf {leaf_index}; \
-                             nothing was written",
+                            "{paragraph_id}: cannot map {} replacement(s) onto leaf \
+                                 {leaf_index}; nothing was written",
                             spans.len()
                         ),
                     )
                 }
             })?;
+        for absorbed_leaf in replaced_leaves {
+            absorbed.push((paragraph_id.clone(), absorbed_leaf));
+        }
         islands.push(docx2typed_core::prose::IslandEdit {
             part: "document".to_string(),
             paragraph_id,
             leaf_index,
-            // The offset the recorded text begins at — the run's start when the
-            // island stays inside one run, the first replacement's otherwise.
-            // That, not the first replacement's offset, is what addresses `old`.
+            // The offset the recorded text begins at — the leaf's start when the
+            // island stays inside one leaf, the covered region's otherwise. That,
+            // not the first replacement's offset, is what addresses `old`.
             char_start: Some(record_start),
             old: record_old,
             new: record_new,
@@ -2478,6 +2525,7 @@ fn plan_patch(
         blocks,
         applied,
         islands,
+        absorbed,
     })
 }
 
@@ -2511,137 +2559,234 @@ fn paragraph_lengths_differ(workdir: &Path, paragraph_id: &str) -> bool {
     draft_len != template_len
 }
 
-/// One run of the paragraph an edit targets: its leaf ordinal, its text, and the
-/// paragraph-character offset its text starts at.
-type RunSlice = (usize, String, usize);
-
-/// The paragraph's runs in order, with the character offset each starts at.
-fn run_offsets(workdir: &Path, paragraph_id: &str) -> Option<(String, Vec<RunSlice>)> {
-    let package = fs::read(workdir.join("_template.docx")).ok()?;
-    let inventory = docx2typed_core::prose::enumerate_package_bytes(&package).ok()?;
-    let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)?;
-    let mut leaves: Vec<&docx2typed_core::prose::ProseLeaf> = inventory
-        .leaves
-        .iter()
-        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
-        .collect();
-    leaves.sort_by_key(|leaf| leaf.leaf_index);
-    let mut runs = Vec::with_capacity(leaves.len());
-    let mut offset = 0usize;
-    for leaf in &leaves {
-        let len = leaf.text.chars().count();
-        runs.push((leaf.leaf_index, leaf.text.clone(), offset));
-        offset += len;
-    }
-    Some((part, runs))
+/// One paragraph leaf in BOTH spaces at once.
+struct LeafView {
+    leaf_index: usize,
+    /// What the template holds: the text an island's `old` has to read.
+    template_text: String,
+    /// What the caller reads: the pending island's `new` when one already
+    /// rewrites this leaf, otherwise the template's text. Callers' offsets are
+    /// measured here.
+    draft_text: String,
+    /// Where `draft_text` starts in the caller's space.
+    draft_start: usize,
+    /// Whether the projection keeps this leaf's text. A leaf it drops — a run
+    /// inside a tracked deletion — has no width in the caller's space, so no
+    /// offset can land in it and no span can cover it.
+    projected: bool,
+    /// Whether a pending island already rewrites this leaf.
+    pending: bool,
 }
 
-/// The island record for one run-group: the template text its spans cover, and
-/// what replaces them.
+/// A paragraph's leaves, in the caller's space.
 ///
-/// The draft addresses spans by PARAGRAPH-global character offsets, while the
-/// island must address the template's runs. Those are two coordinate spaces and
-/// they only meet while the paragraph's visible text and its runs still agree —
-/// `paragraph_lengths_differ` is the caller's guard for the case where they do
-/// not, and `None` here is the second one.
+/// Three coordinate spaces meet on one paragraph: the template's runs, the
+/// projection the caller reads (where a tracked deletion has no width), and the
+/// draft, which is the projection with pending island edits applied. They agree
+/// only until an edit changes a leaf's length — and then a caller's offset
+/// addresses a *different* place in the runs, so resolving it there silently
+/// moves the edit. This view exists so every side reads the same one: the leaf a
+/// span lands in, the text a leaf carries now, and the text the template holds.
+struct ParagraphLeaves {
+    leaves: Vec<LeafView>,
+}
+
+impl ParagraphLeaves {
+    fn load(workdir: &Path, paragraph_id: &str) -> Result<Self, CollaborationError> {
+        let package = fs::read(workdir.join("_template.docx")).map_err(|error| {
+            CollaborationError::new("workdir-unreadable", format!("{paragraph_id}: {error}"))
+        })?;
+        let inventory = docx2typed_core::prose::enumerate_package_bytes(&package)
+            .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+        let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)
+            .ok_or_else(|| CollaborationError::new("invalid-edit", "unknown paragraph part"))?;
+        let pending = docx2typed_core::prose::load_islands(workdir)
+            .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+        let mut ordered: Vec<&docx2typed_core::prose::ProseLeaf> = inventory
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
+            .collect();
+        ordered.sort_by_key(|leaf| leaf.leaf_index);
+        let mut leaves = Vec::with_capacity(ordered.len());
+        let mut draft_start = 0usize;
+        for leaf in ordered {
+            let island = pending.iter().find(|edit| {
+                edit.part == part
+                    && edit.paragraph_id == paragraph_id
+                    && edit.leaf_index == leaf.leaf_index
+            });
+            let draft_text = island
+                .map(|edit| edit.new.clone())
+                .unwrap_or_else(|| leaf.text.clone());
+            leaves.push(LeafView {
+                leaf_index: leaf.leaf_index,
+                template_text: leaf.text.clone(),
+                draft_text: draft_text.clone(),
+                draft_start,
+                projected: leaf.projected,
+                pending: island.is_some(),
+            });
+            if leaf.projected {
+                draft_start += draft_text.chars().count();
+            }
+        }
+        Ok(ParagraphLeaves { leaves })
+    }
+
+    /// The leaf the caller's offset falls in. A leaf the projection drops
+    /// (a tracked deletion) has no width there, so no offset can land in it.
+    fn leaf_at(&self, offset: usize) -> Option<&LeafView> {
+        self.leaves
+            .iter()
+            .find(|leaf| leaf.projected && offset >= leaf.draft_start && offset < leaf.end())
+    }
+
+    /// The leaf that carries the whole span, or None when it crosses leaves.
+    fn leaf_for_span(&self, offset: usize, length: usize) -> Option<&LeafView> {
+        self.leaves.iter().find(|leaf| {
+            leaf.projected && offset >= leaf.draft_start && offset + length <= leaf.end()
+        })
+    }
+
+    fn by_index(&self, leaf_index: usize) -> Option<&LeafView> {
+        self.leaves
+            .iter()
+            .find(|leaf| leaf.leaf_index == leaf_index)
+    }
+
+    /// The leaves a span covers, from the one it starts in to the one it ends
+    /// in — the caller's space again, so a hidden leaf is not one of them.
+    fn covered(&self, start: usize, end: usize) -> Option<Vec<&LeafView>> {
+        let last = end.checked_sub(1)?;
+        let holds = |leaf: &&LeafView, offset: usize| {
+            leaf.projected && offset >= leaf.draft_start && offset < leaf.end()
+        };
+        let from = self.leaves.iter().position(|leaf| holds(&leaf, start))?;
+        let to = self.leaves.iter().position(|leaf| holds(&leaf, last))?;
+        if to < from {
+            return None;
+        }
+        // A hidden leaf between two visible ones means the region crosses text
+        // the caller's offsets do not count; collapsing it would record an
+        // island whose `old` skips what the template holds.
+        if self.leaves[from..=to].iter().any(|leaf| !leaf.projected) {
+            return None;
+        }
+        Some(self.leaves[from..=to].iter().collect())
+    }
+}
+
+impl LeafView {
+    fn end(&self) -> usize {
+        self.draft_start + self.draft_text.chars().count()
+    }
+}
+
+/// One island record, before it becomes a sidecar entry: where its `old` starts
+/// in the caller's space, what the template holds there, what the caller reads
+/// there now, and the leaves whose own pending islands it replaces.
+type LeafIsland = (usize, String, String, Vec<usize>);
+
+/// The record covers WHOLE leaves, on both sides: `old` as the template holds
+/// them, `new` as the caller reads them with this call's spans applied. Whole
+/// leaves rather than just the span range, because that is what makes a pending
+/// island inside the region absorbable: the record already rewrites every byte
+/// of every leaf it names, so one island replaces them all — while a record that
+/// starts mid-leaf leaves the older island addressing text this one also
+/// changes, and the build splices both.
 ///
-/// A region that stays inside ONE run keeps the long-standing record: that run
-/// as it stands, and that run as it should read. Only a region that crosses
-/// runs is recorded as the covered range itself, because the applier has to
-/// rebuild every run it touched and `old` is how it finds them.
-/// Returns `(start, old, new)`: the paragraph offset `old` begins at, so the
-/// island can address its span instead of searching for the text. One island
-/// carries every replacement in its leaf, and the merged text can occur twice in
-/// that leaf, so a text-only search refuses a batch the applier could place.
+/// Text between two hunks rides along unchanged on BOTH sides: the applier
+/// replaces one contiguous region, and whatever this island does not edit has to
+/// read the same before and after.
+///
+/// Returns `(start, old, new, absorbed)`: the paragraph offset `old` begins at,
+/// so the island can address its span instead of searching for the text, plus
+/// the leaves whose pending islands this record replaces. One island carries
+/// every replacement in its leaves and the merged text can occur twice in one of
+/// them, so a text-only search refuses a batch the applier could place.
 fn merged_leaf_island(
     workdir: &Path,
     paragraph_id: &str,
     leaf_index: usize,
     spans: &[LeafReplacement],
-) -> Option<(usize, String, String)> {
-    let (_part, runs) = run_offsets(workdir, paragraph_id)?;
+) -> Result<Option<LeafIsland>, CollaborationError> {
+    let Some(view) = ParagraphLeaves::load(workdir, paragraph_id).ok() else {
+        return Ok(None);
+    };
     let mut ordered: Vec<&LeafReplacement> = spans.iter().collect();
     ordered.sort_by_key(|(start, _, _)| *start);
-    let first = ordered.first().map(|(start, _, _)| *start)?;
-
-    // The group key is the run the region starts in. A mismatch means the
-    // draft's offsets and the template's runs have drifted apart, and recording
-    // the edit anyway would land it in the wrong run.
-    let owner = run_covering(&runs, first)?.0;
-    if owner != leaf_index {
-        return None;
-    }
+    let Some(first) = ordered.first().map(|(start, _, _)| *start) else {
+        return Ok(None);
+    };
 
     let mut cursor = first;
     for (start, len, _) in &ordered {
-        let end = start.checked_add(*len)?;
+        let Some(end) = start.checked_add(*len) else {
+            return Ok(None);
+        };
         if *start < cursor {
-            return None;
+            return Ok(None);
         }
         cursor = end;
     }
-    let last_char = cursor.checked_sub(1)?;
 
-    if run_covering(&runs, last_char)?.0 == owner {
-        // One run only: rewrite that run's text with the spans applied, and
-        // record it the way every batch inside one run has always been recorded.
-        let (_, run_text, run_start) = run_covering(&runs, first)?;
-        let mut chars: Vec<char> = run_text.chars().collect();
-        let mut descending: Vec<&LeafReplacement> = ordered.clone();
-        descending.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
-        for (start, len, replacement) in descending {
-            let local = start.checked_sub(run_start)?;
-            let end = local.checked_add(*len)?;
-            if end > chars.len() {
-                return None;
-            }
-            let mut next: Vec<char> = Vec::with_capacity(chars.len() + replacement.len());
-            next.extend_from_slice(&chars[..local]);
-            next.extend(replacement.chars());
-            next.extend_from_slice(&chars[end..]);
-            chars = next;
-        }
-        return Some((run_start, run_text, chars.into_iter().collect()));
+    // The group key is the leaf the region starts in, and the region ends in the
+    // leaf the last character lands in. Read in the caller's space: a mismatch
+    // means the offsets and the leaves have drifted apart, and recording the
+    // edit anyway would land it in the wrong leaf.
+    let Some(owner) = view.leaf_at(first) else {
+        return Ok(None);
+    };
+    if owner.leaf_index != leaf_index {
+        return Ok(None);
     }
+    let Some(covered) = view.covered(first, cursor) else {
+        return Ok(None);
+    };
 
-    // More than one run: record the covered region itself. Text between two
-    // hunks rides along unchanged on BOTH sides, because the island replaces one
-    // contiguous region and whatever it does not edit has to read the same
-    // before and after.
-    let paragraph_text: String = runs.iter().map(|(_, text, _)| text.as_str()).collect();
-    let chars: Vec<char> = paragraph_text.chars().collect();
     let mut old = String::new();
-    let mut new = String::new();
-    let mut cursor = first;
-    for (start, len, replacement) in ordered {
-        let end = start.checked_add(*len)?;
+    let mut draft = String::new();
+    for leaf in &covered {
+        old.push_str(&leaf.template_text);
+        draft.push_str(&leaf.draft_text);
+    }
+    let Some(new) = apply_spans(&draft, covered[0].draft_start, &ordered) else {
+        return Ok(None);
+    };
+    if old.is_empty() && new.is_empty() {
+        return Ok(None);
+    }
+    let absorbed: Vec<usize> = covered
+        .iter()
+        .filter(|leaf| leaf.pending)
+        .map(|leaf| leaf.leaf_index)
+        .collect();
+    Ok(Some((covered[0].draft_start, old, new, absorbed)))
+}
+
+/// `text` with every span that starts inside it applied, spans addressed by
+/// their caller-space offsets and applied right to left.
+fn apply_spans(text: &str, region_start: usize, spans: &[&LeafReplacement]) -> Option<String> {
+    let mut chars: Vec<char> = text.chars().collect();
+    let mut descending: Vec<&&LeafReplacement> = spans
+        .iter()
+        .filter(|(start, _, _)| *start >= region_start)
+        .collect();
+    descending.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    for (start, len, replacement) in descending {
+        let local = start.checked_sub(region_start)?;
+        let end = local.checked_add(*len)?;
         if end > chars.len() {
             return None;
         }
-        if *start > cursor {
-            old.extend(&chars[cursor..*start]);
-            new.extend(&chars[cursor..*start]);
-        }
-        old.extend(&chars[*start..end]);
-        new.push_str(replacement);
-        cursor = end;
+        let mut next: Vec<char> = Vec::with_capacity(chars.len() + replacement.len());
+        next.extend_from_slice(&chars[..local]);
+        next.extend(replacement.chars());
+        next.extend_from_slice(&chars[end..]);
+        chars = next;
     }
-    if old.is_empty() && new.is_empty() {
-        return None;
-    }
-    Some((first, old, new))
-}
-
-/// The run carrying the character at paragraph offset `offset`: its ordinal,
-/// its text, and the offset its text starts at.
-fn run_covering(runs: &[RunSlice], offset: usize) -> Option<(usize, String, usize)> {
-    for (index, text, start) in runs {
-        let len = text.chars().count();
-        if offset < start + len {
-            return Some((*index, text.clone(), *start));
-        }
-    }
-    None
+    Some(chars.into_iter().collect())
 }
 
 /// The draft's opaque revision token: the canonical edit-body hash of
@@ -2782,7 +2927,7 @@ pub fn document_patch(
     }
     let plan = plan_patch(workdir, &blocks, &normalized, allow_comment_text, tracking)?;
     write_draft(workdir, &header, &plan.blocks)?;
-    if let Err(error) = append_island_edits(workdir, &plan.islands) {
+    if let Err(error) = settle_island_edits(workdir, &plan.islands, &plan.absorbed) {
         // edit.md is the contract surface: a sidecar failure must not leave a
         // batch the caller believes failed sitting in the draft.
         let _ = fs::write(workdir.join(PROJECTION_FILE), &original);

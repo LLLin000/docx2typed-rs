@@ -544,6 +544,144 @@ fn a_dry_run_checks_a_structural_edit_instead_of_calling_it_empty() {
 }
 
 #[test]
+fn a_second_edit_in_a_leaf_the_first_rewrote_merges_into_one_island() {
+    let (dir, workdir) = opened("leaf-composition");
+    let first = handle(&workdir, "中文区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": first, "replace_with": "中文区块区域内容A" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+
+    // The second edit shrinks a span inside the very leaf the first one rewrote.
+    // Its offsets are the caller's, and the leaf already carries an edit, so the
+    // two spaces no longer agree — which is the state that used to record a
+    // SECOND island over the same bytes and build a `word/document.xml` with an
+    // unclosed `w:t`. Measured on a scratch copy of a real patent: 6 saves
+    // reported `output-not-verified` and had each already written the malformed
+    // file to the path the caller asked for.
+    let second = handle(&workdir, "中文区块区域内容A");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": second, "replace_with": "中文区域内容A" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+
+    let islands =
+        std::fs::read_to_string(Path::new(&workdir).join("islands.json")).expect("islands.json");
+    let parsed: Value = serde_json::from_str(&islands).expect("islands json");
+    let edits = parsed["edits"].as_array().expect("edits");
+    assert!(!edits.is_empty(), "no island recorded: {islands}");
+    let mut leaves: Vec<(String, u64)> = edits
+        .iter()
+        .map(|edit| {
+            (
+                edit["paragraph_id"].as_str().unwrap_or("").to_string(),
+                edit["leaf_index"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    leaves.sort();
+    let mut unique = leaves.clone();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        leaves.len(),
+        "two islands address one leaf, and the build splices both over the same bytes: {islands}"
+    );
+
+    // And the file it publishes is the document the workdir describes.
+    let out = dir.join("composed.docx");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let text = built_text(&out);
+    assert!(
+        text.contains("中文区域内容A"),
+        "both edits reached the file: {text}"
+    );
+}
+
+#[test]
+fn a_save_publishes_only_what_it_verified() {
+    let (dir, workdir) = opened("save-publish");
+    let target = handle(&workdir, "中文区域内容");
+    let out = dir.join("published.docx");
+    std::fs::write(&out, b"a file that was here first").expect("placeholder");
+
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": target, "replace_with": "中文区块区域内容" }] }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+    assert!(
+        built_text(&out).contains("中文区块区域内容"),
+        "the publish replaced the old file with the built package"
+    );
+    // The build happens out of the way: nothing of it is left beside the file,
+    // and the evidence the build and the verification wrote travels with the
+    // document to the name it was published under.
+    let mut staged: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&*dir).expect("scratch dir") {
+        let name = entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if name.contains(".building-") {
+            staged.push(name);
+        }
+    }
+    assert!(
+        staged.is_empty(),
+        "a staged build was left behind: {staged:?}"
+    );
+    assert!(
+        out.with_file_name("published.docx.evidence.json").is_file(),
+        "the build's evidence did not follow the document to its published name"
+    );
+
+    // A save that cannot write where it was told must not leave anything there:
+    // the workdir itself is a directory, so the publish has nowhere to land.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": workdir })),
+    ]);
+    assert_ne!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert!(
+        Path::new(&workdir).is_dir(),
+        "a refused save damaged the workdir it was pointed at"
+    );
+    let mut leftovers: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&*dir).expect("scratch dir") {
+        let name = entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if name.contains(".building-") {
+            leftovers.push(name);
+        }
+    }
+    assert!(
+        leftovers.is_empty(),
+        "a refused save left a staged build behind: {leftovers:?}"
+    );
+}
+
+#[test]
 fn find_reports_its_coverage_rather_than_implying_it_saw_everything() {
     let (_dir, workdir) = opened("coverage");
     let replies = mcp(&[
