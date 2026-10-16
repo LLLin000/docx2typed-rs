@@ -708,12 +708,81 @@ fn find_handle(workdir: &str, query: &str) -> Result<String, String> {
         .ok_or_else(|| format!("no handle for {query:?}: {entry}"))
 }
 
+/// A sequence failure, identified by WHAT broke and WHERE — never by its wording,
+/// which changes with every message edit.
+#[derive(Clone, Debug)]
+struct SequenceFailure {
+    step: usize,
+    /// The invariant that broke, from a closed set: `replace`, `insert`,
+    /// `delete`, `save`, `projection-missing`, `projection-stale`,
+    /// `island-per-leaf`, `dry-run-changed`, `refused-batch-accepted`,
+    /// `refused-batch-changed`, `insert-no-change`, `delete-no-change`,
+    /// `stale-accepted`, `stale-changed`.
+    kind: &'static str,
+    detail: String,
+}
+
+impl SequenceFailure {
+    fn new(step: usize, kind: &'static str, detail: String) -> Self {
+        SequenceFailure { step, kind, detail }
+    }
+}
+
+impl std::fmt::Display for SequenceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "step {}: {}: {}",
+            self.step, self.kind, self.detail
+        )
+    }
+}
+
+/// Outcomes that are known and TRACKED, as `(seed, step, kind)`.
+///
+/// A failure matching its entry is an expected failure. Anything else about that
+/// seed — a different step, a different invariant — is a NEW defect and fails the
+/// sweep, and a registered seed that stops failing is reported too, so the entry
+/// cannot quietly become an exemption. Empty right now: both defects the wider op
+/// space found are fixed and pinned by deterministic tests.
+const KNOWN_FAILURES: [(u64, usize, &str); 0] = [];
+
+/// What a seed's outcome means against the register.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Pass,
+    /// Unregistered, or registered under different terms.
+    Fail,
+    /// Exactly the failure that was registered.
+    Xfail,
+    /// Registered, but no longer failing — the entry is stale.
+    Xpass,
+}
+
+fn classify(
+    registered: Option<(usize, &'static str)>,
+    actual: Option<&SequenceFailure>,
+) -> Verdict {
+    match (registered, actual) {
+        (None, None) => Verdict::Pass,
+        (None, Some(_)) => Verdict::Fail,
+        (Some((step, kind)), Some(failure)) => {
+            if failure.step == step && failure.kind == kind {
+                Verdict::Xfail
+            } else {
+                Verdict::Fail
+            }
+        }
+        (Some(_), None) => Verdict::Xpass,
+    }
+}
+
 /// One sequence, from its seed alone.
 ///
 /// The log is written into the caller's buffer as the sequence runs, so it
 /// survives the failure it is meant to explain — a log returned only on success
 /// is a log nobody has when they need it.
-fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), String> {
+fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), SequenceFailure> {
     let (dir, workdir) = opened(&format!("fuzz-{seed}"));
     let out = dir.join("fuzzed.docx");
     let wd = Path::new(&workdir);
@@ -741,7 +810,8 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                     ));
                     continue;
                 }
-                let handle = find_handle(&workdir, &slots[slot])?;
+                let handle = find_handle(&workdir, &slots[slot])
+                    .map_err(|detail| SequenceFailure::new(step, "find", detail))?;
                 let replies = mcp(&[
                     ("document_open", json!({ "source": workdir })),
                     (
@@ -750,9 +820,13 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                     ),
                 ]);
                 if outcome(&replies[1]) != "success" {
-                    return Err(format!(
-                        "{step}: replace slot {slot} {:?} -> {target:?} failed: {:?}",
-                        slots[slot], replies[1]
+                    return Err(SequenceFailure::new(
+                        step,
+                        "replace",
+                        format!(
+                            "replace slot {slot} {:?} -> {target:?} failed: {:?}",
+                            slots[slot], replies[1]
+                        ),
                     ));
                 }
                 log.push(format!(
@@ -760,13 +834,15 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                     slots[slot]
                 ));
                 slots[slot] = target.to_string();
-                assert_islands_cover_distinct_leaves(wd);
+                assert_islands_cover_distinct_leaves(wd)
+                    .map_err(|detail| SequenceFailure::new(step, "island-per-leaf", detail))?;
             }
             // A dry run: it must change nothing, and it must report the same
             // verdict the real call would.
             2 => {
                 let slot = rng.below(3) as usize;
-                let handle = find_handle(&workdir, &slots[slot])?;
+                let handle = find_handle(&workdir, &slots[slot])
+                    .map_err(|detail| SequenceFailure::new(step, "find", detail))?;
                 let before = content_digest(wd);
                 let replies = mcp(&[
                     ("document_open", json!({ "source": workdir })),
@@ -778,17 +854,26 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                     ),
                 ]);
                 if outcome(&replies[1]) != "success" {
-                    return Err(format!("{step}: dry run failed: {:?}", replies[1]));
+                    return Err(SequenceFailure::new(
+                        step,
+                        "dry-run-changed",
+                        format!("dry run failed: {:?}", replies[1]),
+                    ));
                 }
                 if content_digest(wd) != before {
-                    return Err(format!("{step}: a dry run changed the workdir"));
+                    return Err(SequenceFailure::new(
+                        step,
+                        "dry-run-changed",
+                        "a dry run changed the workdir".to_string(),
+                    ));
                 }
                 log.push(format!("{step}: dry run on slot {slot}"));
             }
             // A batch that cannot be applied: it must leave the workdir exactly
             // as it found it.
             3 => {
-                let handle = find_handle(&workdir, &slots[rng.below(3) as usize])?;
+                let handle = find_handle(&workdir, &slots[rng.below(3) as usize])
+                    .map_err(|detail| SequenceFailure::new(step, "find", detail))?;
                 let before = content_digest(wd);
                 let replies = mcp(&[
                     ("document_open", json!({ "source": workdir })),
@@ -801,10 +886,18 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                     ),
                 ]);
                 if outcome(&replies[1]) == "success" {
-                    return Err(format!("{step}: a batch with a bogus handle succeeded"));
+                    return Err(SequenceFailure::new(
+                        step,
+                        "refused-batch-accepted",
+                        "a batch with a bogus handle succeeded".to_string(),
+                    ));
                 }
                 if content_digest(wd) != before {
-                    return Err(format!("{step}: a refused batch changed the workdir"));
+                    return Err(SequenceFailure::new(
+                        step,
+                        "refused-batch-changed",
+                        "a refused batch changed the workdir".to_string(),
+                    ));
                 }
                 log.push(format!("{step}: refused batch"));
             }
@@ -817,7 +910,8 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                 }
                 let text = INSERT_TEXTS[next_insert];
                 let slot = rng.below(3) as usize;
-                let handle = find_handle(&workdir, &slots[slot])?;
+                let handle = find_handle(&workdir, &slots[slot])
+                    .map_err(|detail| SequenceFailure::new(step, "find", detail))?;
                 let before = content_digest(wd);
                 let replies = mcp(&[
                     ("document_open", json!({ "source": workdir })),
@@ -829,17 +923,24 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                     ),
                 ]);
                 if outcome(&replies[1]) != "success" {
-                    return Err(format!("{step}: insert {text:?} failed: {:?}", replies[1]));
+                    return Err(SequenceFailure::new(
+                        step,
+                        "insert",
+                        format!("insert {text:?} failed: {:?}", replies[1]),
+                    ));
                 }
                 if content_digest(wd) == before {
-                    return Err(format!(
-                        "{step}: an insert reported success and changed nothing"
+                    return Err(SequenceFailure::new(
+                        step,
+                        "insert-no-change",
+                        "an insert reported success and changed nothing".to_string(),
                     ));
                 }
                 next_insert += 1;
                 live.push(text.to_string());
                 log.push(format!("{step}: insert_after slot {slot} -> {text:?}"));
-                assert_islands_cover_distinct_leaves(wd);
+                assert_islands_cover_distinct_leaves(wd)
+                    .map_err(|detail| SequenceFailure::new(step, "island-per-leaf", detail))?;
             }
             // And deleted again. Its handle is captured first, so the paragraph
             // is addressed the way a caller would address it.
@@ -851,7 +952,8 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                 let index = rng.below(live.len() as u64) as usize;
                 let text = live[index].clone();
                 let before_digest = content_digest(wd);
-                let handle = find_handle(&workdir, &text)?;
+                let handle = find_handle(&workdir, &text)
+                    .map_err(|detail| SequenceFailure::new(step, "find", detail))?;
                 let replies = mcp(&[
                     ("document_open", json!({ "source": workdir })),
                     (
@@ -860,11 +962,17 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                     ),
                 ]);
                 if outcome(&replies[1]) != "success" {
-                    return Err(format!("{step}: delete {text:?} failed: {:?}", replies[1]));
+                    return Err(SequenceFailure::new(
+                        step,
+                        "delete",
+                        format!("delete {text:?} failed: {:?}", replies[1]),
+                    ));
                 }
                 if content_digest(wd) == before_digest {
-                    return Err(format!(
-                        "{step}: a delete reported success and changed nothing"
+                    return Err(SequenceFailure::new(
+                        step,
+                        "delete-no-change",
+                        "a delete reported success and changed nothing".to_string(),
                     ));
                 }
                 live.remove(index);
@@ -894,14 +1002,17 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                     ),
                 ]);
                 if outcome(&replies[1]) == "success" {
-                    return Err(format!(
-                        "{step}: a stale handle was accepted as an edit: {:?}",
-                        replies[1]
+                    return Err(SequenceFailure::new(
+                        step,
+                        "stale-accepted",
+                        format!("a stale handle was accepted as an edit: {:?}", replies[1]),
                     ));
                 }
                 if content_digest(wd) != before_stale {
-                    return Err(format!(
-                        "{step}: a refused stale-handle edit changed the workdir"
+                    return Err(SequenceFailure::new(
+                        step,
+                        "stale-changed",
+                        "a refused stale-handle edit changed the workdir".to_string(),
                     ));
                 }
                 log.push(format!("{step}: stale handle refused"));
@@ -914,13 +1025,21 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                     ("document_save", json!({ "output": out.to_string_lossy() })),
                 ]);
                 if outcome(&replies[1]) != "success" {
-                    return Err(format!("{step}: save failed: {:?}", replies[1]));
+                    return Err(SequenceFailure::new(
+                        step,
+                        "save",
+                        format!("save failed: {:?}", replies[1]),
+                    ));
                 }
                 let built = built_text(&out);
                 for (slot, current) in slots.iter().enumerate() {
                     if !built.contains(current) {
-                        return Err(format!(
-                            "{step}: the saved file does not carry slot {slot} {current:?}: {built}"
+                        return Err(SequenceFailure::new(
+                            step,
+                            "projection-missing",
+                            format!(
+                                "the saved file does not carry slot {slot} {current:?}: {built}"
+                            ),
                         ));
                     }
                     for other in SLOT_TARGETS[slot]
@@ -928,27 +1047,40 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
                         .filter(|target| **target != current)
                     {
                         if built.contains(other) {
-                            return Err(format!(
-                                "{step}: the saved file still carries {other:?} while slot {slot}                                  reads {current:?}: {built}"
+                            return Err(SequenceFailure::new(
+                                step,
+                                "projection-stale",
+                                format!(
+                                    "the saved file still carries {other:?} while slot {slot} \
+                                     reads {current:?}: {built}"
+                                ),
                             ));
                         }
                     }
                 }
                 for text in &live {
                     if !built.contains(text) {
-                        return Err(format!(
-                            "{step}: the saved file lost the inserted paragraph {text:?}: {built}"
+                        return Err(SequenceFailure::new(
+                            step,
+                            "projection-missing",
+                            format!("the saved file lost the inserted paragraph {text:?}: {built}"),
                         ));
                     }
                 }
                 for text in &deleted {
                     if built.contains(text) {
-                        return Err(format!(
-                            "{step}: the saved file still carries the deleted paragraph {text:?}:                              {built}"
+                        return Err(SequenceFailure::new(
+                            step,
+                            "projection-stale",
+                            format!(
+                                "the saved file still carries the deleted paragraph {text:?}: \
+                                 {built}"
+                            ),
                         ));
                     }
                 }
-                assert_islands_cover_distinct_leaves(wd);
+                assert_islands_cover_distinct_leaves(wd)
+                    .map_err(|detail| SequenceFailure::new(step, "island-per-leaf", detail))?;
                 saved_any = true;
                 log.push(format!(
                     "{step}: save (slots {:?}, live {live:?}, deleted {deleted:?})",
@@ -965,47 +1097,53 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), St
             ("document_save", json!({ "output": out.to_string_lossy() })),
         ]);
         if outcome(&replies[1]) != "success" {
-            return Err(format!("final save failed: {:?}", replies[1]));
+            return Err(SequenceFailure::new(
+                steps,
+                "save",
+                format!("final save failed: {:?}", replies[1]),
+            ));
         }
     }
     Ok(())
 }
 
-/// Seeds whose failure is KNOWN and open, so that a wider sweep reports what it
-/// is instead of a mystery. Each entry names the defect and the shortest calls
-/// that show it, and the replay path still runs the seed — that is how the
-/// failure is reproduced while it is open. Remove the entry when it is fixed.
-///
-/// seed 6 — a paragraph that carries an island, with pending inserted paragraphs
-/// around it: the canonical `typed.md` ends up with ANOTHER paragraph's body in
-/// its slot, and every later edit of that paragraph fails `current-not-changed`
-/// (the projection never changes again). Shortest calls, verified by hand:
-///
-/// ```text
-/// replace P2's span (第一区域 -> 丁丁丁)          -> success
-/// insert_after(P1's paragraph, 插段一)          -> success
-/// replace P2's span (丁丁丁 -> 丙丙丙)           -> success
-/// insert_after(P2's paragraph, 插段二)          -> success
-///     typed.md now reads 插段一 where P2's body belongs
-/// replace P2's span (丙丙丙 -> 丁丁丁)           -> failure current-not-changed
-/// ```
-/// seed 11 — three paragraphs inserted after the same anchor (chained), then the
-/// MIDDLE one deleted: the third paragraph's `insert_before` still names it, and
-/// the build refuses the whole workdir with `unknown insert_before paragraph`.
-/// Deleting a link has to re-point whatever anchored on it; the draft already
-/// shows the right order, so the structure recording is what loses it.
-///
-/// ```text
-/// insert_after slot 2 -> 插段一 / 插段二 / 插段三   -> success
-/// delete 插段二                                  -> success
-/// save                                            -> failure
-///     invalid-structure: unknown insert_before paragraph: P6
-/// ```
-const KNOWN_FAILING_SEEDS: [u64; 2] = [6, 11];
-
 /// Where a failing seed's artifact goes, and how to replay it.
 fn fuzz_artifact_dir() -> PathBuf {
     repo_root().join("target").join("sequence-fuzz")
+}
+
+/// The register's four rules, checked directly: a registered failure is expected,
+/// another failure of the same seed is not, and a registered seed that stops
+/// failing is reported rather than silently dropped.
+#[test]
+fn the_known_failure_register_is_strict() {
+    let failure = |step, kind| SequenceFailure::new(step, kind, "detail".to_string());
+    assert_eq!(classify(None, None), Verdict::Pass);
+    assert_eq!(
+        classify(None, Some(&failure(3, "save"))),
+        Verdict::Fail,
+        "an unregistered failure is a failure"
+    );
+    assert_eq!(
+        classify(Some((3, "save")), Some(&failure(3, "save"))),
+        Verdict::Xfail,
+        "the registered step and invariant is the expected failure"
+    );
+    assert_eq!(
+        classify(Some((3, "save")), Some(&failure(2, "save"))),
+        Verdict::Fail,
+        "the same seed failing EARLIER is a different defect"
+    );
+    assert_eq!(
+        classify(Some((3, "save")), Some(&failure(3, "projection-stale"))),
+        Verdict::Fail,
+        "the same step failing a different invariant is a different defect"
+    );
+    assert_eq!(
+        classify(Some((3, "save")), None),
+        Verdict::Xpass,
+        "a registered failure that stopped happening is reported, not ignored"
+    );
 }
 
 #[test]
@@ -1037,17 +1175,33 @@ fn sequence_fuzz() {
         .unwrap_or(8);
 
     for seed in 1..=seeds {
-        if KNOWN_FAILING_SEEDS.contains(&seed) {
-            println!(
-                "seed {seed} is a known open defect (see KNOWN_FAILING_SEEDS); replay it with \
-                 SEQUENCE_FUZZ_SEED={seed}"
-            );
-            continue;
-        }
+        let registered = KNOWN_FAILURES
+            .iter()
+            .find(|(known, _, _)| *known == seed)
+            .map(|(_, step, kind)| (*step, *kind));
         let mut log = Vec::new();
-        let Err(error) = run_sequence(seed, steps, &mut log) else {
-            continue;
-        };
+        let outcome = run_sequence(seed, steps, &mut log);
+        match classify(registered, outcome.as_ref().err()) {
+            Verdict::Pass | Verdict::Xfail => {
+                if classify(registered, outcome.as_ref().err()) == Verdict::Xfail {
+                    println!(
+                        "seed {seed}: expected failure (step {}, {}) — still open",
+                        registered.expect("registered").0,
+                        registered.expect("registered").1
+                    );
+                }
+                continue;
+            }
+            Verdict::Xpass => {
+                panic!(
+                    "seed {seed} no longer fails the way it is registered ({:?}) — delete its \
+                     entry from KNOWN_FAILURES, and keep the regression it earned",
+                    registered
+                );
+            }
+            Verdict::Fail => {}
+        }
+        let error = outcome.expect_err("a failing seed has a failure");
         // Shrink: the shortest prefix that still fails is the repro worth
         // keeping, and finding it is one replay per length. Ops are generated
         // from the observed state, so a prefix of the steps is a prefix of the
@@ -1070,7 +1224,11 @@ fn sequence_fuzz() {
             serde_json::to_vec_pretty(&json!({
                 "seed": seed,
                 "shortest_failing_steps": shortest.0,
-                "failure": shortest.1,
+                "failure": {
+                    "step": shortest.1.step,
+                    "kind": shortest.1.kind,
+                    "detail": shortest.1.detail,
+                },
                 "log": shortest_log,
                 "replay": format!(
                     "SEQUENCE_FUZZ_SEED={seed} SEQUENCE_FUZZ_STEPS={} cargo test --test \
@@ -1431,6 +1589,197 @@ fn two_paragraphs_after_one_anchor_chain_and_still_build() {
     );
 }
 
+/// The projection is keyed by the paragraph's IDENTITY, not by its position in
+/// the built file. Measured before the fix: one inserted paragraph renumbered
+/// everything after it, `typed.md` showed the inserted paragraph's body in P2's
+/// slot, and every later edit of P2 was refused `current-not-changed` — the
+/// canonical projection never changed again, so P2 could not be edited at all.
+/// Deleting a paragraph that another synthesised paragraph anchored on has to
+/// move the anchor, in the order the draft shows. Measured before the fix:
+/// deleting the middle one of three chained inserts left the third one's
+/// `insert_before` naming a paragraph that no longer existed, and the workdir
+/// stopped building for good (`invalid-structure: unknown insert_before
+/// paragraph: P6`).
+#[test]
+fn deleting_a_paragraph_that_anchors_others_keeps_the_document_buildable() {
+    let (dir, workdir) = opened("chain-delete");
+    let out = dir.join("deleted.docx");
+    let anchor = handle(&workdir, "EnglishRegion");
+
+    // Three paragraphs after the same anchor: the draft reads 插段三, 插段二,
+    // 插段一 (each lands immediately after the anchor), so each one anchors on the
+    // one inserted before it.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "kind": "insert_after", "handle": anchor.clone(), "text": "插段一" }] }),
+        ),
+        (
+            "document_edit",
+            json!({ "edits": [{ "kind": "insert_after", "handle": anchor.clone(), "text": "插段二" }] }),
+        ),
+        (
+            "document_edit",
+            json!({ "edits": [{ "kind": "insert_after", "handle": anchor.clone(), "text": "插段三" }] }),
+        ),
+    ]);
+    for reply in replies.iter().skip(1) {
+        assert_eq!(outcome(reply), "success", "{reply:?}");
+    }
+
+    let delete_and_save = |text: &str, expected: &[&str], absent: &[&str]| {
+        let handle = handle(&workdir, text);
+        let replies = mcp(&[
+            ("document_open", json!({ "source": workdir })),
+            (
+                "document_edit",
+                json!({ "edits": [{ "kind": "delete", "handle": handle }] }),
+            ),
+            ("document_save", json!({ "output": out.to_string_lossy() })),
+        ]);
+        assert_eq!(
+            outcome(&replies[1]),
+            "success",
+            "deleting {text:?} failed: {:?}",
+            replies[1]
+        );
+        assert_eq!(
+            outcome(&replies[2]),
+            "success",
+            "the document stopped building after deleting {text:?}: {:?}",
+            replies[2]
+        );
+        let built = built_text(&out);
+        for kept in expected {
+            assert!(built.contains(kept), "{kept:?} was lost: {built}");
+        }
+        for gone in absent {
+            assert!(!built.contains(gone), "{gone:?} is still there: {built}");
+        }
+        built
+    };
+
+    // The middle one: the third anchored on it, and has to land where it would
+    // have — before 插段一, which is the order the draft shows.
+    let built = delete_and_save("插段二", &["插段三", "插段一"], &["插段二"]);
+    assert!(
+        built.find("插段三") < built.find("插段一"),
+        "the surviving chain came out in the wrong order: {built}"
+    );
+    // Then the tail of what is left, then the head.
+    delete_and_save("插段一", &["插段三"], &["插段一", "插段二"]);
+    delete_and_save(
+        "插段三",
+        &["EnglishRegion"],
+        &["插段三", "插段二", "插段一"],
+    );
+
+    // And deleting two of them in a row.
+    let anchor = handle(&workdir, "EnglishRegion");
+    let _ = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "kind": "insert_after", "handle": anchor.clone(), "text": "插段四" }] }),
+        ),
+        (
+            "document_edit",
+            json!({ "edits": [{ "kind": "insert_after", "handle": anchor.clone(), "text": "插段五" }] }),
+        ),
+    ]);
+    delete_and_save("插段五", &["插段四"], &["插段五"]);
+    delete_and_save("插段四", &["EnglishRegion"], &["插段四", "插段五"]);
+}
+
+#[test]
+fn a_paragraph_keeps_its_projection_across_inserts_and_repeated_edits() {
+    let (dir, workdir) = opened("identity");
+    let wd = Path::new(&workdir);
+    let typed = |tag: &str| -> String {
+        let text = std::fs::read_to_string(wd.join("typed.md")).expect("typed.md");
+        let mut out = String::new();
+        let mut take = false;
+        for line in text.lines() {
+            if line.starts_with("<!--@p id=") || line.starts_with("<!--@new ") {
+                take = line.contains("P2");
+                continue;
+            }
+            if take && !line.starts_with("<!--") {
+                out.push_str(line);
+                take = false;
+            }
+        }
+        format!("{tag}: {out}")
+    };
+
+    let span = handle(&workdir, "第一区域");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": span, "replace_with": "丁丁丁" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert!(typed("after the first replace").contains("丁丁丁"));
+
+    // Insert a paragraph BEFORE the one being edited: this is what renumbered the
+    // ids when they were minted by position.
+    let anchor = handle(&workdir, "EnglishRegion");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "kind": "insert_after", "handle": anchor, "text": "插段一" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+
+    // The paragraph is still itself, and still editable — three replacements in a
+    // row, each of which has to reach the canonical projection.
+    for (from, to) in [
+        ("丁丁丁", "丙丙丙"),
+        ("丙丙丙", "丁丁丁"),
+        ("丁丁丁", "丙丙丙"),
+    ] {
+        let handle = handle(&workdir, from);
+        let replies = mcp(&[
+            ("document_open", json!({ "source": workdir })),
+            (
+                "document_edit",
+                json!({ "edits": [{ "handle": handle, "replace_with": to }] }),
+            ),
+        ]);
+        assert_eq!(
+            outcome(&replies[1]),
+            "success",
+            "the paragraph stopped being editable after {from} -> {to}: {:?}",
+            replies[1]
+        );
+        let projected = typed(&format!("after {from} -> {to}"));
+        assert!(
+            projected.contains(to),
+            "the canonical projection does not carry the edit: {projected}"
+        );
+        assert!(
+            !projected.contains("插段一"),
+            "the projection of P2 carries the inserted paragraph's body: {projected}"
+        );
+    }
+
+    // And the file it publishes says the same as the projection.
+    let out = dir.join("identity.docx");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let built = built_text(&out);
+    assert!(built.contains("丙丙丙第二区域"), "{built}");
+    assert!(built.contains("插段一"), "{built}");
+}
+
 #[test]
 fn an_edit_sequence_across_calls_keeps_one_island_per_leaf_and_one_version() {
     let (dir, workdir) = opened("sequence");
@@ -1449,7 +1798,7 @@ fn an_edit_sequence_across_calls_keeps_one_island_per_leaf_and_one_version() {
     ]);
     assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
     let after_first = content_digest(wd);
-    assert_islands_cover_distinct_leaves(wd);
+    assert_islands_cover_distinct_leaves(wd).expect("one island per leaf");
 
     let second = handle(&workdir, "中文区块区域内容");
     let replies = mcp(&[
@@ -1460,7 +1809,7 @@ fn an_edit_sequence_across_calls_keeps_one_island_per_leaf_and_one_version() {
         ),
     ]);
     assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
-    assert_islands_cover_distinct_leaves(wd);
+    assert_islands_cover_distinct_leaves(wd).expect("one island per leaf");
 
     let third = handle(&workdir, "中文区域内容A");
     let before_dry = content_digest(wd);
@@ -1506,7 +1855,7 @@ fn an_edit_sequence_across_calls_keeps_one_island_per_leaf_and_one_version() {
     let rebuilt = built_text(&out);
     assert!(rebuilt.contains("中文区域内容"), "{rebuilt}");
     assert!(!rebuilt.contains("中文区域内容A"), "{rebuilt}");
-    assert_islands_cover_distinct_leaves(wd);
+    assert_islands_cover_distinct_leaves(wd).expect("one island per leaf");
 
     // 8-9: a batch that cannot be applied, then continuing as if it never was.
     // The refusal must leave the workdir exactly as it found it.
@@ -1554,14 +1903,16 @@ fn an_edit_sequence_across_calls_keeps_one_island_per_leaf_and_one_version() {
 
 /// One island per leaf, across every call the sequence made. A workdir that has
 /// recorded nothing yet satisfies it trivially.
-fn assert_islands_cover_distinct_leaves(workdir: &Path) {
+fn assert_islands_cover_distinct_leaves(workdir: &Path) -> Result<(), String> {
     let path = workdir.join("islands.json");
     if !path.is_file() {
-        return;
+        return Ok(());
     }
-    let islands = std::fs::read_to_string(&path).expect("islands.json");
-    let parsed: Value = serde_json::from_str(&islands).expect("islands json");
-    let edits = parsed["edits"].as_array().expect("edits");
+    let islands = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let parsed: Value = serde_json::from_str(&islands).map_err(|error| error.to_string())?;
+    let edits = parsed["edits"]
+        .as_array()
+        .ok_or_else(|| format!("islands.json carries no edits array: {islands}"))?;
     let mut leaves: Vec<(String, u64)> = edits
         .iter()
         .map(|edit| {
@@ -1574,11 +1925,12 @@ fn assert_islands_cover_distinct_leaves(workdir: &Path) {
     leaves.sort();
     let mut unique = leaves.clone();
     unique.dedup();
-    assert_eq!(
-        unique.len(),
-        leaves.len(),
-        "two islands address one leaf, which the build cannot splice: {islands}"
-    );
+    if unique.len() != leaves.len() {
+        return Err(format!(
+            "two islands address one leaf, which the build cannot splice: {islands}"
+        ));
+    }
+    Ok(())
 }
 
 #[test]

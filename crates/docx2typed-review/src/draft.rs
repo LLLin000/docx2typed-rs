@@ -1448,6 +1448,47 @@ pub fn insert_paragraph(
     Ok(result)
 }
 
+/// Point whatever anchored on `deleted` at the place `deleted` would have been.
+///
+/// A synthesised paragraph can be another one's anchor — the structure chains
+/// them, because the second insert was sent "after the same paragraph" and the
+/// draft already showed the first one there. Deleting the anchor used to leave
+/// that reference hanging, and the build refuses the whole workdir for it,
+/// permanently: measured, every later `document_save` failed with
+/// `invalid-structure: unknown insert_before paragraph: P6` and nothing on the
+/// caller's side could undo it.
+///
+/// The dependent takes the deleted paragraph's OWN anchor, which is where the
+/// deleted one would have landed. That is the order the draft shows; the
+/// predecessor's position is not an answer, because `insert_before` plus the
+/// same-offset rule already places the paragraphs around it.
+fn repoint_dependents(workdir: &Path, deleted: &str) -> Result<(), CollaborationError> {
+    let mut structure = docx2typed_core::prose::load_structure(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let Some(anchor) = structure
+        .new_paragraphs
+        .iter()
+        .find(|paragraph| paragraph.paragraph_id == deleted)
+        .map(|paragraph| paragraph.insert_before.clone())
+    else {
+        // A baseline paragraph: the build already falls forward past one of
+        // those, so there is nothing to record.
+        return Ok(());
+    };
+    let mut changed = false;
+    for paragraph in structure.new_paragraphs.iter_mut() {
+        if paragraph.insert_before.as_deref() == Some(deleted) {
+            paragraph.insert_before = anchor.clone();
+            changed = true;
+        }
+    }
+    if changed {
+        docx2typed_core::prose::save_structure(workdir, &structure)
+            .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    }
+    Ok(())
+}
+
 /// The `delete_paragraph` tool body: remove the block, append a delete
 /// marker.
 pub fn delete_paragraph(workdir: &Path, paragraph_id: &str) -> Result<Value, CollaborationError> {
@@ -1477,6 +1518,10 @@ pub fn delete_paragraph(workdir: &Path, paragraph_id: &str) -> Result<Value, Col
         paragraph_id,
         "paragraph with protected structure cannot be deleted",
     )?;
+    // Fail closed before the draft is touched: an anchor this paragraph gave to
+    // another synthesised paragraph has to move first, or the workdir stops
+    // building.
+    repoint_dependents(workdir, paragraph_id)?;
     blocks.remove(index);
     blocks.push(format!("<!--@delete id=\"{paragraph_id}\"-->"));
     write_draft(workdir, &header, &blocks)?;
@@ -3894,17 +3939,33 @@ pub fn apply_projection_with_options(
     // The draft dialect cannot be the source either: it spells a revision as a
     // token with nowhere to put the text, the author or the date, so a tracked
     // edit produced a projection with no revision in it at all.
+    // Keyed by the ids the BUILD decided on, never by scanning the result: a scan
+    // mints `P{n}` by position, so one inserted paragraph renumbers everything
+    // after it, and this map then hands P2 the body of the paragraph that was
+    // inserted before it. Measured: `typed.md` showed `插段一` in P2's slot and
+    // every later edit of P2 was refused `current-not-changed`, because the
+    // projection never changed again. A build that cannot run leaves the map
+    // empty (the commit refuses on its own terms); a map whose ids and paragraphs
+    // disagree is a refusal, because that projection would be a lie about the
+    // file.
     let current_markup: std::collections::BTreeMap<String, String> =
-        docx2typed_core::prose::apply_build(
+        match docx2typed_core::prose::apply_build(
             &workdir.join("_template.docx"),
             &islands,
             &structure,
             &docx2typed_core::prose::load_rpr_edits(workdir).unwrap_or_default(),
             &docx2typed_core::prose::load_style_rprs_for(workdir).unwrap_or_default(),
-        )
-        .ok()
-        .and_then(|(package, _)| docx2typed_core::prose::paragraph_markup_map(&package).ok())
-        .unwrap_or_default();
+        ) {
+            Ok(build) if build.document_ids.is_empty() => {
+                docx2typed_core::prose::paragraph_markup_map(&build.package).unwrap_or_default()
+            }
+            Ok(build) => docx2typed_core::prose::paragraph_markup_map_with_ids(
+                &build.package,
+                &build.document_ids,
+            )
+            .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?,
+            Err(_) => std::collections::BTreeMap::new(),
+        };
 
     let typed_path = workdir.join("typed.md");
     let mut typed = String::new();

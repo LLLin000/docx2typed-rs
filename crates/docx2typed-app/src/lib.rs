@@ -866,7 +866,7 @@ impl Engine {
                 // surgery and structural synthesis to the template bytes
                 // (revalidated here; plan_build already gated the whole build)
                 // and publish the result.
-                let (bytes, stale_restyles) = match docx2typed_core::prose::apply_build(
+                let build = match docx2typed_core::prose::apply_build(
                     &plan.template,
                     &plan.edits,
                     &plan.structure,
@@ -878,6 +878,7 @@ impl Engine {
                 };
                 // A restyle whose paragraph a structure edit removed is reported,
                 // never dropped silently (#26's class).
+                let (bytes, stale_restyles) = (build.package.clone(), build.stale_restyles.clone());
                 if !stale_restyles.is_empty() {
                     return Ok(OperationOutcome::failure(vec![Diagnostic::new(
                         "rpr-edit-stale",
@@ -2073,10 +2074,11 @@ impl Engine {
                 // Issue #58 / PR 3: edited build through the store: apply
                 // the recorded leaf surgery and structural synthesis to the
                 // template bytes (revalidated) and stage the result.
-                let (bytes, stale) = docx2typed_core::prose::apply_build(
+                let build = docx2typed_core::prose::apply_build(
                     &template, &edits, &structure, &rpr_edits, &styles,
                 )
                 .map_err(|error| StoreError::store("workdir-invalid", error.to_string()))?;
+                let (bytes, stale) = (build.package, build.stale_restyles);
                 if !stale.is_empty() {
                     return Err(StoreError::store(
                         "rpr-edit-stale",

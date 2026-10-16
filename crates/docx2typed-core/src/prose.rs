@@ -2642,7 +2642,46 @@ pub fn serialize_typed(
 /// through `typed_paragraph_block`, so a body produced here is spelled exactly
 /// as one produced for a full projection — two ways of asking for the same
 /// paragraph cannot give two answers.
+/// Every paragraph's markup, keyed by the id the BUILD produced for it.
+///
+/// The document part's ids come from the build (identity); every other part's are
+/// the ones a scan mints, because a structure edit never touches them. The counts
+/// have to agree: a mismatch means the id order and the paragraphs it describes
+/// are not the same document, and a projection written from it would be a lie
+/// about the file — so it is a refusal, not a fallback.
+pub fn paragraph_markup_map_with_ids(
+    package: &[u8],
+    document_ids: &[String],
+) -> Result<BTreeMap<String, String>, CoreError> {
+    let mut ids = document_ids.iter();
+    paragraph_markup_map_by(package, &mut |part_key, scanned| {
+        // The body's typed part key is the EMPTY string (`typed_part_key`); only
+        // the document part is renumbered by a structure edit, so only it takes
+        // the build's ids. Comparing against "document" here matched nothing, and
+        // the map quietly kept the scanned — positional — ids.
+        if part_key.is_empty() {
+            ids.next().cloned().ok_or_else(|| {
+                CoreError::Domain(
+                    "invalid-structure: the build produced more paragraphs than ids for them"
+                        .to_string(),
+                )
+            })
+        } else {
+            Ok(scanned.to_string())
+        }
+    })
+}
+
 pub fn paragraph_markup_map(package: &[u8]) -> Result<BTreeMap<String, String>, CoreError> {
+    paragraph_markup_map_by(package, &mut |_, scanned| Ok(scanned.to_string()))
+}
+
+/// The shared walk: each prepared paragraph's body, under the id `naming` gives
+/// it.
+fn paragraph_markup_map_by(
+    package: &[u8],
+    naming: &mut dyn FnMut(&str, &str) -> Result<String, CoreError>,
+) -> Result<BTreeMap<String, String>, CoreError> {
     let trees = crate::token_table::paragraph_nodes(package)?;
     let catalog = StyleCatalog::build(package)?;
     let (prepared, _promoted) = prepare_paragraphs(&trees, &catalog);
@@ -2658,7 +2697,9 @@ pub fn paragraph_markup_map(package: &[u8]) -> Result<BTreeMap<String, String>, 
             },
             _ => String::new(),
         };
-        out.insert(entry.tree.paragraph_id.clone(), body);
+        let part_key = crate::token_table::typed_part_key(&entry.tree.part);
+        let id = naming(&part_key, &entry.tree.paragraph_id)?;
+        out.insert(id, body);
     }
     Ok(out)
 }
@@ -3847,11 +3888,18 @@ fn strip_ephemeral_p_attrs(opening: &[u8]) -> Vec<u8> {
 /// Splice the structural edits into one document part: deleted paragraphs
 /// are dropped, synthesised paragraphs land before the next surviving
 /// baseline paragraph (or at the append offset).
+/// The spliced part, and the ids of the paragraphs it carries IN DOCUMENT ORDER.
+///
+/// The ids are the document's own identity: the template's keep what extraction
+/// gave them, a synthesised one carries the id the structure recorded. Handing
+/// them out here is what keeps every consumer from re-deriving them by POSITION —
+/// which is wrong the moment one paragraph is inserted, because everything after
+/// it is renumbered.
 fn splice_structure(
     part: &[u8],
     inventory: &ProseInventory,
     edits: &StructureEdits,
-) -> Result<Vec<u8>, CoreError> {
+) -> Result<(Vec<u8>, Vec<String>), CoreError> {
     let located = scan_document(part)?;
     let index_of: BTreeMap<&str, usize> = located
         .iter()
@@ -3864,11 +3912,11 @@ fn splice_structure(
         .map(|paragraph| paragraph.paragraph_id.as_str())
         .collect();
     let append_at = body_append_offset(part)?;
-    let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    let mut spans: Vec<(usize, usize, Vec<u8>, Option<String>)> = Vec::new();
     for paragraph in &edits.deleted_paragraphs {
         let index = index_of[paragraph.paragraph_id.as_str()];
         let (_, start, end) = &located[index];
-        spans.push((*start, *end, Vec::new()));
+        spans.push((*start, *end, Vec::new(), None));
     }
     // Where each synthesised paragraph goes. An anchor may be a paragraph of the
     // template, a paragraph that a delete is removing (fall forward to the next
@@ -3927,23 +3975,45 @@ fn splice_structure(
             at,
             at,
             render_new_paragraph(part, inventory, &located, paragraph)?,
+            Some(paragraph.paragraph_id.clone()),
         ));
     }
-    spans.sort_by_key(|(start, end, _)| (*start, *end));
+    spans.sort_by_key(|(start, end, _, _)| (*start, *end));
+    let survivors: Vec<(usize, &str)> = located
+        .iter()
+        .filter(|(id, _, _)| !deleted.contains(id.as_str()))
+        .map(|(id, start, _)| (*start, id.as_str()))
+        .collect();
+    let mut ids: Vec<String> = Vec::with_capacity(survivors.len() + spans.len());
+    let mut next_survivor = 0usize;
     let mut out = Vec::with_capacity(part.len());
     let mut cursor = 0usize;
-    for (start, end, replacement) in spans {
+    for (start, end, replacement, pending) in spans {
         if start < cursor || end < start {
             return Err(CoreError::Domain(
                 "invalid-structure: overlapping paragraph splices".to_string(),
             ));
         }
+        // Everything the insertion lands past comes first; a paragraph starting
+        // exactly at this offset comes after it, which is what "insert before
+        // this paragraph" means.
+        while next_survivor < survivors.len() && survivors[next_survivor].0 < start {
+            ids.push(survivors[next_survivor].1.to_string());
+            next_survivor += 1;
+        }
+        if let Some(id) = pending {
+            ids.push(id);
+        }
         out.extend_from_slice(&part[cursor..start]);
         out.extend_from_slice(&replacement);
         cursor = end;
     }
+    while next_survivor < survivors.len() {
+        ids.push(survivors[next_survivor].1.to_string());
+        next_survivor += 1;
+    }
     out.extend_from_slice(&part[cursor..]);
-    Ok(out)
+    Ok((out, ids))
 }
 
 /// The full edited build: island leaf surgery first, then the structural
@@ -3955,22 +4025,44 @@ pub fn apply_build(
     structure: &StructureEdits,
     rpr_edits: &[RprEdit],
     styles: &BTreeMap<String, String>,
-) -> Result<(Vec<u8>, Vec<String>), CoreError> {
+) -> Result<BuildOutput, CoreError> {
     let package = apply_edits(template, islands)?;
     // Structural synthesis first: it decides which paragraphs exist, and a
     // restyle addresses paragraphs. Then the property lane over the result.
-    let package = if structure.is_empty() {
-        package
+    let (package, document_ids) = if structure.is_empty() {
+        (package, Vec::new())
     } else {
         validate_structure(template, structure)?;
         let part = read_part_bytes(&package, &part_path("document"))?;
         let inventory = enumerate_package_bytes(&package)?;
-        let new_part = splice_structure(&part, &inventory, structure)?;
-        patch_zip_member(&package, &part_path("document"), &new_part)?
+        let (new_part, ids) = splice_structure(&part, &inventory, structure)?;
+        (
+            patch_zip_member(&package, &part_path("document"), &new_part)?,
+            ids,
+        )
     };
     // A restyle whose paragraph a structure edit removed is reported, never
     // dropped silently and never resurrected (#26's class).
-    apply_rpr_edits(&package, rpr_edits, styles)
+    let (package, stale_restyles) = apply_rpr_edits(&package, rpr_edits, styles)?;
+    Ok(BuildOutput {
+        package,
+        stale_restyles,
+        document_ids,
+    })
+}
+
+/// What one build produced.
+#[derive(Clone, Debug)]
+pub struct BuildOutput {
+    /// The built package.
+    pub package: Vec<u8>,
+    /// Restyles whose paragraph a structure edit removed.
+    pub stale_restyles: Vec<String>,
+    /// The document part's paragraph ids IN DOCUMENT ORDER, by identity. Empty
+    /// when the build carried no structural edit, in which case the paragraph
+    /// ids are the ones a scan of the package mints and every consumer can use
+    /// those.
+    pub document_ids: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -5042,6 +5134,54 @@ mod tests {
             .collect()
     }
 
+    /// The ids a build hands out are the document's IDENTITY, in document order —
+    /// not the ones a scan of the result would mint by position. Measured: an
+    /// inserted paragraph renumbered everything after it, and the projection then
+    /// keyed P2's markup under the inserted paragraph's id.
+    #[test]
+    fn a_built_document_reports_paragraph_ids_by_identity() {
+        let template = fixture("styled.docx");
+        let mut structure = StructureEdits::default();
+        structure.new_paragraphs.push(NewParagraph {
+            part: "document".to_string(),
+            paragraph_id: "P5".to_string(),
+            inherit: "P1".to_string(),
+            body: "插段一".to_string(),
+            insert_before: Some("P2".to_string()),
+            format_policy: FormatPolicy::SafeInherit,
+        });
+        let build = apply_build(&template, &[], &structure, &[], &BTreeMap::new())
+            .expect("build with one inserted paragraph");
+        assert_eq!(
+            build.document_ids,
+            vec![
+                "P0".to_string(),
+                "P1".to_string(),
+                "P5".to_string(),
+                "P2".to_string(),
+                "P3".to_string(),
+                "P4".to_string(),
+            ],
+            "the inserted paragraph has to be named where it lands, not where a scan puts it"
+        );
+
+        // And the markup map keys them the same way: P2 carries its own body.
+        let markup = paragraph_markup_map_with_ids(&build.package, &build.document_ids)
+            .expect("markup by identity");
+        assert!(
+            markup
+                .get("P2")
+                .is_some_and(|body| body.contains("智能") || body.contains("第一")),
+            "P2's markup is not P2's: {:?}",
+            markup.get("P2")
+        );
+        assert_eq!(
+            markup.len(),
+            build.document_ids.len(),
+            "the map and the id list describe different documents"
+        );
+    }
+
     #[test]
     fn new_paragraphs_strip_ephemeral_opening_attributes() {
         // `typed_docx.py` `_EPHEMERAL_P_ATTRS`: identity and revision marks
@@ -5104,8 +5244,9 @@ mod tests {
             }],
         };
         validate_structure(&template, &edits).expect("valid structure edits");
-        let (bytes, stale) =
+        let build =
             apply_build(&template, &[], &edits, &[], &BTreeMap::new()).expect("apply structure");
+        let (bytes, stale) = (build.package, build.stale_restyles);
         assert!(stale.is_empty(), "no restyles were recorded: {stale:?}");
         let package = std::io::Cursor::new(bytes);
         let mut archive = zip::ZipArchive::new(package).expect("zip");
