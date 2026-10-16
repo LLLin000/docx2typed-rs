@@ -1772,9 +1772,29 @@ fn check_protected_structure(
 /// One located leaf with its byte ranges (independent walker).
 struct LocatedLeaf {
     editable: bool,
+    /// false when the projection drops this leaf's text as a revision gap — a
+    /// `w:delText`, or a run inside `w:del` / `w:moveFrom`. The caller's offsets
+    /// are measured in that projection, so the applier must read an island's
+    /// recorded offset the same way or it resolves a different run than the one
+    /// the edit was applied to.
+    projected: bool,
     text_start: usize,
     text_end: usize,
     open_end: usize,
+}
+
+/// Is this element inside a tracked deletion (`w:del` / `w:moveFrom`)?
+///
+/// The projection renders those subtrees as a zero-width revision gap, so their
+/// text is not part of the offsets an island records.
+fn inside_deletion(nodes: &[LightNode], mut index: usize) -> bool {
+    while let Some(parent) = nodes[index].parent {
+        if matches!(nodes[parent].name.as_str(), "del" | "moveFrom") {
+            return true;
+        }
+        index = parent;
+    }
+    false
 }
 
 /// Locate EVERY leaf of one paragraph, in order (independent port of the
@@ -1814,7 +1834,7 @@ fn locate_paragraph_leaves(
     let mut opaque_ranges: Vec<(usize, usize)> = Vec::new();
     collect_opaque_ranges(root, &nodes, &mut opaque_ranges, &mut rpr_ok);
     // walk runs
-    for node in nodes.iter() {
+    for (node_index, node) in nodes.iter().enumerate() {
         if node.name != "r" {
             continue;
         }
@@ -1823,6 +1843,7 @@ fn locate_paragraph_leaves(
             let child_node = &nodes[child];
             !KNOWN_RUN_CHILDREN.contains(&child_node.name.as_str())
         });
+        let in_deletion = inside_deletion(&nodes, node_index);
         for &child in &node.children {
             let child_node = &nodes[child];
             if child_node.name == "t" || child_node.name == "delText" {
@@ -1840,6 +1861,7 @@ fn locate_paragraph_leaves(
                     });
                 leaves.push(LocatedLeaf {
                     editable,
+                    projected: !in_deletion && child_node.name == "t",
                     text_start: start + text_start,
                     text_end: start + text_end,
                     open_end: start + child_node.open_end,
@@ -2428,18 +2450,22 @@ fn edit_run_ranges(
             edit.leaf_index, edit.paragraph_id
         ));
     }
-    // Paragraph-level offset of each run's first char, so an island that records
-    // its own offset can be resolved at that offset. This crate stays
-    // independent of the applier on purpose — that is what makes it a check —
-    // but it must read the same input: one island carries every replacement in
-    // its leaf, and its merged text can occur twice in that leaf, which a
-    // text-only search refuses.
-    let mut prefix: Vec<usize> = Vec::with_capacity(leaves.len());
+    // Paragraph-level offset of each run's first char, in the projection the
+    // island's offset was recorded in — not in the runs, where a revision gap
+    // still has width. This crate stays independent of the applier on purpose —
+    // that is what makes it a check — but it must read the same input: one
+    // island carries every replacement in its leaf, and its merged text can
+    // occur twice in that leaf, which a text-only search refuses. It must also
+    // measure that offset the same way, or a paragraph with a tracked deletion
+    // resolves to a different run than the applier wrote.
+    let mut projected_prefix: Vec<usize> = Vec::with_capacity(leaves.len());
     let mut running = 0usize;
     for leaf in &leaves {
-        prefix.push(running);
-        let (text, _) = decode_text(&part[leaf.text_start..leaf.text_end])?;
-        running += text.chars().count();
+        projected_prefix.push(running);
+        if leaf.projected {
+            let (text, _) = decode_text(&part[leaf.text_start..leaf.text_end])?;
+            running += text.chars().count();
+        }
     }
 
     let mut found: Option<Vec<(usize, usize)>> = None;
@@ -2450,8 +2476,12 @@ fn edit_run_ranges(
         // The recorded offset starts inside this run, or this start is not its
         // business.
         let anchored_head = match edit.char_start {
-            Some(want) if want >= prefix[start] && want < prefix[start] + first_len => {
-                Some(want - prefix[start])
+            Some(want)
+                if first.projected
+                    && want >= projected_prefix[start]
+                    && want < projected_prefix[start] + first_len =>
+            {
+                Some(want - projected_prefix[start])
             }
             Some(_) => continue,
             None => None,
@@ -2654,5 +2684,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("foo"));
+    }
+
+    /// The verifier resolves an island at the offset the island recorded, and
+    /// that offset is a paragraph offset in the PROJECTION — where a tracked
+    /// deletion is a zero-width gap. Counting the deleted characters instead put
+    /// the anchor two places late, so the verifier looked for the edit's text in
+    /// the wrong run and reported a template mismatch on a paragraph the applier
+    /// had written correctly.
+    #[test]
+    fn an_anchor_after_a_tracked_deletion_resolves_the_run_the_applier_wrote() {
+        let part = b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+                     <w:body><w:p><w:r><w:t>AB</w:t></w:r>\
+                     <w:del w:id=\"1\" w:author=\"jinxq\"><w:r><w:delText>XY</w:delText></w:r></w:del>\
+                     <w:r><w:t>CD</w:t></w:r></w:p></w:body></w:document>";
+        let edit = |char_start| IslandEdit {
+            part: "document".to_string(),
+            paragraph_id: "P0".to_string(),
+            leaf_index: 2,
+            char_start: Some(char_start),
+            old: "CD".to_string(),
+            new: "CE".to_string(),
+            tracked: false,
+            author: String::new(),
+            date: String::new(),
+        };
+        let ranges = edit_run_ranges(part, "document", &edit(2)).expect("the run the offset names");
+        let text = String::from_utf8_lossy(&part[ranges[0].0..ranges[0].1]);
+        assert_eq!(text, "CD");
+        assert!(
+            edit_run_ranges(part, "document", &edit(4)).is_err(),
+            "an offset counted over the runs is a different address, not a second chance"
+        );
     }
 }

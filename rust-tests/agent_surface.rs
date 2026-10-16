@@ -470,6 +470,57 @@ fn re_opening_the_same_document_does_not_rebuild_the_baseline() {
 }
 
 #[test]
+fn a_dry_run_checks_a_structural_edit_instead_of_calling_it_empty() {
+    let (_dir, workdir) = opened("dry-structural");
+    let target = handle(&workdir, "中文区域内容");
+    let _ = mcp(&[("document_open", json!({ "source": workdir }))]);
+    let before = content_digest(Path::new(&workdir));
+
+    // `dry_run` is the honest way to try a call whose handle you are unsure of,
+    // so it is the first thing an agent reaches for — and it used to drop every
+    // structural edit, hand the facade an empty replacement list, and report
+    // `edit-empty`, "at least one edit is required", for a call that gave one.
+    // A blind agent tried 20 shapes that way and concluded that inserting a
+    // paragraph was impossible, which is what this test exists to prevent.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({
+                "dry_run": true,
+                "edits": [
+                    { "kind": "insert_after", "handle": target, "text": "新增的一段。" }
+                ]
+            }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let structural = data(&replies[1])
+        .get("structural")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "a dry run reports the structure it checked: {:?}",
+                replies[1]
+            )
+        });
+    assert_eq!(structural.len(), 1, "{structural:?}");
+    assert_eq!(structural[0]["kind"], "insert_after");
+    assert_eq!(structural[0]["capability"], "supported");
+    assert!(
+        structural[0]
+            .get("anchor")
+            .is_some_and(|anchor| !anchor.is_null()),
+        "the preview names the paragraph it resolved: {structural:?}"
+    );
+    assert_eq!(
+        content_digest(Path::new(&workdir)),
+        before,
+        "a dry run wrote to the document"
+    );
+}
+
+#[test]
 fn find_reports_its_coverage_rather_than_implying_it_saw_everything() {
     let (_dir, workdir) = opened("coverage");
     let replies = mcp(&[

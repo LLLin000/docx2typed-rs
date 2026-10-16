@@ -85,6 +85,13 @@ pub struct ProseLeaf {
     /// true when the leaf sits on the editable surface (no opaque node in
     /// its paragraph, run not opaque, not a deletion revision).
     pub editable: bool,
+    /// true when the leaf's text reaches the projection the caller reads, and
+    /// false when the projection drops it as a revision gap: a `w:delText`, or
+    /// any run inside a `w:del` / `w:moveFrom`. Callers' offsets are measured in
+    /// that projection, so a hidden leaf contributes no width to them —
+    /// counting it here is what made an anchored `char_start` land in the wrong
+    /// leaf and left every span after a tracked deletion uneditable.
+    pub projected: bool,
     /// Byte range of the leaf's text content within the part XML.
     pub text_start: usize,
     pub text_end: usize,
@@ -483,23 +490,34 @@ pub fn match_leaf_span_at(
         .position(|leaf| leaf.leaf_index >= from_leaf)
         .unwrap_or(leaves.len());
 
-    // Paragraph-level offset of each leaf's first char, so an anchored call can
-    // turn the caller's offset into a position inside the accumulator.
-    let mut prefix: Vec<usize> = Vec::with_capacity(leaves.len());
-    let mut running = 0usize;
+    // Paragraph-level offset of each leaf's first char, in the projection the
+    // caller's offsets are measured in — not in the leaves, where a revision gap
+    // still has width. A `char_start` read against leaf widths landed after the
+    // tracked deletion instead of on it, so the anchored start was rejected and
+    // every span past a `w:del` came back `cross-leaf-edit`.
+    let mut projected_prefix: Vec<usize> = Vec::with_capacity(leaves.len());
+    let mut running_projected = 0usize;
     for leaf in &leaves {
-        prefix.push(running);
-        running += leaf.text.chars().count();
+        projected_prefix.push(running_projected);
+        if leaf.projected {
+            running_projected += leaf.text.chars().count();
+        }
     }
 
     let mut found: Option<LeafSpanMatch> = None;
     for start in start_at..leaves.len() {
         let first_chars = leaves[start].text.chars().count();
         // The anchored span starts inside this leaf, or this start is not its
-        // business.
+        // business. The question is asked in the caller's space and answered with
+        // an index into this leaf's own text — the accumulation below starts
+        // there, so the two are the same thing.
         let anchored_head = match char_start {
-            Some(want) if want >= prefix[start] && want < prefix[start] + first_chars => {
-                Some(want - prefix[start])
+            Some(want)
+                if leaves[start].projected
+                    && want >= projected_prefix[start]
+                    && want < projected_prefix[start] + first_chars =>
+            {
+                Some(want - projected_prefix[start])
             }
             Some(_) => continue,
             None => None,
@@ -1111,6 +1129,7 @@ fn extract_paragraph(
         rpr_bytes: &mut Vec<u8>,
         paragraph_id: &str,
         part_key: &str,
+        in_gap: bool,
     ) {
         let mut opaque = false;
         let mut rpr_range: (usize, usize) = (0, 0);
@@ -1137,6 +1156,10 @@ fn extract_paragraph(
                     paragraph_id: paragraph_id.to_string(),
                     leaf_index: *leaf_index,
                     editable: true, // locked later for delText / opaque paragraphs
+                    // The projection renders a `w:del` subtree as a zero-width
+                    // revision gap and keeps nothing of its text, so a leaf
+                    // inside one is not part of the offsets the caller reads.
+                    projected: !in_gap && name != "delText",
                     text_start,
                     text_end,
                     open_end: child_node.open_end,
@@ -1183,6 +1206,7 @@ fn extract_paragraph(
         rpr_bytes: &mut Vec<u8>,
         paragraph_id: &str,
         part_key: &str,
+        in_gap: bool,
     ) {
         for &child in &node.children {
             let child_node = &nodes[child];
@@ -1208,6 +1232,7 @@ fn extract_paragraph(
                     rpr_bytes,
                     paragraph_id,
                     part_key,
+                    in_gap,
                 ),
                 "hyperlink" | "ins" | "del" | "moveFrom" | "moveTo" => process_container(
                     child_node,
@@ -1219,6 +1244,9 @@ fn extract_paragraph(
                     rpr_bytes,
                     paragraph_id,
                     part_key,
+                    // `del` and `moveFrom` are the deletion side of a tracked
+                    // change: the projection keeps a gap where their text was.
+                    in_gap || name == "del" || name == "moveFrom",
                 ),
                 "bookmarkStart" | "bookmarkEnd" | "commentRangeStart" | "commentRangeEnd" => {}
                 _ => opaques.push(OpaqueBlock {
@@ -1242,6 +1270,7 @@ fn extract_paragraph(
         &mut rpr_bytes,
         paragraph_id,
         part_key,
+        false,
     );
     // Paragraph-level edibility (Python `not contains_opaque`): any opaque
     // node in the paragraph locks every leaf.
@@ -4906,6 +4935,57 @@ mod tests {
             "the anchored span starts at the offset the handle named"
         );
         assert_eq!(anchored.first_leaf, leaf.leaf_index);
+    }
+
+    /// A caller's offset is measured in the PROJECTION, where a tracked deletion
+    /// is a zero-width gap. Read against the runs instead — where the deleted
+    /// characters still have width — the anchor lands late, the anchored start is
+    /// skipped, and the span is refused `cross-leaf-edit`. On a real patent that
+    /// is every span after the first `w:del` in a paragraph: `P26`'s tail could
+    /// not be edited at all, while its earlier commas could.
+    #[test]
+    fn an_anchor_after_a_tracked_deletion_addresses_the_projection() {
+        let xml = b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+                    <w:body><w:p><w:r><w:t>AB</w:t></w:r>\
+                    <w:del w:id=\"1\" w:author=\"jinxq\"><w:r><w:delText>XY</w:delText></w:r></w:del>\
+                    <w:r><w:t>CD</w:t></w:r></w:p></w:body></w:document>";
+        let mut parts: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        parts.insert("document".to_string(), xml.to_vec());
+        let inventory = enumerate_parts(&parts).expect("enumerate");
+
+        let paragraph: Vec<&ProseLeaf> = inventory
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.paragraph_id == "P0")
+            .collect();
+        assert_eq!(
+            paragraph
+                .iter()
+                .map(|leaf| (leaf.text.as_str(), leaf.projected))
+                .collect::<Vec<_>>(),
+            vec![("AB", true), ("XY", false), ("CD", true)],
+            "the deleted run keeps its leaf and loses its place in the projection"
+        );
+
+        // The projection is `ABCD`, so `CD` starts at 2 there and at 4 among the
+        // runs. Only the caller's space may address a span.
+        let anchored = match_leaf_span_at(&inventory, "document", "P0", 0, "CD", Some(2))
+            .expect("anchored search")
+            .expect("the anchored span resolves");
+        assert_eq!(anchored.first_leaf, 2);
+        assert_eq!(
+            match_leaf_span_at(&inventory, "document", "P0", 0, "CD", Some(4)).expect("search"),
+            None,
+            "an offset counted over the runs is a different address, not a second chance"
+        );
+        assert_eq!(
+            match_leaf_span(&inventory, "document", "P0", 0, "CD")
+                .expect("search")
+                .expect("found")
+                .first_leaf,
+            2,
+            "the text itself was always reachable; only the anchor's space was wrong"
+        );
     }
 
     fn ids(inventory: &ProseInventory) -> Vec<String> {

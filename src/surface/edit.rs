@@ -349,32 +349,77 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
 
     if dry_run {
         // Nothing is written, so nothing needs a transaction or a ledger entry.
-        let workdir = session.open_workdir().unwrap_or_default().to_string();
-        let preview = match facade::edit(
-            Path::new(&workdir),
-            &edits
-                .iter()
-                .filter_map(|edit| match edit {
-                    Edit::Replace(request) => Some(request.clone()),
-                    // A dry run reports what the replacements would do; the
-                    // structural kinds are checked by the same resolve that the
-                    // real call uses, so the report is not weaker than the act.
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            true,
-            tracking,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                return session.failure("document_edit", &error.code, &error.detail, build_commit)
+        let workdir = Path::new(session.open_workdir().unwrap_or_default());
+        // The structural kinds are previewed by resolving their anchor — the
+        // first step the real call takes, and the only one that can fail before
+        // a byte is written — instead of being dropped on the floor. They used
+        // to be filtered out and the survivors handed to the facade, so an
+        // insert-only batch arrived there EMPTY and came back `edit-empty`,
+        // "at least one edit is required", for a call that gave one. A blind
+        // agent probed 20 shapes through `dry_run` (the honest way to try an
+        // unknown tool), was told its edit did not exist every time, and
+        // concluded that inserting a paragraph was not possible at all.
+        let mut replacements: Vec<EditRequest> = Vec::new();
+        let mut structural: Vec<Value> = Vec::new();
+        let mut blocked: Vec<Value> = Vec::new();
+        for edit in &edits {
+            let (kind, handle) = match edit {
+                Edit::Replace(request) => {
+                    replacements.push(request.clone());
+                    continue;
+                }
+                Edit::InsertAfter { handle, .. } => ("insert_after", handle),
+                Edit::Delete { handle } => ("delete", handle),
+            };
+            match paragraph_of(workdir, handle) {
+                Ok(anchor) => structural.push(json!({
+                    "kind": kind,
+                    "anchor": anchor,
+                    "capability": "supported",
+                })),
+                Err(error) => blocked.push(json!({
+                    "kind": kind,
+                    "capability": "unsupported",
+                    "reason": format!("{}: {}", error.code, error.detail),
+                })),
+            }
+        }
+        // An empty replacement batch is not a question the facade can answer, so
+        // a structural-only call does not ask it one.
+        let preview = if replacements.is_empty() {
+            Value::Null
+        } else {
+            match facade::edit(workdir, &replacements, true, tracking) {
+                Ok(value) => value,
+                Err(error) => {
+                    return session.failure(
+                        "document_edit",
+                        &error.code,
+                        &error.detail,
+                        build_commit,
+                    )
+                }
             }
         };
-        return session.success(
-            "document_edit",
-            json!({ "operation_id": operation_id, "dry_run": true, "edit": preview }),
-            build_commit,
-        );
+        let mut data = json!({
+            "operation_id": operation_id,
+            "dry_run": true,
+            "edit": preview,
+        });
+        if !structural.is_empty() || !blocked.is_empty() {
+            data["structural"] = json!(structural);
+            // Say what a dry run can and cannot promise about the structural
+            // kinds: the anchor is resolved here, and the properties the new
+            // paragraph inherits are chosen when the edit is applied.
+            data["note"] = json!(
+                "structural edits are previewed by resolving their anchor; the properties an \
+                 inserted paragraph inherits are chosen when the edit is applied"
+            );
+        }
+        if !blocked.is_empty() {
+            data["blocked_targets"] = json!(blocked);
+        }
+        return session.success("document_edit", data, build_commit);
     }
 
     // The operation id goes through the args so the store's ledger sees it: a
