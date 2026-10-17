@@ -3973,10 +3973,25 @@ pub fn apply_projection_with_options(
     // patent, 20 `comments.P*` paragraphs disappeared from the canonical
     // projection on the first commit that carried an edit.
     let committed_layout = parse_typed_layout(&typed_before);
-    // Rust-extracted workdirs carry a header-only typed.md; the pre-commit
-    // bodies live in the template inventory (same source compute_changed uses).
-    for paragraph in inventory_paragraphs(workdir)? {
-        before.entry(paragraph.id).or_insert(paragraph.visible_text);
+    // Rust-extracted workdirs carry a header-only typed.md; the pre-commit bodies
+    // come from the template — rendered by THE SAME RULE that produced `typed.md`,
+    // not by the stored-view inventory.
+    //
+    // This is the diff's baseline, and taking it from `inventory_paragraphs` made
+    // two views of one document look like a user's structural edit: measured on a
+    // real patent, a plain text replacement wrote `4 new + 4 deleted` for
+    // paragraphs nobody had touched (the template's `moveFrom` and table-cell
+    // identities differ from the projection's), and the build then refused them as
+    // `table-structure-immutable`. The same rule now answers here as in
+    // `has_unrecorded_typed_edits` — one contract, one rendering.
+    if let Ok(package) = fs::read(workdir.join("_template.docx")) {
+        if let Ok(markup) = docx2typed_core::prose::paragraph_markup_map(&package) {
+            for (id, body) in markup {
+                before
+                    .entry(id)
+                    .or_insert_with(|| typed_body_visible_text(&body));
+            }
+        }
     }
     let mut islands = docx2typed_core::prose::load_islands(workdir)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
