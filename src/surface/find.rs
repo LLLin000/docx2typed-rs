@@ -54,7 +54,24 @@ fn verdict_for(workdir: &Path, handle: &str) -> Value {
                         .to_string(),
                     "why": target.get("reason").cloned().unwrap_or(Value::Null),
                 }),
-                None => json!({ "editable": true }),
+                None => {
+                    // `editable: true` is a verdict about the TEXT, not a promise
+                    // about formatting. When the replacement will change the
+                    // character formatting of what it covers — a span across runs
+                    // with different `w:rPr`, which is where superscripts and bold
+                    // live — the forecast rides in the same verdict, so the caller
+                    // can tell "editable" from "editable and lossless".
+                    let mut verdict = json!({ "editable": true });
+                    if let Some(format) = report
+                        .get("staged_targets")
+                        .and_then(Value::as_array)
+                        .and_then(|targets| targets.first())
+                        .and_then(|target| target.get("format"))
+                    {
+                        verdict["format"] = format.clone();
+                    }
+                    verdict
+                }
             }
         }
         Err(error) => json!({ "editable": false, "code": error.code, "why": error.detail }),

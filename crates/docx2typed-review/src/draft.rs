@@ -1201,6 +1201,114 @@ pub fn check_editable_span(
     check_format_boundary(workdir, paragraph_id, old, start)
 }
 
+/// A canonical `rPr` tree as the properties a reader recognises:
+/// `b;sz=24;vertAlign=superscript`. The canonical form is the same for two runs
+/// with the same formatting, so it decides identity; this decides what a caller
+/// sees, and `["w:rPr",...]` is not something to read.
+fn readable_rpr(canonical: &str) -> String {
+    let Ok(Value::Array(root)) = serde_json::from_str::<Value>(canonical) else {
+        return canonical.to_string();
+    };
+    let Some(Value::Array(children)) = root.get(3) else {
+        return "(no character properties)".to_string();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for child in children {
+        let Some(Value::Array(entry)) = Some(child) else {
+            continue;
+        };
+        let name = entry
+            .first()
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim_start_matches("w:")
+            .to_string();
+        let mut values: Vec<String> = Vec::new();
+        if let Some(Value::Array(attributes)) = entry.get(1) {
+            for attribute in attributes {
+                let Some(Value::Array(pair)) = Some(attribute) else {
+                    continue;
+                };
+                let value = pair
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !value.is_empty() && !values.contains(&value) {
+                    values.push(value);
+                }
+            }
+        }
+        parts.push(if values.is_empty() {
+            name
+        } else {
+            format!("{name}={}", values.join("/"))
+        });
+    }
+    if parts.is_empty() {
+        "(no character properties)".to_string()
+    } else {
+        parts.join(";")
+    }
+}
+
+/// What a replacement will do to the character formatting of the text it covers,
+/// as a value the caller can read BEFORE editing.
+///
+/// The rule is fixed: the new text takes the first covered run's properties. What
+/// varies is whether that is lossless — one covered run, or several that share
+/// one `w:rPr`, and nothing is given up; several with different properties, and
+/// the replaced characters lose the ones they had. `editable: true` is not a
+/// promise about formatting, so the promise is stated instead of implied.
+///
+/// Measured on a real patent: `Fe3O4` covers five runs (two of them
+/// `vertAlign` superscripts), and replacing it with `Fe3O4-x` yields one plain
+/// run — correct by the rule, and exactly the thing a chemistry document needs to
+/// be told about.
+pub fn format_forecast(
+    workdir: &Path,
+    paragraph_id: &str,
+    old: &str,
+    start: usize,
+) -> Option<Value> {
+    let view = ParagraphLeaves::load(workdir, paragraph_id).ok()?;
+    let covered = view.covered(start, start + old.chars().count())?;
+    let mut canonical_seen: Vec<String> = Vec::new();
+    let mut signatures: Vec<String> = Vec::new();
+    for leaf in &covered {
+        let canonical = docx2typed_core::prose::canonical_rpr_json(&leaf.rpr)
+            .unwrap_or_else(|_| leaf.rpr.clone());
+        if !canonical_seen.contains(&canonical) {
+            canonical_seen.push(canonical.clone());
+            signatures.push(readable_rpr(&canonical));
+        }
+    }
+    let first = signatures.first().cloned().unwrap_or_default();
+    let mixed = signatures.len() > 1;
+    let effect = match (covered.len(), mixed) {
+        (1, _) => "the replaced text keeps this run's character properties".to_string(),
+        (_, false) => format!(
+            "the {} covered runs share one set of character properties, so the replaced text \
+             keeps them",
+            covered.len()
+        ),
+        (n, true) => format!(
+            "the replaced text takes the FIRST covered run's character properties; {n} covered \
+             runs carry {} different sets, and the replaced characters will not keep the others",
+            signatures.len()
+        ),
+    };
+    Some(json!({
+        "covered_runs": covered.len(),
+        "mixed_rPr": mixed,
+        "replacement_rPr": "first-covered-run",
+        "distinct_rPr": signatures.len(),
+        "rPr": signatures,
+        "first_rPr": first,
+        "effect": effect,
+    }))
+}
+
 /// A replacement that crosses run boundaries applies into the FIRST covered run:
 /// its new text takes that run's character properties, and every later covered
 /// run is emptied. That is correct when the span is exactly what those runs hold.
@@ -2752,6 +2860,9 @@ fn paragraph_lengths_differ(workdir: &Path, paragraph_id: &str) -> bool {
 /// One paragraph leaf in BOTH spaces at once.
 struct LeafView {
     leaf_index: usize,
+    /// The owning run's raw `w:rPr`. A leaf is one run's text, so this is the
+    /// character formatting a replacement into that run takes (or gives up).
+    rpr: String,
     /// What the template holds: the text an island's `old` has to read.
     template_text: String,
     /// What the caller reads: the pending island's `new` when one already
@@ -2811,6 +2922,7 @@ impl ParagraphLeaves {
                 .unwrap_or_else(|| leaf.text.clone());
             leaves.push(LeafView {
                 leaf_index: leaf.leaf_index,
+                rpr: leaf.rpr.clone(),
                 template_text: leaf.text.clone(),
                 draft_text: draft_text.clone(),
                 draft_start,
@@ -4712,6 +4824,7 @@ mod tests {
             leaves: vec![
                 LeafView {
                     leaf_index: 0,
+                    rpr: r#"<w:rPr><w:sz w:val="24"/></w:rPr>"#.to_string(),
                     template_text: "使用".to_string(),
                     draft_text: "使用".to_string(),
                     draft_start: 0,
@@ -4720,6 +4833,7 @@ mod tests {
                 },
                 LeafView {
                     leaf_index: 1,
+                    rpr: r#"<w:rPr><w:b/><w:sz w:val="24"/></w:rPr>"#.to_string(),
                     template_text: "乳液自组装法".to_string(),
                     draft_text: "乳液自组装法".to_string(),
                     draft_start: 2,

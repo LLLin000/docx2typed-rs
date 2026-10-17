@@ -201,6 +201,12 @@ pub struct StagedEdit {
     pub capability: Capability,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<String>,
+    /// What the replacement will do to the character formatting of what it
+    /// covers, when the target can be edited at all. Stated, not implied: a
+    /// caller that reads `editable: true` must not read it as "formatting is
+    /// safe" (see `draft::format_forecast`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub format: Option<Value>,
 }
 
 /// Stage a batch of edits: validate every one, publish nothing.
@@ -236,6 +242,17 @@ pub fn stage_edits(
                 } else {
                     Capability::Supported
                 };
+                let format = capability
+                    .is_ok()
+                    .then(|| {
+                        draft::format_forecast(
+                            workdir,
+                            &resolved.paragraph_id,
+                            &old_text,
+                            resolved.start,
+                        )
+                    })
+                    .flatten();
                 let entry = StagedEdit {
                     handle: edit.handle.clone(),
                     paragraph_id: resolved.paragraph_id.clone(),
@@ -250,6 +267,7 @@ pub fn stage_edits(
                             None => Some("replace-is-a-noop".to_string()),
                         }
                     },
+                    format,
                 };
                 if capability.is_ok() {
                     staged.push(entry);
@@ -272,6 +290,7 @@ pub fn stage_edits(
                         Capability::Unsupported
                     },
                     reason: Some(message),
+                    format: None,
                 });
             }
         }
