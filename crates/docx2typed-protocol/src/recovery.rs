@@ -211,6 +211,19 @@ pub fn recovery_for(operation: &str, code: &str) -> Recovery {
     if code == "output-docx-not-found" || code == "workdir-missing" {
         return r("build-output", &["build_docx"]);
     }
+    if code == "workdir-invalid" || code == "workdir-not-found" {
+        // Measured twice with blind agents: a mistyped `source` fell through to
+        // the default tail, which sends the caller to `workdir_status` — and with
+        // nothing open that can only answer "nothing is open". A path that names
+        // neither a document nor a workdir is fixed by looking at the path.
+        return rm(
+            "fix-the-source-path",
+            "`source` takes a DOCX path or the directory a previous open or extract wrote (a \
+             workdir directory contains typed.md); see what is actually at the path you passed, \
+             then open again",
+            &[],
+        );
+    }
     // fallback
     r("inspect-diagnostic", &["workdir_status", "review_state"])
 }
@@ -335,9 +348,12 @@ mod tests {
         assert_eq!(r.action, "open-workdir");
         assert_eq!(r.tools, Some(vec!["workdir_open".to_string()]));
 
-        let r = recovery_for("document_patch", "workdir-invalid");
-        // unknown code -> default tail
-        assert_eq!(r.action, "inspect-diagnostic");
+        // A bad `source` gets advice about the path, not the default tail: the
+        // tail names workdir_status, which cannot answer anything while nothing
+        // is open (this is what two blind agents were sent to do).
+        let r = recovery_for("document_open", "workdir-invalid");
+        assert_eq!(r.action, "fix-the-source-path");
+        assert!(r.message.as_deref().unwrap_or("").contains("typed.md"));
 
         let r = recovery_for("document_patch", "patch-hunks-invalid");
         assert_eq!(r.action, "apply-listed-fixes");

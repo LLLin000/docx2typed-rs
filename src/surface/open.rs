@@ -196,13 +196,29 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
             }
         }
     } else {
+        // What the path actually is, not just what it is not: both blind agents
+        // that mistyped a path got the same sentence and had to go looking.
+        let what = if !source.exists() {
+            format!("{source_label} does not exist")
+        } else if source.is_dir() {
+            format!(
+                "{source_label} is a directory that is not a typed workdir (a workdir contains \
+                 typed.md)"
+            )
+        } else if source
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("docx"))
+        {
+            format!("{source_label} is a file that could not be read as a DOCX package")
+        } else {
+            format!("{source_label} is a file that is not a DOCX")
+        };
         return session.failure(
             "document_open",
             "workdir-invalid",
             &format!(
-                "{} is neither a document nor a typed workdir; `source` takes a DOCX path or \
-                 the directory a previous open or extract wrote",
-                source.display()
+                "{what}; `source` takes a DOCX path or the directory a previous open or extract \
+                 wrote"
             ),
             build_commit,
         );

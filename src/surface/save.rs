@@ -1,7 +1,12 @@
 //! `document_save` — write the DOCX, and verify what was written.
 //!
-//! This is the only call that produces a file, and it does not trust its own
-//! build: the output is verified against the workdir before success is reported.
+//! This is the only call that produces files: the output DOCX and, beside it, its
+//! evidence set — `<out>.docx.evidence.json`, `<out>.docx.operation-ledger.json`
+//! and `<out>.docx.verify.evidence.json`. All four name the same bytes; that set is
+//! what a later reader can check the release against.
+//!
+//! It does not trust its own build: the output is verified against the workdir
+//! before success is reported.
 //! A save that reports success while the file kept the old text is the failure
 //! this whole line of work exists to remove, and it is not hypothetical — the
 //! engine has a guard (`unrecorded-edits`) precisely because a build could
@@ -376,22 +381,84 @@ pub fn document_save(session: &mut McpSession, args: &Value, build_commit: &str)
         );
     }
 
+    // Both payloads were produced against the staged build, so both name it: the
+    // build wrote there, the verification read it back, and after publication
+    // neither name is one the caller can follow to anything (measured: a blind
+    // agent reported the staging name as the thing that was "verified"). Repointed
+    // to the file the caller now has — the hashes in them are the published bytes.
+    let mut build = envelope.get("data").cloned().unwrap_or(Value::Null);
+    let mut verified = verify_envelope.get("data").cloned().unwrap_or(Value::Null);
+    repoint_paths(&mut build, &staging, output);
+    repoint_paths(&mut verified, &staging, output);
     session.success(
         "document_save",
         json!({
             "output": output,
             "operation_id": operation_id,
             "docx_sha256": published,
-            "build": envelope.get("data").cloned().unwrap_or(Value::Null),
-            "verified": verify_envelope.get("data").cloned().unwrap_or(Value::Null),
+            "build": build,
+            "verified": verified,
         }),
         build_commit,
     )
 }
 
+/// Replace every occurrence of `from` inside the payload's strings with `to`.
+fn repoint_paths(value: &mut Value, from: &str, to: &str) {
+    match value {
+        Value::String(text) => {
+            if let Some(index) = text.find(from) {
+                let mut replaced = String::with_capacity(text.len() + to.len());
+                replaced.push_str(&text[..index]);
+                replaced.push_str(to);
+                replaced.push_str(&text[index + from.len()..]);
+                *text = replaced;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                repoint_paths(item, from, to);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                repoint_paths(item, from, to);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_paths_name_the_published_file_not_the_staging_one() {
+        let mut payload = json!({
+            "output": "C:/x/out.docx.building-abc",
+            "verified": {
+                "value": "C:/x/out.docx.building-abc",
+                "evidence": "C:/x/out.docx.building-abc.verify.evidence.json",
+            },
+            "digest": "abc",
+        });
+        repoint_paths(&mut payload, "C:/x/out.docx.building-abc", "C:/x/out.docx");
+        assert_eq!(payload["output"], "C:/x/out.docx");
+        assert_eq!(payload["verified"]["value"], "C:/x/out.docx");
+        assert_eq!(
+            payload["verified"]["evidence"],
+            "C:/x/out.docx.verify.evidence.json"
+        );
+        assert_eq!(payload["digest"], "abc");
+
+        // The build payload names the staged file as well: the build wrote there,
+        // and after publication that name is not one the caller can follow.
+        let mut built =
+            json!({ "output": "C:/x/out.docx.building-abc", "docx_sha256": "deadbeef" });
+        repoint_paths(&mut built, "C:/x/out.docx.building-abc", "C:/x/out.docx");
+        assert_eq!(built["output"], "C:/x/out.docx");
+    }
 
     /// A scratch directory that removes itself, panics included.
     struct Scratch(std::path::PathBuf);
