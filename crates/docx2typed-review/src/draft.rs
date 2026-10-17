@@ -30,6 +30,10 @@ use serde_json::{json, Value};
 use crate::collab::{block_body, find_block, paragraph_blocks, CollaborationError};
 
 pub const PROJECTION_FILE: &str = "edit.md";
+
+/// The frozen editable baseline: the projection as it stood before any edit.
+/// Written once at `ensure_projection`, never rewritten (ADR 0051, principle 2).
+pub const BASELINE_VIEW_FILE: &str = "baseline.view";
 pub const STATE_FILE: &str = "edit.state.json";
 pub const SEGMENTATION_CONTRACT: &str = "uax29-c1-1/unicode-16.0.0";
 
@@ -140,6 +144,14 @@ pub fn ensure_projection(workdir: &Path) -> Result<EditState, CollaborationError
     let (text, typed_sha256) = render_projection(workdir, &paragraphs)?;
     let body_hash = edit_body_sha256(&text)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    // Freeze the editable baseline (ADR 0051, principle 2): the projection as it
+    // stands BEFORE any edit, written once and never rewritten. The commit's diff
+    // and the unrecorded-edit check both compare the draft against THIS, so both
+    // sides come from one artifact and one rendering — instead of each re-deriving
+    // a baseline from the template by position, which is what made four untouched
+    // paragraphs look like a user's structural edit.
+    fs::write(workdir.join(BASELINE_VIEW_FILE), &text)
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     fs::write(workdir.join(PROJECTION_FILE), text)
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     let state = state_json(&typed_sha256, &body_hash);
@@ -3984,13 +3996,9 @@ pub fn apply_projection_with_options(
     // identities differ from the projection's), and the build then refused them as
     // `table-structure-immutable`. The same rule now answers here as in
     // `has_unrecorded_typed_edits` — one contract, one rendering.
-    if let Ok(package) = fs::read(workdir.join("_template.docx")) {
-        if let Ok(markup) = docx2typed_core::prose::paragraph_markup_map(&package) {
-            for (id, body) in markup {
-                before
-                    .entry(id)
-                    .or_insert_with(|| typed_body_visible_text(&body));
-            }
+    if let Ok(frozen) = fs::read_to_string(workdir.join(BASELINE_VIEW_FILE)) {
+        for (id, body) in parse_typed_paragraphs(&frozen) {
+            before.entry(id).or_insert(body);
         }
     }
     let mut islands = docx2typed_core::prose::load_islands(workdir)
