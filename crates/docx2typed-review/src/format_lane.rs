@@ -173,12 +173,28 @@ pub fn record_format_request(
     request: FormatRequest,
 ) -> Result<(FormatPlan, Snapshot, Vec<FormatRequest>), CollaborationError> {
     let mut requests = load_format_requests(workdir)?;
-    if !requests.contains(&request) {
+    // A request for the same characters SUPERSEDES the earlier one: the caller
+    // changed their mind, which is not a conflict. Keeping both made the plan
+    // report a span as overlapping itself — `[126, 131) and [126, 131) overlap in
+    // P13 and name different styles` — with no way to withdraw either.
+    let same_span = |existing: &FormatRequest| {
+        existing.paragraph_id == request.paragraph_id
+            && existing.start == request.start
+            && existing.end == request.end
+    };
+    if let Some(index) = requests.iter().position(same_span) {
+        requests[index] = request;
+    } else {
         requests.push(request);
     }
     let (plan, snapshot) = plan_format(workdir, &requests)?;
     save_format_requests(workdir, &requests)?;
     save_format_plan(workdir, &plan)?;
+    // The projection is what the read side publishes, so it has to carry the
+    // plan's effect: otherwise a caller records a format edit and every read
+    // afterwards still reports the old properties, which is how a blind run
+    // concluded five times that its restyle "did nothing".
+    crate::draft::apply_projection(workdir)?;
     Ok((plan, snapshot, requests))
 }
 

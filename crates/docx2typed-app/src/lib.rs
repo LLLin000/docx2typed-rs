@@ -2910,10 +2910,20 @@ impl Default for Engine {
 /// was derived from, refuse a digest mismatch, then materialise. The build does
 /// not re-derive a single formatting rule (ADR 0050).
 fn apply_format_plan_to_workdir(workdir: &Path, package: &[u8]) -> Result<Vec<u8>, String> {
-    let plan = docx2typed_review::format_lane::load_format_plan(workdir)
-        .map_err(|error| format!("{}: {}", error.code, error.detail))?
-        .ok_or_else(|| "no format plan in this workdir".to_string())?;
-    let snapshot = docx2typed_review::format_lane::snapshot_for_plan(workdir, &plan)
+    // The requests are the durable input; the plan is a pure function of them and
+    // the draft. So the build RE-DERIVES it here rather than trusting the sidecar:
+    // a plan recorded at edit time goes stale the moment anything else moves the
+    // workdir — a text edit, or the save's own sync — and a stale plan used to be
+    // a permanent refusal with no way out on the five-tool surface. Two blind runs
+    // ended with an undeliverable document because of exactly that.
+    let requests = docx2typed_review::format_lane::load_format_requests(workdir)
+        .map_err(|error| format!("{}: {}", error.code, error.detail))?;
+    if requests.is_empty() {
+        return Ok(package.to_vec());
+    }
+    let (plan, snapshot) = docx2typed_review::format_lane::plan_format(workdir, &requests)
+        .map_err(|error| format!("{}: {}", error.code, error.detail))?;
+    docx2typed_review::format_lane::save_format_plan(workdir, &plan)
         .map_err(|error| format!("{}: {}", error.code, error.detail))?;
     docx2typed_review::format_lane::apply_format_plan(package, &plan, &snapshot)
         .map_err(|error| format!("{}: {}", error.code, error.detail))
