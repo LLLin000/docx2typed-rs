@@ -718,18 +718,41 @@ pub(crate) fn compute_changed(
     workdir: &Path,
     blocks: &[String],
 ) -> Result<Vec<String>, CollaborationError> {
-    let typed_path = workdir.join("typed.md");
-    let mut old_paragraphs: std::collections::BTreeMap<String, String> = if typed_path.is_file() {
-        let text = fs::read_to_string(&typed_path)
-            .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-        parse_typed_paragraphs(&text)
-    } else {
-        std::collections::BTreeMap::new()
-    };
-    for paragraph in inventory_paragraphs(workdir)? {
-        old_paragraphs
-            .entry(paragraph.id)
-            .or_insert(paragraph.visible_text);
+    // The baseline is the FROZEN BASELINE VIEW — the same artifact, the same
+    // grammar and the same rendering as the draft being compared against it
+    // (ADR 0051, principle 2).
+    //
+    // Reading `typed.md` and the inventory here compared two grammars instead of
+    // two states: a paragraph whose draft form is a gap (`moveFrom`, opaque,
+    // unsupported runs) renders differently from its typed form by construction,
+    // so four untouched paragraphs came back as changed and the commit wrote
+    // island edits for them. The applier refused them — correctly, their old text
+    // is nowhere in the document — and `save` failed on a document nobody had
+    // edited. A workdir extracted before this file existed keeps the old rule.
+    let mut old_paragraphs: std::collections::BTreeMap<String, String> =
+        match fs::read_to_string(workdir.join(BASELINE_VIEW_FILE)) {
+            Ok(frozen) => parse_baseline_paragraphs(&frozen),
+            Err(_) => std::collections::BTreeMap::new(),
+        };
+    // Existence also comes from the CURRENT state: a paragraph synthesised by an
+    // earlier commit lives in `typed.md` and in the structure sidecar, never in
+    // the frozen baseline — and deleting it is a legitimate structural edit, not
+    // a paragraph that was never there. The baseline's bodies win where both have
+    // the id; these only fill the gaps.
+    {
+        let typed_path = workdir.join("typed.md");
+        if typed_path.is_file() {
+            let text = fs::read_to_string(&typed_path)
+                .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+            for (id, body) in parse_typed_paragraphs(&text) {
+                old_paragraphs.entry(id).or_insert(body);
+            }
+        }
+        for paragraph in inventory_paragraphs(workdir)? {
+            old_paragraphs
+                .entry(paragraph.id)
+                .or_insert(paragraph.visible_text);
+        }
     }
     let mut changed: Vec<String> = Vec::new();
     for block in blocks {
@@ -3920,7 +3943,16 @@ pub fn apply_projection_with_options(
     }
     let (_, blocks) = read_blocks(workdir)?;
     let changed = compute_changed(workdir, &blocks)?;
-    if changed.is_empty() {
+    // `changed` is measured against the FROZEN baseline, so it is empty in a case
+    // that still needs a commit: the user edited a paragraph back to its baseline
+    // text. The draft then differs from the last COMMITTED state while agreeing
+    // with B, the edit path drops the island that made the edit real, and
+    // returning here left `edit.md`, the sidecar and `edit.state.json` disagreeing
+    // — the next build refused the workdir as dirty. A dirty draft is work.
+    let draft_dirty = docx2typed_core::edit_state::classify_edit_state(workdir)
+        .map(|state| state.state != "clean")
+        .unwrap_or(true);
+    if changed.is_empty() && !draft_dirty {
         return Ok(changed);
     }
     // Formal paragraph ids for this commit's new blocks, in draft order —
@@ -3997,7 +4029,7 @@ pub fn apply_projection_with_options(
     // `table-structure-immutable`. The same rule now answers here as in
     // `has_unrecorded_typed_edits` — one contract, one rendering.
     if let Ok(frozen) = fs::read_to_string(workdir.join(BASELINE_VIEW_FILE)) {
-        for (id, body) in parse_typed_paragraphs(&frozen) {
+        for (id, body) in parse_baseline_paragraphs(&frozen) {
             before.entry(id).or_insert(body);
         }
     }
@@ -4007,7 +4039,6 @@ pub fn apply_projection_with_options(
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let mut recorded = 0usize;
     let mut structured = false;
-    let inventory = docx2typed_core::prose::enumerate_package(&workdir.join("_template.docx")).ok();
     // The bodies THIS commit is committing, keyed by the id it commits them
     // under — not what happens to be on disk. The recording now runs before the
     // write, so reading `typed.md` here would see the PREVIOUS commit's file.
@@ -4022,10 +4053,47 @@ pub fn apply_projection_with_options(
             };
             if kind == "p" || kind == "new" {
                 let formal = formal_ids.get(&id).map(String::as_str).unwrap_or(&id);
-                map.insert(formal.to_string(), visible_text(&block_body(block)));
+                // The projection's own rendering — the expression `compute_changed`
+                // compares with, and the rule the frozen baseline was rendered by.
+                // `visible_text` disagreed with it on `moveFrom`/opaque paragraphs,
+                // and that disagreement alone read as a body change nobody made.
+                map.insert(
+                    formal.to_string(),
+                    typed_body_visible_text(&typed_markup_from_draft(&block_body(block))),
+                );
             }
         }
         map
+    };
+    // Reverted edits: a recorded island whose paragraph the draft now reads
+    // exactly as the frozen baseline does. `changed` is computed against that
+    // baseline, so a paragraph the user edited BACK is not in it — and the
+    // island that made the edit real stayed in the sidecar, the workdir stayed
+    // dirty, and the next build refused a document with no pending change.
+    // The accepted set is recomputed from B every time, never accumulated
+    // (ADR 0051, principle 4).
+    let reverted: Vec<String> = islands
+        .iter()
+        .filter(|edit| {
+            !changed.contains(&edit.paragraph_id)
+                && committed.get(&edit.paragraph_id) == before.get(&edit.paragraph_id)
+        })
+        .map(|edit| edit.paragraph_id.clone())
+        .collect();
+    if changed.is_empty() && reverted.is_empty() {
+        return Ok(changed);
+    }
+    // What this commit CHANGED, which is not only what the draft changes: an edit
+    // the user reverted leaves `changed` empty while the committed state moves
+    // back. Returning the short list here made the caller's "nothing changed"
+    // path publish nothing — and the workdir kept a sidecar, a draft and a state
+    // that no longer agreed, so the next build refused it as dirty.
+    let accepted = {
+        let mut all = changed.clone();
+        all.extend(reverted.iter().cloned());
+        all.sort();
+        all.dedup();
+        all
     };
     for id in &changed {
         let Some(new_body) = committed.get(id) else {
@@ -4097,56 +4165,46 @@ pub fn apply_projection_with_options(
         if islands.iter().any(|edit| edit.paragraph_id == *id) {
             continue;
         }
-        let is_single_leaf = inventory.as_ref().is_some_and(|inv| {
-            let mut leaves = inv
-                .leaves
-                .iter()
-                .filter(|l| l.part_key == "document" && &l.paragraph_id == id);
-            let first = leaves.next();
-            let second = leaves.next();
-            second.is_none() && first.is_some_and(|l| &l.text == old_body)
-        });
-        if is_single_leaf {
+        // A body difference is a TEXT change, whatever the paragraph's leaf shape.
+        // This used to gate on `is_single_leaf` — one leaf, its text equal to the
+        // baseline — and record everything else as `delete` + `new`. Two measured
+        // consequences on a real patent: the gate failed on `moveFrom`/opaque
+        // paragraphs whose inventory text and projection text are rendered
+        // differently, so four paragraphs nobody touched were recorded as replaced
+        // and the build refused them; and an ordinary edit inside a paragraph of
+        // eleven runs took the same path. Structural edits are never inferred from
+        // a body diff (ADR 0051, principle 3) — they come from the draft's own
+        // `@delete`/`@new` markers, which the branches above record. A span the
+        // applier cannot express is refused by the applier, by name.
+        {
+            // The span the difference actually changes, not the whole body: the
+            // applier rewrites the bytes a span covers, so handing it the entire
+            // paragraph re-rendered runs the user never touched — measured on a
+            // patent, a paragraph's whitespace-only run lost its spaces because
+            // the edit's own paragraph was rewritten around it. `char_start` is
+            // the paragraph-level offset the span begins at, which is also what
+            // disambiguates a span that occurs more than once in the paragraph.
+            let (old_span, new_span, char_start) = changed_span(old_body, new_body);
             islands.retain(|edit| edit.paragraph_id != *id);
             islands.push(docx2typed_core::prose::IslandEdit {
                 part: "document".to_string(),
                 paragraph_id: id.clone(),
                 leaf_index: 0,
-                char_start: None,
-                old: old_body.clone(),
-                new: new_body.clone(),
+                char_start: Some(char_start),
+                old: old_span,
+                new: new_span,
                 tracked,
                 author: author.unwrap_or("").to_string(),
                 date: date.unwrap_or("").to_string(),
             });
             recorded += 1;
-        } else {
-            let next_anchor = next_live_paragraph(&blocks, id);
-            if !structure
-                .deleted_paragraphs
-                .iter()
-                .any(|p| p.paragraph_id == *id)
-            {
-                structure
-                    .deleted_paragraphs
-                    .push(docx2typed_core::prose::DeletedParagraph {
-                        part: "document".to_string(),
-                        paragraph_id: id.clone(),
-                    });
-            }
-            structure.new_paragraphs.retain(|p| p.paragraph_id != *id);
-            structure
-                .new_paragraphs
-                .push(docx2typed_core::prose::NewParagraph {
-                    part: "document".to_string(),
-                    paragraph_id: id.clone(),
-                    inherit: id.clone(),
-                    format_policy: docx2typed_core::prose::FormatPolicy::default(),
-                    body: new_body.clone(),
-                    insert_before: next_anchor,
-                });
-            structured = true;
         }
+    }
+    if !reverted.is_empty() {
+        islands.retain(|edit| !reverted.contains(&edit.paragraph_id));
+        // One more record to write: the dropped islands. `recorded` is what
+        // decides whether the sidecar is saved at all.
+        recorded += 1;
     }
     if recorded > 0 {
         docx2typed_core::prose::save_islands(workdir, &islands)
@@ -4421,7 +4479,7 @@ pub fn apply_projection_with_options(
         serde_json::to_vec_pretty(&state).expect("serializes"),
     )
     .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-    Ok(changed)
+    Ok(accepted)
 }
 
 /// True when `typed.md` records a paragraph the build cannot reproduce from
@@ -4455,14 +4513,41 @@ pub fn has_unrecorded_typed_edits(workdir: &Path) -> Result<bool, CollaborationE
     // `[opaque:opaque][opaque:unsupported-run]`, and `save` refused a document
     // nobody had edited. Two renderings of one rule is how that happens; this is
     // the side that was rendering the projection's own markup.
-    let package = fs::read(workdir.join("_template.docx"))
-        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-    let markup = docx2typed_core::prose::paragraph_markup_map(&package)
-        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    let baseline: std::collections::BTreeMap<String, String> = markup
-        .iter()
-        .map(|(id, body)| (id.clone(), typed_body_visible_text(body)))
-        .collect();
+    // The frozen baseline view, read by the SAME rendering the draft side uses
+    // (ADR 0051, principle 2): one artifact, one rule, so a difference here is a
+    // difference the user made. A workdir extracted before this file existed
+    // falls back to the template render.
+    let baseline: std::collections::BTreeMap<String, String> =
+        match fs::read_to_string(workdir.join(BASELINE_VIEW_FILE)) {
+            Ok(frozen) => parse_baseline_paragraphs(&frozen),
+            Err(_) => {
+                let package = fs::read(workdir.join("_template.docx")).map_err(|error| {
+                    CollaborationError::new("workdir-unreadable", error.to_string())
+                })?;
+                let markup =
+                    docx2typed_core::prose::paragraph_markup_map(&package).map_err(|error| {
+                        CollaborationError::new("workdir-invalid", error.to_string())
+                    })?;
+                markup
+                    .iter()
+                    .map(|(id, body)| (id.clone(), typed_body_visible_text(body)))
+                    .collect()
+            }
+        };
+    // A synthesised paragraph has no baseline to compare against: its legitimacy
+    // is the structure sidecar's record, written by the commit that created it.
+    // Reading its absence as an unrecorded edit refused the very documents this
+    // engine had just built.
+    let synthesised: std::collections::BTreeSet<String> =
+        docx2typed_core::prose::load_structure(workdir)
+            .map(|structure| {
+                structure
+                    .new_paragraphs
+                    .iter()
+                    .map(|paragraph| paragraph.paragraph_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
     for (id, body) in &recorded {
         match baseline.get(id) {
             Some(baseline_body) => {
@@ -4470,6 +4555,7 @@ pub fn has_unrecorded_typed_edits(workdir: &Path) -> Result<bool, CollaborationE
                     return Ok(true);
                 }
             }
+            None if synthesised.contains(id) => {}
             None => return Ok(true),
         }
     }
@@ -4675,6 +4761,64 @@ fn parse_typed_layout(text: &str) -> Vec<CommittedEntry> {
     }
     flush(&mut out, &mut marker, &mut id, &mut body_lines);
     out
+}
+
+/// The span a body difference actually changes: the common prefix and suffix are
+/// stripped, and the span's offset in the paragraph's projected text comes back
+/// with it.
+///
+/// A pure insertion has an empty old span, which no island can express; the whole
+/// body is returned instead, so the applier still resolves it and the limitation
+/// stays where it belongs — in the applier's own vocabulary.
+fn changed_span(old: &str, new: &str) -> (String, String, usize) {
+    let a: Vec<char> = old.chars().collect();
+    let b: Vec<char> = new.chars().collect();
+    let mut prefix = 0usize;
+    while prefix < a.len() && prefix < b.len() && a[prefix] == b[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < a.len() - prefix
+        && suffix < b.len() - prefix
+        && a[a.len() - 1 - suffix] == b[b.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let old_span: String = a[prefix..a.len() - suffix].iter().collect();
+    let new_span: String = b[prefix..b.len() - suffix].iter().collect();
+    if old_span.is_empty() {
+        return (old.to_string(), new.to_string(), 0);
+    }
+    (old_span, new_span, prefix)
+}
+
+/// The frozen baseline view, read EXACTLY the way the draft's own blocks are read
+/// and rendered: same splitter (`paragraph_blocks`), same body extraction, same
+/// markup conversion, same renderer.
+///
+/// Every step of that chain was, at some point, implemented twice with different
+/// answers, and each disagreement surfaced as a user edit nobody made: the typed
+/// renderer keeps `[opaque:unsupported-run]` where the draft renderer drops it
+/// (four untouched `moveFrom`/opaque paragraphs), and the raw file keeps a
+/// whitespace-only body line the block splitter discards (one untouched paragraph
+/// read as an edit that emptied it). One artifact, one rule (ADR 0051, principle 2).
+fn parse_baseline_paragraphs(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut records: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let Ok(blocks) = paragraph_blocks(text) else {
+        return records;
+    };
+    for block in &blocks {
+        let Some((kind, id, _)) = marker_of(block) else {
+            continue;
+        };
+        if kind == "p" || kind == "new" {
+            records.insert(
+                id,
+                typed_body_visible_text(&typed_markup_from_draft(&block_body(block))),
+            );
+        }
+    }
+    records
 }
 
 fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, String> {

@@ -823,10 +823,24 @@ pub(crate) fn apply_and_sync(
         facade::edit(target, &requests, false, tracking)
             .map_err(|error| MutationError::new(error.code, error.detail))?
     };
-    if !requests.is_empty() && edited.get("outcome").and_then(Value::as_str) != Some("committed") {
-        // The facade stages every target before it applies any, so a blocked
-        // batch has written nothing. Report it and let the caller decide; the
-        // generation it returns is the one it started from.
+    // A blocked batch wrote nothing (the facade stages every target before it
+    // applies any) and there is nothing to commit — report it and let the caller
+    // decide. But "not committed" is not the same as "nothing to do": editing a
+    // paragraph BACK to its baseline text reports a no-op while moving the
+    // committed state, and returning here left `edit.md`, the sidecar and
+    // `edit.state.json` disagreeing — the next build refused the workdir as
+    // dirty. A dirty draft is committed whatever the facade called it.
+    // A state that cannot be classified is not a reason to skip the commit: it
+     // is a reason to make one, and the commit reports the real error if it has
+     // one. Reading `Err` as "clean" is how a workdir ends up with a draft, a
+     // sidecar and a state that disagree.
+    let draft_dirty = docx2typed_core::edit_state::classify_edit_state(target)
+        .map(|state| state.state != "clean")
+        .unwrap_or(true);
+    if !requests.is_empty()
+        && edited.get("outcome").and_then(Value::as_str) != Some("committed")
+        && !draft_dirty
+    {
         return Ok(json!({
             "edit": edited,
             "structural": structural,
