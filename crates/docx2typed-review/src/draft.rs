@@ -1197,7 +1197,74 @@ pub fn check_editable_span(
     // to leave the tool and edit the XML by hand — which loses the byte
     // fidelity, the revision records and the verification the tool exists for.
     let leaf = leaf_index_for_span(workdir, paragraph_id, start, old.chars().count());
-    island_leaf_for(workdir, paragraph_id, old, leaf, Some(start)).map(|_| ())
+    island_leaf_for(workdir, paragraph_id, old, leaf, Some(start))?;
+    check_format_boundary(workdir, paragraph_id, old, start)
+}
+
+/// A replacement that crosses run boundaries applies into the FIRST covered run:
+/// its new text takes that run's character properties, and every later covered
+/// run is emptied. That is correct when the span is exactly what those runs hold.
+/// It is not correct when the LAST covered run carries text beyond the span: that
+/// text would be pulled into the first run and lose its own character
+/// properties. Measured on a real patent — replacing `使用乳液` (plain + bold)
+/// turned `自组装法` into part of the plain replacement run; the text stayed
+/// right and the bold was gone.
+///
+/// The refusal names the run and what it holds, because the fix is mechanical:
+/// select the whole run, or keep the span inside one run.
+fn check_format_boundary(
+    workdir: &Path,
+    paragraph_id: &str,
+    old: &str,
+    start: usize,
+) -> Result<(), CollaborationError> {
+    let Ok(view) = ParagraphLeaves::load(workdir, paragraph_id) else {
+        // A paragraph the draft cannot read is refused by the commit path with a
+        // better code; this check only refines a span it can see.
+        return Ok(());
+    };
+    let Some((leaf_index, tail_chars, tail_text, covered)) =
+        untouched_tail_after_span(&view, start, start + old.chars().count())
+    else {
+        return Ok(());
+    };
+    Err(CollaborationError::new(
+        "format-boundary-crossed",
+        format!(
+            "{old:?} in {paragraph_id} crosses {covered} runs, and the last one (run {leaf_index}) \
+             holds {tail_chars} more characters after the span ({tail_text:?}); a replacement \
+             applies into the first run, so that tail would be swallowed into it and lose its \
+             character properties. Select the whole run's text instead, or keep the replacement \
+             inside one run"
+        ),
+    ))
+}
+
+/// The last covered run's text beyond the span, when a replacement there would
+/// leave it with the wrong run's character properties: `(leaf_index, chars,
+/// text, covered_runs)`. None when the span sits in one run, or when the last
+/// covered run is covered to its end.
+fn untouched_tail_after_span(
+    view: &ParagraphLeaves,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize, String, usize)> {
+    let covered = view.covered(start, end)?;
+    // One run means the replacement stays inside it and the tail keeps its own.
+    if covered.len() < 2 {
+        return None;
+    }
+    let last = covered.last()?;
+    let tail = last.end().checked_sub(end)?;
+    if tail == 0 {
+        return None;
+    }
+    let text: String = last
+        .template_text
+        .chars()
+        .skip(last.template_text.chars().count().saturating_sub(tail))
+        .collect();
+    Some((last.leaf_index, tail, text, covered.len()))
 }
 
 /// A core domain failure carries `code: detail`. Keep the code the message
@@ -4634,6 +4701,44 @@ mod tests {
         assert_eq!(error.code, "edit-span-crosses-protected-marker");
         // A span that is not contiguous in the flat text is simply not found.
         assert!(span_crosses_boundary("P0", body, "zz", None).is_none());
+    }
+
+    /// The format-boundary rule: a span that ends inside the LAST of several runs
+    /// would pull that run's remaining text into the first run. Measured on a real
+    /// patent: 使用乳液 (plain + bold) lost 自组装法's bold.
+    #[test]
+    fn a_span_ending_inside_a_later_run_is_a_format_boundary() {
+        let view = ParagraphLeaves {
+            leaves: vec![
+                LeafView {
+                    leaf_index: 0,
+                    template_text: "使用".to_string(),
+                    draft_text: "使用".to_string(),
+                    draft_start: 0,
+                    projected: true,
+                    pending: false,
+                },
+                LeafView {
+                    leaf_index: 1,
+                    template_text: "乳液自组装法".to_string(),
+                    draft_text: "乳液自组装法".to_string(),
+                    draft_start: 2,
+                    projected: true,
+                    pending: false,
+                },
+            ],
+        };
+        // 使用乳液 ends inside run 1, which holds 4 more characters.
+        assert_eq!(
+            untouched_tail_after_span(&view, 0, 4),
+            Some((1, 4, "自组装法".to_string(), 2))
+        );
+        // A span covering run 1 to its end is fine.
+        assert_eq!(untouched_tail_after_span(&view, 0, 8), None);
+        // A span inside one run is fine: the replacement stays in that run.
+        assert_eq!(untouched_tail_after_span(&view, 2, 4), None);
+        // Ending exactly at a run boundary is fine.
+        assert_eq!(untouched_tail_after_span(&view, 0, 2), None);
     }
 
     /// The batch primitive's argument surface, exercised without a workdir.
