@@ -137,3 +137,47 @@ Rules that keep the boundary from eroding:
 - The frozen text guarantees (`format-boundary-crossed`, and every other refusal
   the text protocol has promised) may MOVE to the engine. They may not weaken.
   A split that quietly relaxes one of them is not a refactor.
+
+---
+
+# Format Engine v1 Integration Baseline
+
+Recorded 2026-10-17, after the migration's last steps. This is the state that may
+be treated as a baseline: not a claim that formatting is solved, a claim about
+what is proven and what is deliberately out of scope.
+
+## What is proven
+
+| condition | evidence |
+|---|---|
+| The new engine is the actual execution path | `document_edit kind: "format"` resolves a handle to a character range and hands the request to the engine; the reply reports the plan's own shape |
+| The build executes the plan and re-derives nothing | both build paths read `format_plan.json`, check `base_digest`, materialise; `apply_build` no longer takes formatting at all |
+| Plan conformance is verified | `format-plan-applied` asserts each planned run exists with exactly the properties the plan names — the registry's bytes for a styled run, the baseline's own for one left alone; `edited-part-exact` compares the part modulo the planned runs |
+| An INDEPENDENT check exists that does not read the plan | `scripts/format_preservation.py --styled PARAGRAPH:START-END=STYLE_ID` takes targets from the request and expected properties from the document's own registry, works per character, and reports nine checks |
+| The old replay path is gone | `apply_rpr_edits`, `load_rpr_edits`, `save_rpr_edits`, `record_format_span` and `RPR_EDITS_FILE` are deleted, with the five tests that only exercised them |
+| The five-tool interface and the frozen text protocol are unchanged | no surface change beyond `kind: "format"`'s routing; `core-edit-protocol-v1`'s identity, anchor and transaction contracts untouched |
+| A real patent passes end to end | `find 3O` → `document_edit kind=format` → `save`, then the independent checker: `3` was already subscript (no-op), `O` gained it, and every other character kept its properties |
+
+## What v1 deliberately does not do
+
+- **No style inheritance.** Direct properties only. `docDefaults`, `styles.xml`,
+  paragraph styles, `character styles`, `basedOn` and the paragraph mark's `rPr`
+  are not computed, and the engine must not claim to compute Word's rendering.
+- **No new property vocabulary.** A format edit switches between styles the
+  document already carries; the attribute algebra (derive a style from a partial
+  override map) still lives where it was, serving the wider engine's `format_span`
+  tool, and moves here only when something needs it.
+- **No widening beyond the document part's plain paragraphs.** A paragraph holding
+  a revision gap, or one that is not a plain `P{n}`, is refused rather than
+  guessed; a run inside a hyperlink is never restyled.
+
+## Rules that hold from here
+
+1. A new property, and any inheritance rule, is added in this engine. Not in
+   `prose.rs`, not in `draft.rs`, not in the verifier.
+2. The text lane may read, copy and preserve `rPr` BYTES — that is what keeps a
+   rewrite faithful. It may not decide what those bytes mean. The distinction is
+   the point: forbidding the byte handling would break the frozen guarantees,
+   while allowing the semantics is what produced every failure this ADR records.
+3. The frozen text guarantees may move to the engine. They may not weaken.
+4. A verifier that takes its targets from the plan is not an independent check.
