@@ -121,6 +121,9 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
         );
     };
     let source = PathBuf::from(source);
+    // Kept for the messages: `source` is moved into the workdir when it already is
+    // one, and a refusal has to be able to name it afterwards.
+    let source_label = source.display().to_string();
     let sidecar_report = if !is_workdir(&source) && source.is_file() {
         Some(crate::surface::save::sidecar_set_state(&source))
     } else {
@@ -131,8 +134,13 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
     // caller's vocabulary: it names the call that releases the binding, and it
     // says what that call does NOT do — a workdir keeps its baseline, sidecars
     // and draft on disk, so nothing is lost by leaving it.
+    // One connection drives one workdir, and this is where a caller gets to move
+    // on. The release is queued, not performed: a switch that fails must leave the
+    // original session where it was, so nothing is let go until the target is
+    // known to open — and if opening it fails, the previous workdir is bound
+    // again before the refusal is returned.
     let bound = session.open_workdir().map(str::to_string);
-    let mut released: Option<Value> = None;
+    let mut switching: Option<String> = None;
     if let Some(open) = bound {
         let target_workdir = if is_workdir(&source) {
             source.clone()
@@ -141,14 +149,12 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
         };
         let same = canonical(Path::new(&open)) == canonical(&target_workdir);
         if !same {
-            let reported = workdir_state(session, &open, build_commit);
             if args
                 .get("release_current")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                session.release_workdir();
-                released = Some(reported);
+                switching = Some(open);
             } else {
                 return session.failure(
                     "document_open",
@@ -158,13 +164,14 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
                          Call document_open again with release_current: true to leave it and open \
                          {} — nothing is lost by that: {open} keeps its baseline, its sidecars and \
                          its draft on disk, and opening it again resumes exactly where it stood",
-                        source.display()
+                        source_label
                     ),
                     build_commit,
                 );
             }
         }
     }
+
     let workdir = if is_workdir(&source) {
         source
     } else if source.is_file() {
@@ -217,7 +224,36 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
             }
         }
     }
+    // Only now is the previous binding let go: the target resolved, so the switch
+    // has somewhere to land.
+    let previous = switching.map(|open| {
+        let reported = workdir_state(session, &open, build_commit);
+        session.release_workdir();
+        (open, reported)
+    });
     let opened = session.workdir_open(&open_args, build_commit);
+    if opened.get("isError").and_then(Value::as_bool) == Some(true) {
+        // The switch failed. Put the session back where it was, so a failed switch
+        // costs nothing, and say both things: what failed and what was restored.
+        if let Some((open, _)) = &previous {
+            let restored = session.workdir_open(&json!({ "workdir": open.as_str() }), build_commit);
+            let restored_ok = restored.get("isError").and_then(Value::as_bool) != Some(true);
+            if !restored_ok {
+                return session.failure(
+                    "document_open",
+                    "switch-failed-session-lost",
+                    &format!(
+                        "switching to {} failed, and the previous workdir {open} could not be \
+                         bound again either; nothing was written, and both workdirs are intact on \
+                         disk — open {open} again to resume it",
+                        source_label
+                    ),
+                    build_commit,
+                );
+            }
+        }
+        return opened;
+    }
     // Any internal failure is passed through, unconditionally. Skipping this on
     // a re-open hid it: a workdir whose metadata had gone bad would report a
     // success with no session behind it.
@@ -240,12 +276,12 @@ pub fn document_open(session: &mut McpSession, args: &Value, build_commit: &str)
         // document's provenance.
         data["sidecars"] = sidecars;
     }
-    if let Some(released) = released {
+    if let Some((_, reported)) = previous {
         // Which workdir was left, and what it was carrying. Stated in the reply
         // because the caller asked to leave it: a release that loses nothing is
         // still a change of subject, and an agent that forgets where it was has
         // no way to ask later.
-        data["released"] = released;
+        data["released"] = reported;
     }
     // Whether this workdir can be built at all — answered HERE, not only when
     // `document_save` finally refuses. A document carrying committed typed edits

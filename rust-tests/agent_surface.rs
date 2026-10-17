@@ -2332,6 +2332,112 @@ fn a_session_can_leave_a_workdir_without_losing_its_work() {
     );
 }
 
+/// A switch that cannot finish must cost nothing: the failed target is reported,
+/// and the session is put back on the workdir it was driving. Measured before the
+/// fix: the surface released the binding first, so a bad target left the session
+/// driving nothing at all — and the work that was mid-flight on the first document
+/// became unreachable without knowing that.
+#[test]
+fn a_failed_switch_leaves_the_session_where_it_was() {
+    let (dir, first) = opened("switch-failed");
+    let missing = dir.join("no-such-document.docx");
+    let edit = handle(&first, "中文区域内容");
+
+    let replies = mcp(&[
+        ("document_open", json!({ "source": first })),
+        // A target that cannot be opened, with the release asked for.
+        (
+            "document_open",
+            json!({ "source": missing.to_string_lossy(), "release_current": true }),
+        ),
+        ("document_status", json!({})),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(
+        outcome(&replies[1]),
+        "failure",
+        "opening a missing document must fail: {:?}",
+        replies[1]
+    );
+    assert_eq!(
+        outcome(&replies[2]),
+        "success",
+        "the session was left driving nothing after a failed switch: {:?}",
+        replies[2]
+    );
+    assert_eq!(
+        data(&replies[2])["session"]["source_drift"]["source"]
+            .as_str()
+            .map(|source| source.ends_with("source.docx")),
+        Some(true),
+        "the session is not back on the workdir it was driving: {:?}",
+        data(&replies[2])
+    );
+
+    // And the work goes on: the edit that was pending before the failed switch is
+    // still addressable, and still lands.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": first })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": edit, "replace_with": "中文区块区域内容" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+}
+
+/// Switching back and forth is not a state change: the documents keep what they
+/// had, and a handle taken before a switch still addresses its span afterwards.
+/// The handle's address is the REVISION, not the connection.
+#[test]
+fn switching_away_and_back_keeps_both_documents_and_their_handles() {
+    let (dir, first) = opened("switch-cycles");
+    let second_source = dir.join("second.docx");
+    std::fs::copy(fixture("styled"), &second_source).expect("copy fixture");
+    // Measure AFTER the first find: `edit.md` and `edit.state.json` are materialised
+    // when the projection is first read, so a digest taken before that would report
+    // the projection's own work as the switching's.
+    let handle_before = handle(&first, "中文区域内容");
+    let before = content_digest(Path::new(&first));
+
+    let mut replies = Vec::new();
+    for _ in 0..3 {
+        replies.extend(mcp(&[
+            (
+                "document_open",
+                json!({ "source": second_source.to_string_lossy(), "release_current": true }),
+            ),
+            (
+                "document_open",
+                json!({ "source": first, "release_current": true }),
+            ),
+        ]));
+    }
+    for reply in &replies {
+        assert_eq!(outcome(reply), "success", "{reply:?}");
+    }
+    assert_eq!(
+        content_digest(Path::new(&first)),
+        before,
+        "switching away and back changed the workdir"
+    );
+
+    // The handle taken before all that switching still edits its span.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": first })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": handle_before, "replace_with": "中文区块区域内容" }] }),
+        ),
+    ]);
+    assert_eq!(
+        outcome(&replies[1]),
+        "success",
+        "a handle taken before a switch no longer addresses its span: {:?}",
+        replies[1]
+    );
+}
+
 #[test]
 fn an_opened_document_reports_whether_its_evidence_is_its_own() {
     let (dir, workdir) = opened("sidecar-set");
