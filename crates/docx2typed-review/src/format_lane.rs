@@ -185,8 +185,23 @@ pub fn resolve_style(
             }
             _ => CollaborationError::new("format-style-unavailable", message),
         }
-    })?;
-    Ok(derived.style_id)
+    });
+    match derived {
+        Ok(restyle) => Ok(restyle.style_id),
+        // "Nothing to change" is not a failure to resolve: the span already holds
+        // the requested properties, so the style it holds IS the answer. A
+        // whole-set request then skips it as satisfied instead of refusing the
+        // batch — measured, bolding every 四氧化三铁 failed because the first one
+        // was bold in the source.
+        Err(error) if error.to_string().starts_with("format-noop") => {
+            Ok(docx2typed_core::document_projection::content_style_id(
+                prose::canonical_rpr_json(&base.rpr)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            ))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// The requests a workdir has accumulated, in the order they were made.
