@@ -226,6 +226,45 @@ mod schema_forwarding_tests {
     /// The same rule one level down. An edit object is validated against its own
     /// schema, and that schema is closed — so a per-edit key the code reads but
     /// the schema omits is refused before the read, exactly like a top-level one.
+    /// Every field the schema declares is CONSUMED by each kind that may carry it,
+    /// or refused when that kind cannot use it.
+    ///
+    /// The invariant that was missing: `replace` accepted `format` and dropped it.
+    /// A field read as accepted and then ignored is worse than an unknown one, and
+    /// this is the test that keeps the matrix total.
+    #[test]
+    fn every_declared_field_is_consumed_or_refused() {
+        let schema = crate::surface::schema("document_edit").expect("schema");
+        let item = &schema["properties"]["edits"]["items"];
+        let declared: Vec<String> = item["properties"]
+            .as_object()
+            .expect("edit properties")
+            .keys()
+            .cloned()
+            .collect();
+        for kind in ["replace", "insert_after", "delete", "format"] {
+            for field in &declared {
+                let mut object = serde_json::Map::new();
+                object.insert("kind".to_string(), serde_json::json!(kind));
+                object.insert(field.clone(), serde_json::json!("x"));
+                let entry = serde_json::Value::Object(object);
+                let unconsumed = crate::surface::edit::unconsumed_field(kind, &entry);
+                let consumed = unconsumed.is_none();
+                let universal = matches!(field.as_str(), "kind" | "handle" | "selector");
+                assert!(
+                    consumed || universal || unconsumed == Some(field.as_str()),
+                    "kind `{kind}` neither consumes nor refuses `{field}`"
+                );
+                if !universal {
+                    assert!(
+                        consumed || unconsumed.is_some(),
+                        "`{field}` must be consumed by `{kind}` or refused when sent with it"
+                    );
+                }
+            }
+        }
+    }
+
     /// `format_policy` was taught to `document_edit` and not declared here, and
     /// the tool rejected the parameter it had just been given a way to honour.
     #[test]

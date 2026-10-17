@@ -39,6 +39,122 @@ use docx2typed_review::{collab, server::MutationError};
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// Which member of a selector-expanded batch refused, and why.
+///
+/// One dry run per member, through the same path the batch took, so the engine
+/// decides — this reports a decision, it does not make one. `index` and the range
+/// come from the resolution, never from the caller's arithmetic.
+fn selector_member_diagnosis(
+    session: &mut McpSession,
+    args: &Value,
+    failure: &Value,
+    build_commit: &str,
+) -> Option<Value> {
+    let entries = args.get("edits").and_then(Value::as_array)?;
+    let selector = entries
+        .iter()
+        .find_map(|entry| entry.get("selector"))
+        .filter(|selector| !selector.is_null())?;
+    let handles = handles_for_selector(session, selector, build_commit).ok()?;
+    let matched = handles.len();
+    let mut failures: Vec<Value> = Vec::new();
+    for (index, handle) in handles.iter().enumerate() {
+        let mut single = entries.clone();
+        for entry in single.iter_mut() {
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("selector");
+                object.insert("handle".to_string(), json!(handle));
+            }
+        }
+        let mut probe_args = args.clone();
+        if let Some(object) = probe_args.as_object_mut() {
+            object.insert("edits".to_string(), json!(single));
+            object.insert("dry_run".to_string(), json!(true));
+        }
+        let probed = super::edit::document_edit(session, &probe_args, build_commit);
+        let Some(envelope) = probed.get("structuredContent") else {
+            continue;
+        };
+        if envelope.get("outcome").and_then(Value::as_str) == Some("success") {
+            continue;
+        }
+        let code = envelope
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .and_then(|diagnostics| diagnostics.first())
+            .and_then(|diagnostic| diagnostic.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("refused")
+            .to_string();
+        failures.push(json!({
+            "index": index,
+            "handle": handle,
+            "code": code,
+        }));
+    }
+    if failures.is_empty() {
+        return None;
+    }
+    let rejected = failures.len();
+    let detail = failure
+        .get("structuredContent")
+        .and_then(|envelope| envelope.get("diagnostics"))
+        .and_then(Value::as_array)
+        .and_then(|diagnostics| diagnostics.first())
+        .and_then(|diagnostic| diagnostic.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some(session.failure(
+        "document_edit",
+        "selector-member-rejected",
+        &format!(
+            "the selector matched {matched} target(s), {rejected} of them cannot be applied, and \
+             nothing was written (the batch is all-or-nothing). The members that refused: {}. \
+             First refusal: {detail}",
+            failures
+                .iter()
+                .map(|failure| format!(
+                    "#{} ({})",
+                    failure.get("index").and_then(Value::as_u64).unwrap_or(0),
+                    failure.get("code").and_then(Value::as_str).unwrap_or("refused")
+                ))
+                .collect::<Vec<String>>()
+                .join(", ")
+        ),
+        build_commit,
+    ))
+}
+
+/// The first key an entry carries that its kind does not consume.
+///
+/// The matrix, and the reason it exists: the schema declares the union of every
+/// kind's fields, so a field that belongs to one kind can be sent with another and
+/// be read as accepted. `replace` carrying `format` did exactly that — the
+/// formatting was dropped without a word.
+pub(crate) fn unconsumed_field<'a>(kind: &str, edit: &'a Value) -> Option<&'a str> {
+    const UNIVERSAL: [&str; 3] = ["kind", "handle", "selector"];
+    let consumed: &[&str] = match kind {
+        "replace" => &["replace_with"],
+        "insert_after" => &["text", "format_policy"],
+        "delete" => &[],
+        "format" => &["style_id", "format"],
+        _ => return None,
+    };
+    let object = edit.as_object()?;
+    object.keys().find_map(|key| {
+        if UNIVERSAL.contains(&key.as_str()) || consumed.contains(&key.as_str()) {
+            return None;
+        }
+        // The marker the selector expansion leaves behind never comes from a
+        // caller and is removed before parsing.
+        if key == FROM_SELECTOR {
+            return None;
+        }
+        Some(key.as_str())
+    })
+}
+
 /// Every handle a `selector` names, in document order.
 ///
 /// A caller that wants "every 四氧化三铁 in the body" should say exactly that. The
@@ -224,9 +340,11 @@ fn edits_from(
     // is this layer's job — the format engine still decides what each span becomes,
     // and one target that cannot be applied refuses the whole batch.
     let mut expanded: Vec<Value> = Vec::with_capacity(edits.len());
+    let mut from_selector = false;
     for edit in edits {
         match edit.get("selector") {
             Some(selector) if !selector.is_null() => {
+                from_selector = true;
                 let handles = handles_for_selector(session, selector, build_commit)?;
                 for handle in handles {
                     let mut concrete = edit.clone();
@@ -247,6 +365,7 @@ fn edits_from(
         }
     }
     let mut parsed = Vec::with_capacity(expanded.len());
+    let mut members: Vec<Value> = Vec::new();
     for (index, edit) in expanded.iter().enumerate() {
         let number = index + 1;
         let keys = || {
@@ -269,6 +388,36 @@ fn edits_from(
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("replace");
+        // Every field this kind accepts is CONSUMED by it. A key the schema
+        // declares but the kind ignores is worse than an unknown key: it reads as
+        // accepted and then does nothing — `{"kind": "replace", "format": {...}}`
+        // silently dropped the formatting. Refused here, whole batch, nothing
+        // written.
+        if let Some(field) = unconsumed_field(kind, edit) {
+            return Err(session.failure(
+                "document_edit",
+                "unsupported-combined-edit",
+                &format!(
+                    "edit #{number} is kind `{kind}` and carries `{field}`, which that kind does \
+                     not use; nothing was written. `format` belongs to its own entry (kind \
+                     `format`), because a format edit's span is measured against the text as it \
+                     stands — replacing text and formatting the replacement in one entry has no \
+                     defined order yet. Send the text edit, then a separate format edit. Keys on \
+                     this entry: [{}]",
+                    keys()
+                ),
+                build_commit,
+            ));
+        }
+        if from_selector {
+            // Kept so a batch that fails can name WHICH member it failed on: the
+            // caller enumerated nothing and cannot reconstruct an index, and
+            // finding it by bisection is a handful of turns it should not spend.
+            members.push(json!({
+                "index": index,
+                "handle": handle,
+            }));
+        }
         match kind {
             "replace" => {
                 let Some(replace_with) = edit.get("replace_with").and_then(Value::as_str) else {
@@ -502,6 +651,17 @@ pub(crate) fn apply_and_sync(
                         "unit": "unicode-scalars",
                     },
                     "style_id": style_id,
+                    // Two different operations, named apart. `attribute_request`
+                    // derives a style from the span's base properties and requires
+                    // the document to carry it; `registered_style` applies the
+                    // named style's WHOLE property set, which may change `lang`,
+                    // font slots and anything else the run carried. Twelve spans
+                    // being bold says nothing about what else they were.
+                    "mode": if request.attributes.is_some() {
+                        "attribute_request"
+                    } else {
+                        "registered_style"
+                    },
                     "segments": paragraph_plan.map(|plan| plan.segments.len()),
                     "runs": paragraph_plan.map(|plan| plan.runs.len()),
                 }));
@@ -819,6 +979,13 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
         return applied;
     };
     if envelope.get("outcome").and_then(Value::as_str) != Some("success") {
+        // A batch a SELECTOR expanded can name which member refused. The caller
+        // enumerated nothing, so it cannot reconstruct an index; without this it
+        // bisects the set over several turns. Still zero writes: the diagnosis is
+        // a dry run per member, and the refusal above already wrote nothing.
+        if let Some(diagnosis) = selector_member_diagnosis(session, args, &applied, build_commit) {
+            return diagnosis;
+        }
         return applied;
     }
     let data = envelope.get("data").cloned().unwrap_or_else(|| json!({}));
