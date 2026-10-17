@@ -156,6 +156,7 @@ fn a_character_range_gets_a_style_and_nothing_else_moves() {
         start: offset,
         end: offset + length,
         style_id: SUPERSCRIPT.to_string(),
+        attributes: None,
     };
     let (plan, snapshot) = plan_format(workdir, std::slice::from_ref(&request)).expect("plan");
     save_format_requests(workdir, std::slice::from_ref(&request)).expect("save requests");
@@ -257,6 +258,7 @@ fn planning_the_same_request_again_changes_nothing() {
         start: offset,
         end: offset + 6,
         style_id: SUPERSCRIPT.to_string(),
+        attributes: None,
     };
     let (plan, snapshot) = plan_format(workdir, std::slice::from_ref(&request)).expect("plan");
     let built = apply_format_plan(&package, &plan, &snapshot).expect("apply");
@@ -271,6 +273,81 @@ fn planning_the_same_request_again_changes_nothing() {
     assert_eq!(built, built_again, "the plan is a fixed point");
 }
 
+/// Asking by PROPERTIES is the engine's job: it resolves the style the document
+/// already carries, so a caller never has to read rPr features to pick an id. A
+/// blind run did exactly that by hand, which is why this form exists.
+#[test]
+fn properties_resolve_to_the_document_own_style() {
+    let scratch = workdir("by-properties", "complex");
+    let workdir = scratch.0.as_path();
+    // A span whose base is the document's plain formatting: the derivation is
+    // base + override, and the registry has to hold that exact combination. A run
+    // already carrying `<w:shadow/>` has no bold variant, and the engine refuses
+    // rather than inventing one — which this test also asserts.
+    let (_, offset) = locate(workdir, "P3", "EDIT-ME");
+    let length = "EDIT-ME".chars().count();
+
+    let attributes = serde_json::json!({ "bold": true })
+        .as_object()
+        .cloned()
+        .expect("object");
+    let resolved = docx2typed_review::format_lane::resolve_style(
+        workdir,
+        "P3",
+        offset,
+        offset + length,
+        &attributes,
+    )
+    .expect("the document carries a bold variant of the plain base");
+
+    // The resolved style is one the document carries, and it IS bold.
+    let registry = docx2typed_review::format_lane::style_registry(workdir).expect("registry");
+    let rpr = registry
+        .get(&resolved)
+        .expect("a style the document carries");
+    assert!(
+        rpr.contains("<w:b"),
+        "the resolved style must be a bold one: {rpr}"
+    );
+
+    // A request by properties plans exactly like the same request by id.
+    let by_properties = FormatRequest {
+        paragraph_id: "P3".to_string(),
+        start: offset,
+        end: offset + length,
+        style_id: resolved.clone(),
+        attributes: Some(serde_json::json!({ "bold": true })),
+    };
+    let by_id = FormatRequest {
+        attributes: None,
+        ..by_properties.clone()
+    };
+    let (plan_a, _) = plan_format(workdir, std::slice::from_ref(&by_properties)).expect("plan a");
+    let (plan_b, _) = plan_format(workdir, std::slice::from_ref(&by_id)).expect("plan b");
+    assert_eq!(
+        plan_a, plan_b,
+        "the two ways to ask must plan the same thing"
+    );
+
+    // A base that has no such variant is refused, not guessed: the span in a
+    // `<w:shadow/>` run cannot become bold because the document has no such style.
+    let (_, shadow) = locate(workdir, "P3", "shadow");
+    let error = docx2typed_review::format_lane::resolve_style(
+        workdir,
+        "P3",
+        shadow,
+        shadow + 6,
+        &attributes,
+    )
+    .expect_err("no bold variant on that base");
+    assert_eq!(error.code, "format-style-unavailable");
+    assert!(
+        error.detail.contains("style_id"),
+        "the refusal must say what to do instead: {}",
+        error.detail
+    );
+}
+
 #[test]
 fn a_style_the_document_does_not_carry_is_refused_with_the_ones_it_does() {
     let scratch = workdir("unknown-style", "complex");
@@ -281,6 +358,7 @@ fn a_style_the_document_does_not_carry_is_refused_with_the_ones_it_does() {
         start: offset,
         end: offset + 6,
         style_id: "s_not_a_style".to_string(),
+        attributes: None,
     };
     let error: CollaborationError =
         plan_format(workdir, std::slice::from_ref(&request)).expect_err("unknown style");
@@ -298,6 +376,7 @@ fn a_range_outside_the_paragraph_is_refused_before_anything_is_written() {
         start: visible.chars().count() + 5,
         end: visible.chars().count() + 9,
         style_id: SUPERSCRIPT.to_string(),
+        attributes: None,
     };
     let error = plan_format(workdir, std::slice::from_ref(&request)).expect_err("bad range");
     assert_eq!(error.code, "format-range-invalid");
@@ -340,6 +419,7 @@ fn a_text_edit_and_a_format_edit_land_in_one_generation() {
         start: offset,
         end: offset + 4,
         style_id: SUPERSCRIPT.to_string(),
+        attributes: None,
     };
     let (plan, snapshot) = plan_format(workdir, std::slice::from_ref(&request)).expect("plan");
     let package = draft_package(workdir).expect("draft package");

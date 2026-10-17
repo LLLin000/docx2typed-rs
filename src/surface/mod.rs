@@ -117,7 +117,11 @@ pub fn schema(name: &str) -> Option<Value> {
                             "replace_with": {"type": ["string", "null"], "default": null},
                             "text": {"type": ["string", "null"], "default": null},
                             // kind `format`: the style the covered characters take.
+                            // Name it (`style_id`, from document_find's verdict) or
+                            // name properties (`format: {"bold": true}`) and let the
+                            // engine resolve the style this document already carries.
                             "style_id": {"type": ["string", "null"], "default": null},
+                            "format": {"type": ["object", "null"], "default": null},
                             // How much of the anchor's formatting the new
                             // paragraph takes. `safe_inherit` is the default and
                             // copies only what may be copied — no revision

@@ -46,7 +46,9 @@ use std::path::Path;
 #[derive(Clone, Debug)]
 pub(crate) struct FormatRequest {
     pub(crate) handle: String,
+    /// Either a style id the caller named, or empty with `attributes` set.
     pub(crate) style_id: String,
+    pub(crate) attributes: Option<Value>,
 }
 
 /// One edit, in the shape its kind requires.
@@ -182,23 +184,41 @@ fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<
                 handle: handle.to_string(),
             }),
             "format" => {
-                let Some(style_id) = edit.get("style_id").and_then(Value::as_str) else {
-                    return Err(session.failure(
-                        "document_edit",
-                        "invalid-arguments",
-                        &format!(
-                            "edit #{number} is kind `format` and needs `style_id`: one of the \
-                             style ids document_find reports for the span (they are the styles \
-                             the document already carries); got keys [{}]",
-                            keys()
-                        ),
-                        build_commit,
-                    ));
-                };
-                parsed.push(Edit::Format(FormatRequest {
-                    handle: handle.to_string(),
-                    style_id: style_id.to_string(),
-                }));
+                // Two ways to say it, one authority. `style_id` names a style the
+                // document carries — the ids document_find reports for the span.
+                // `format` names PROPERTIES (`{"bold": true}`) and the engine
+                // resolves the style the document already has for them, refusing
+                // when it has none. An agent that reads rPr features to pick an id
+                // is doing the engine's work; a blind run did exactly that.
+                let style_id = edit.get("style_id").and_then(Value::as_str);
+                let attributes = edit.get("format").and_then(Value::as_object);
+                match (style_id, attributes) {
+                    (Some(style_id), _) => parsed.push(Edit::Format(FormatRequest {
+                        handle: handle.to_string(),
+                        style_id: style_id.to_string(),
+                        attributes: None,
+                    })),
+                    (None, Some(attributes)) => parsed.push(Edit::Format(FormatRequest {
+                        handle: handle.to_string(),
+                        style_id: String::new(),
+                        attributes: Some(Value::Object(attributes.clone())),
+                    })),
+                    (None, None) => {
+                        return Err(session.failure(
+                            "document_edit",
+                            "invalid-arguments",
+                            &format!(
+                                "edit #{number} is kind `format` and needs either `style_id` \
+                                 (one of the ids document_find reports for the span) or `format` \
+                                 (the properties to give the characters, e.g. {{\"bold\": true}}, \
+                                 which the engine resolves against the styles this document \
+                                 already carries); got keys [{}]",
+                                keys()
+                            ),
+                            build_commit,
+                        ))
+                    }
+                }
             }
             other => {
                 return Err(session.failure(
@@ -269,14 +289,29 @@ pub(crate) fn apply_and_sync(
                 // the run structure. A second opinion here is the second authority
                 // the split exists to remove.
                 let length = resolved.text.chars().count();
+                let (start, end) = (resolved.start, resolved.start + length);
+                let style_id = match &request.attributes {
+                    Some(Value::Object(attributes)) => {
+                        docx2typed_review::format_lane::resolve_style(
+                            target,
+                            &resolved.paragraph_id,
+                            start,
+                            end,
+                            attributes,
+                        )
+                        .map_err(|error| MutationError::new(error.code, error.detail))?
+                    }
+                    _ => request.style_id.clone(),
+                };
                 let (plan, _snapshot, _requests) =
                     docx2typed_review::format_lane::record_format_request(
                         target,
                         docx2typed_review::format_lane::FormatRequest {
                             paragraph_id: resolved.paragraph_id.clone(),
-                            start: resolved.start,
-                            end: resolved.start + length,
-                            style_id: request.style_id.clone(),
+                            start,
+                            end,
+                            style_id: style_id.clone(),
+                            attributes: request.attributes.clone(),
                         },
                     )
                     .map_err(|error| MutationError::new(error.code, error.detail))?;
@@ -289,7 +324,7 @@ pub(crate) fn apply_and_sync(
                         "end": resolved.start + length,
                         "unit": "unicode-scalars",
                     },
-                    "style_id": request.style_id,
+                    "style_id": style_id,
                     "segments": paragraph_plan.map(|plan| plan.segments.len()),
                     "runs": paragraph_plan.map(|plan| plan.runs.len()),
                 }));

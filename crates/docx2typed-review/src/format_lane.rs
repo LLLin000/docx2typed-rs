@@ -36,7 +36,73 @@ pub struct FormatRequest {
     pub paragraph_id: String,
     pub start: usize,
     pub end: usize,
+    /// The style the characters take, resolved by the engine. A caller may name
+    /// one directly (an id `document_find` reported) or name PROPERTIES and let
+    /// the engine find the style the document already carries for them —
+    /// `{"bold": true}`. Deriving that from the registry is the engine's work;
+    /// an agent reading rPr features to pick an id is doing the engine's job.
     pub style_id: String,
+    /// What the caller asked for, when they asked by properties. Audit only: the
+    /// plan is derived from `style_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<serde_json::Value>,
+}
+
+/// The style a set of requested properties resolves to for a span, against the
+/// styles the document already carries.
+///
+/// One style for the span, derived from the FIRST covered run's properties — the
+/// same rule the wider engine's `format_span` tool has always used. A property
+/// the document has no variant for is `format-style-unavailable`, listing what it
+/// does have: the engine never invents a style.
+pub fn resolve_style(
+    workdir: &Path,
+    paragraph_id: &str,
+    start: usize,
+    end: usize,
+    attributes: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, CollaborationError> {
+    let package = draft_package(workdir)?;
+    let inventory = prose::enumerate_package_bytes(&package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let leaves: Vec<&ProseLeaf> = inventory
+        .leaves
+        .iter()
+        .filter(|leaf| leaf.paragraph_id == paragraph_id)
+        .collect();
+    let mut cursor = 0usize;
+    let mut first_covered: Option<&ProseLeaf> = None;
+    for leaf in leaves {
+        if leaf.text_start == leaf.text_end {
+            continue;
+        }
+        let length = leaf.text.chars().count();
+        let (leaf_start, leaf_end) = (cursor, cursor + length);
+        cursor = leaf_end;
+        if leaf_start < end && leaf_end > start {
+            first_covered = Some(leaf);
+            break;
+        }
+    }
+    let Some(base) = first_covered else {
+        return Err(CollaborationError::new(
+            "format-range-invalid",
+            format!("[{start}, {end}) of {paragraph_id} covers no editable text"),
+        ));
+    };
+    let available = prose::load_style_rprs_for(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let ids: std::collections::BTreeSet<String> = available.keys().cloned().collect();
+    let derived = prose::restyle_run_properties(&base.rpr, attributes, &ids).map_err(|error| {
+        let message = error.to_string();
+        match message.split_once(':') {
+            Some((code, detail)) if !code.contains(' ') => {
+                CollaborationError::new(code, detail.trim())
+            }
+            _ => CollaborationError::new("format-style-unavailable", message),
+        }
+    })?;
+    Ok(derived.style_id)
 }
 
 /// The requests a workdir has accumulated, in the order they were made.
@@ -134,6 +200,7 @@ pub fn snapshot_for_plan(
             paragraph_id: paragraph_id.clone(),
             start: 0,
             end: 1,
+            attributes: None,
             style_id: plan
                 .paragraphs
                 .iter()

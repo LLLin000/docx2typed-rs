@@ -2253,6 +2253,7 @@ impl McpSession {
                         start: edit.text_start,
                         end: edit.text_end,
                         style_id: edit.style_id.clone(),
+                        attributes: Some(edit.attributes.clone()),
                     },
                 )
                 .map_err(|error| MutationError::new(error.code, error.detail))?;
