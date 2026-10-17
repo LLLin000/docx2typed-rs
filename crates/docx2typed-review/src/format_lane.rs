@@ -1,0 +1,387 @@
+//! The adapter between the workdir and the format engine.
+//!
+//! Everything the engine needs, and nothing it does not: a snapshot (the draft
+//! text, the runs that text lives in, the style registry, the baseline digest)
+//! and, at build time, the byte ranges of the paragraphs a plan names.
+//!
+//! Two boundaries this module exists to hold:
+//!
+//! - **Paragraph identity is decided here and nowhere else.** The engine plans
+//!   characters; the materialiser writes bytes; neither knows what `P9` means.
+//!   This module maps an id to a byte range, once, and the mapping is used for
+//!   the plan, the build and the verification — never re-paired by ordinal after
+//!   a build has moved paragraphs around.
+//! - **The draft is the coordinate space.** A plan's ranges address the draft:
+//!   the template with the text islands and the structural edits applied. The
+//!   build applies the plan to that same package, which is what makes the
+//!   coordinates mean the same thing on both sides.
+
+use docx2typed_core::prose::{self, ProseLeaf};
+use docx2typed_format::materialize::materialize;
+use docx2typed_format::{
+    plan, FormatIntent, FormatPlan, OriginalRun, ParagraphSnapshot, RangeUnit, Snapshot,
+};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::{CollaborationError, FORMAT_INTENTS_FILE, FORMAT_PLAN_FILE};
+
+/// Each planned paragraph and the byte range it occupies in a package.
+pub type ParagraphRanges = Vec<(String, (usize, usize))>;
+
+/// One format request as the surface resolved it: a paragraph, a character range
+/// in the draft, and a style the document carries.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FormatRequest {
+    pub paragraph_id: String,
+    pub start: usize,
+    pub end: usize,
+    pub style_id: String,
+}
+
+/// The requests a workdir has accumulated, in the order they were made.
+pub fn load_format_requests(workdir: &Path) -> Result<Vec<FormatRequest>, CollaborationError> {
+    let path = workdir.join(FORMAT_INTENTS_FILE);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let requests = value
+        .get("requests")
+        .and_then(|requests| requests.as_array())
+        .ok_or_else(|| {
+            CollaborationError::new("workdir-invalid", "format_intents.json has no requests")
+        })?;
+    let mut out = Vec::with_capacity(requests.len());
+    for request in requests {
+        out.push(serde_json::from_value(request.clone()).map_err(|error| {
+            CollaborationError::new(
+                "workdir-invalid",
+                format!("invalid format request: {error}"),
+            )
+        })?);
+    }
+    Ok(out)
+}
+
+/// Add a request (idempotent: the same span and style twice is one request) and
+/// re-derive the plan from the whole set.
+///
+/// The plan is a pure function of the requests and the draft, so re-deriving is
+/// not a second opinion: it is the same answer, computed once more from inputs
+/// that may have grown.
+pub fn plan_format(
+    workdir: &Path,
+    requests: &[FormatRequest],
+) -> Result<(FormatPlan, Snapshot), CollaborationError> {
+    let snapshot = snapshot_for(workdir, requests)?;
+    let intents: Vec<FormatIntent> = requests
+        .iter()
+        .map(|request| FormatIntent::SetStyle {
+            paragraph_id: request.paragraph_id.clone(),
+            range: docx2typed_format::DraftRange::new(request.start, request.end),
+            style_id: request.style_id.clone(),
+        })
+        .collect();
+    let plan = plan(&snapshot, &intents)
+        .map_err(|error| CollaborationError::new(error.code, error.detail))?;
+    Ok((plan, snapshot))
+}
+
+/// Persist the requests and the plan they derive.
+pub fn save_format_requests(
+    workdir: &Path,
+    requests: &[FormatRequest],
+) -> Result<(), CollaborationError> {
+    let path = workdir.join(FORMAT_INTENTS_FILE);
+    if requests.is_empty() {
+        if path.is_file() {
+            std::fs::remove_file(&path).map_err(|error| {
+                CollaborationError::new("workdir-unreadable", error.to_string())
+            })?;
+        }
+        return Ok(());
+    }
+    let value = serde_json::json!({
+        "schema": FORMAT_INTENTS_SCHEMA,
+        "unit": "unicode-scalars",
+        "requests": requests,
+    });
+    let mut json = serde_json::to_string_pretty(&value)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    json.push('\n');
+    std::fs::write(&path, json)
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))
+}
+
+pub const FORMAT_INTENTS_SCHEMA: &str = "docx2typed-format-intents-1";
+
+/// Persist the derived plan, which is what the build executes and the verifier
+/// checks. Regenerable from the requests; stored so neither of them has to
+/// re-derive the rules.
+pub fn save_format_plan(workdir: &Path, plan: &FormatPlan) -> Result<(), CollaborationError> {
+    let path = workdir.join(FORMAT_PLAN_FILE);
+    std::fs::write(&path, docx2typed_format::materialize::to_json(plan))
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))
+}
+
+/// The plan a workdir carries, if any.
+pub fn load_format_plan(workdir: &Path) -> Result<Option<FormatPlan>, CollaborationError> {
+    let path = workdir.join(FORMAT_PLAN_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    let plan: FormatPlan = serde_json::from_slice(&bytes)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    Ok(Some(plan))
+}
+
+/// The package a plan's coordinates are measured in: the template with the text
+/// islands and the structural edits applied, and no formatting yet.
+pub fn draft_package(workdir: &Path) -> Result<Vec<u8>, CollaborationError> {
+    let islands = prose::load_islands(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let structure = prose::load_structure(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let styles = prose::load_style_rprs_for(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let built = prose::apply_build(
+        &workdir.join("_template.docx"),
+        &islands,
+        &structure,
+        &[],
+        &styles,
+    )
+    .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    Ok(built.package)
+}
+
+/// Build the snapshot the engine plans against.
+fn snapshot_for(
+    workdir: &Path,
+    requests: &[FormatRequest],
+) -> Result<Snapshot, CollaborationError> {
+    let package = draft_package(workdir)?;
+    let inventory = prose::enumerate_package_bytes(&package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let styles = prose::load_style_rprs_for(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+
+    let mut paragraph_ids: Vec<String> = Vec::new();
+    for request in requests {
+        if !paragraph_ids.contains(&request.paragraph_id) {
+            paragraph_ids.push(request.paragraph_id.clone());
+        }
+    }
+    let mut paragraphs: Vec<ParagraphSnapshot> = Vec::new();
+    for paragraph_id in paragraph_ids {
+        let leaves: Vec<&ProseLeaf> = inventory
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.paragraph_id == paragraph_id)
+            .collect();
+        if leaves.is_empty() {
+            return Err(CollaborationError::new(
+                "format-paragraph-unknown",
+                format!("{paragraph_id} is not in this document"),
+            ));
+        }
+        // v1 scope, refused rather than guessed: a paragraph holding a revision
+        // gap has a coordinate space of its own, and a paragraph that is not a
+        // plain `P{n}` is one this adapter cannot map to a byte range.
+        if leaves.iter().any(|leaf| !leaf.projected) {
+            return Err(CollaborationError::new(
+                "format-paragraph-unsupported",
+                format!(
+                    "{paragraph_id} holds a revision gap (a tracked deletion); character-level \
+                     formatting there is not supported yet"
+                ),
+            ));
+        }
+        let draft_text: String = leaves.iter().map(|leaf| leaf.text.as_str()).collect();
+        let runs: Vec<OriginalRun> = leaves
+            .iter()
+            .enumerate()
+            .map(|(index, leaf)| OriginalRun {
+                index,
+                text: leaf.text.clone(),
+                rpr: leaf.rpr.clone(),
+            })
+            .collect();
+        paragraphs.push(ParagraphSnapshot {
+            paragraph_id,
+            draft_text,
+            runs,
+        });
+    }
+
+    Ok(Snapshot {
+        generation_id: current_revision(workdir)?,
+        base_digest: base_digest(workdir)?,
+        styles,
+        paragraphs,
+    })
+}
+
+/// The draft revision this plan is derived from — the same token a caller's
+/// handles are bound to.
+fn current_revision(workdir: &Path) -> Result<String, CollaborationError> {
+    Ok(docx2typed_core::edit_state::classify_edit_state(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?
+        .edit_body_sha256)
+}
+
+/// What the plan was derived from: the template, the two structural sidecars and
+/// the registry. A build against another one is refusable rather than silently
+/// applied.
+fn base_digest(workdir: &Path) -> Result<String, CollaborationError> {
+    let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+    for name in [
+        "_template.docx",
+        "islands.json",
+        "structure.json",
+        "styles.json",
+    ] {
+        let path = workdir.join(name);
+        let bytes = if path.is_file() {
+            std::fs::read(&path)
+                .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        parts.push((name.to_string(), bytes));
+    }
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    for (name, bytes) in &parts {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(bytes);
+        hasher.update(b"\0");
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// The byte range of each planned paragraph, inside `package`.
+///
+/// The mapping is computed from the package the plan was made against, so an id
+/// that moved — a paragraph inserted before it — resolves to where the plan
+/// meant, not to whatever now sits at that ordinal.
+pub fn paragraph_ranges(
+    package: &[u8],
+    plan: &FormatPlan,
+) -> Result<ParagraphRanges, CollaborationError> {
+    let inventory = prose::enumerate_package_bytes(package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let part = prose::part_path("document");
+    let mut ordered: Vec<&str> = Vec::new();
+    for entry in &inventory.paragraphs {
+        if entry.part_key == "document" {
+            ordered.push(entry.paragraph_id.as_str());
+        }
+    }
+    let ranges = paragraph_element_ranges(package, &part);
+    let mut out = Vec::new();
+    for planned in &plan.paragraphs {
+        let Some(ordinal) = ordered.iter().position(|id| *id == planned.paragraph_id) else {
+            return Err(CollaborationError::new(
+                "format-paragraph-unknown",
+                format!("{} is not in the package", planned.paragraph_id),
+            ));
+        };
+        let Some(range) = ranges.get(ordinal) else {
+            return Err(CollaborationError::new(
+                "format-paragraph-unsupported",
+                format!(
+                    "{} is not a plain paragraph this adapter can address (nested in a table, a \
+                     box or a content control)",
+                    planned.paragraph_id
+                ),
+            ));
+        };
+        out.push((planned.paragraph_id.clone(), *range));
+    }
+    Ok(out)
+}
+
+/// One member's bytes, read through the crate's own zip reader.
+pub fn member_bytes(package: &[u8], member: &str) -> Result<Vec<u8>, CollaborationError> {
+    use std::io::Read;
+    let reader = std::io::Cursor::new(package.to_vec());
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let mut file = archive
+        .by_name(member)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    Ok(bytes)
+}
+
+/// The byte ranges of the `w:p` elements of one part, in document order.
+fn paragraph_element_ranges(package: &[u8], part_path: &str) -> Vec<(usize, usize)> {
+    let Ok(part) = member_bytes(package, part_path) else {
+        return Vec::new();
+    };
+    let tags = docx2typed_format::xml::scan_tags(&part);
+    let mut ranges = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut depth = 0usize;
+    for tag in &tags {
+        if tag.name != "p" {
+            continue;
+        }
+        if !tag.closing {
+            if depth == 0 {
+                open = Some(tag.start);
+            }
+            depth += 1;
+        } else {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                if let Some(start) = open.take() {
+                    ranges.push((start, tag.end));
+                }
+            }
+        }
+    }
+    ranges
+}
+
+/// Apply a plan to the draft package: the single run-splitting and property-
+/// writing path in the tree.
+pub fn apply_format_plan(
+    package: &[u8],
+    plan: &FormatPlan,
+    snapshot: &Snapshot,
+) -> Result<Vec<u8>, CollaborationError> {
+    let ranges = paragraph_ranges(package, plan)?;
+    let mut current = package.to_vec();
+    for (paragraph_id, range) in ranges {
+        // Every paragraph is materialised against the SAME package: the ranges
+        // were computed from it, and one paragraph's rewrite must not move
+        // another's offsets before it is used.
+        let part = prose::part_path("document");
+        let part_bytes = member_bytes(&current, &part)?;
+        let rewritten = materialize(&part_bytes, range, plan, snapshot, &paragraph_id)
+            .map_err(|error| CollaborationError::new(error.code, error.detail))?;
+        current = prose::patch_zip_member(&current, &part, &rewritten)
+            .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    }
+    Ok(current)
+}
+
+/// The registry, as the engine's snapshot type wants it.
+pub fn style_registry(workdir: &Path) -> Result<BTreeMap<String, String>, CollaborationError> {
+    prose::load_style_rprs_for(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))
+}
+
+/// The declared unit, exposed so a caller never has to infer it.
+pub const RANGE_UNIT: RangeUnit = RangeUnit::UnicodeScalars;

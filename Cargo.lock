@@ -182,6 +182,7 @@ version = "0.2.1"
 dependencies = [
  "docx2typed-app",
  "docx2typed-core",
+ "docx2typed-format",
  "docx2typed-protocol",
  "docx2typed-store",
  "getrandom 0.2.17",
@@ -190,6 +191,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "zip",
 ]
 
 [[package]]

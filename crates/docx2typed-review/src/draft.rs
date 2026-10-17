@@ -609,7 +609,7 @@ pub(crate) fn find_paragraph_block(blocks: &[String], paragraph_id: &str) -> Opt
 }
 
 /// Parse one block marker line into (kind, id, extra attrs).
-pub(crate) fn marker_of(block: &str) -> Option<(String, String, String)> {
+pub fn marker_of(block: &str) -> Option<(String, String, String)> {
     let line = block.split('\n').next().unwrap_or("").trim();
     if let Some(rest) = line.strip_prefix("<!--@p id=\"") {
         let id = rest.split('"').next().unwrap_or("");
@@ -4455,7 +4455,7 @@ pub fn has_unrecorded_typed_edits(workdir: &Path) -> Result<bool, CollaborationE
 /// This was latent until #52: typed.md had no paragraph bodies, so the parser
 /// never had markup to strip, and `has_unrecorded_typed_edits` compared the
 /// markup against the template's plain text and declared every workdir edited.
-fn typed_body_visible_text(body: &str) -> String {
+pub fn typed_body_visible_text(body: &str) -> String {
     let bytes: Vec<char> = body.chars().collect();
     let mut out = String::new();
     let mut index = 0usize;
