@@ -317,6 +317,26 @@ fn paragraph_says(rendered: &str, recorded: &str) -> bool {
     typed_body_visible_text(rendered) == recorded
 }
 
+/// Do the projection and the draft read as different paragraphs?
+///
+/// The comparison is over the WORDS, with whitespace and the spellings of
+/// zero-width tokens removed. The two dialects disagree on notation — the typed
+/// view writes a tab as a tab character, the draft as a token with no text — and
+/// a check that refuses a correctly edited document because of notation is worse
+/// than no check at all. Measured: `sync_guard`'s styling fixture tripped exactly
+/// that way.
+fn readings_disagree(rendered: &str, draft_body: &str) -> bool {
+    fn words(text: &str) -> String {
+        text.replace("\\t", "")
+            .replace("\\n", "")
+            .replace("\\r", "")
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+    words(&typed_body_visible_text(rendered)) != words(&visible_text(draft_body))
+}
+
 /// Record that the tree could not address a paragraph this commit changed.
 ///
 /// A capability gap is reported, never guessed at.
@@ -4023,18 +4043,38 @@ pub fn apply_projection_with_options(
                     // Changed: render from the current node tree. Falling back
                     // to the draft dialect is the OLD lossy route, and it is
                     // reported, never taken silently.
-                    // The body comes from the map keyed by the ids the BUILD
-                    // produced (`BuildOutput.document_ids`) — identity, not
-                    // position. A draft-vs-projection text comparison was tried
-                    // here as a second check and removed: the two dialects reduce
-                    // to different strings for legitimate paragraphs, because they
-                    // spell zero-width inline tokens differently (the typed view
-                    // writes a tab as `\t`, the draft as a token with no text), and
-                    // a check that refuses valid work is worse than no check. The
-                    // defect it was meant to catch is fixed where it lived and
-                    // pinned by a deterministic test.
                     match current_markup.get(&id) {
-                        Some(tree_body) => tree_body.clone(),
+                        Some(tree_body) => {
+                            // Two records of one paragraph: the draft, which the
+                            // caller wrote, and the projection, which a reader
+                            // sees. A projection that does not read what the draft
+                            // says is a lie about the file, and nothing further down
+                            // this path would notice — measured, an id minted by
+                            // position handed P2 the body of the paragraph inserted
+                            // before it, and the only symptom was an edit that could
+                            // never be published.
+                            //
+                            // Compared as WORDS, with all whitespace removed. The
+                            // two dialects spell spacing and zero-width tokens
+                            // differently — the typed view renders an inline tab as
+                            // a tab character, the draft as a token with no text at
+                            // all — and that is a difference in notation, not in what
+                            // the paragraph says. Words and their order still have to
+                            // match, which is what catches a paragraph wearing another
+                            // paragraph's body.
+                            if readings_disagree(tree_body, &block_body(block)) {
+                                return Err(CollaborationError::new(
+                                    "projection-mismatch",
+                                    format!(
+                                        "{id}: the projection reads {:?} while the draft says \
+                                         {:?}",
+                                        typed_body_visible_text(tree_body),
+                                        visible_text(&block_body(block))
+                                    ),
+                                ));
+                            }
+                            tree_body.clone()
+                        }
                         None => {
                             report_projection_gap(&id);
                             typed_markup_from_draft(&block_body(block))
@@ -4661,6 +4701,38 @@ mod visible_text_tests {
             typed_body_visible_text("<docx-revision id=\"N1\" kind=\"insert\">new</docx-revision>"),
             "new"
         );
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::readings_disagree;
+
+    /// The two dialects spell spacing and zero-width inline tokens differently,
+    /// and that must NOT read as a disagreement: `sync_guard`'s styling fixture
+    /// tripped exactly here, with a check that refused a correctly edited document.
+    #[test]
+    fn notation_is_not_a_disagreement() {
+        // The typed view renders an inline tab as a tab character; the draft
+        // renders it as nothing at all.
+        assert!(!readings_disagree(
+            "and  double  spaces\ttab\nline break",
+            "and  double  spacestabline break",
+        ));
+        // Leading spaces: a draft body may carry them, the projection drops them.
+        assert!(!readings_disagree("starts here", "        starts here",));
+    }
+
+    /// What it DOES catch: a paragraph wearing another paragraph's body, which is
+    /// the defect it was written for — an id minted by position handed P2 the body
+    /// of the paragraph inserted before it.
+    #[test]
+    fn another_paragraph_body_is_a_disagreement() {
+        assert!(readings_disagree("插段一", "丙丙丙第二区域"));
+        assert!(readings_disagree(
+            "the paragraph one reads",
+            "the paragraph two reads",
+        ));
     }
 }
 

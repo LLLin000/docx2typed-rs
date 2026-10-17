@@ -1443,6 +1443,142 @@ fn rewrite_document_text(source: &Path, target: &Path, replacement: &str) {
     writer.finish().expect("finish package");
 }
 
+/// Killing the process in the middle of a save is not an exception: the file system
+/// is left wherever the kill landed. What has to hold afterwards is that no file
+/// claims to be a version it is not, that the state is repairable with the tools,
+/// and that repairing twice changes nothing.
+///
+/// This is a smoke test of process termination at an UNCONTROLLED instant — it does
+/// not prove a particular crash point was hit, and it is not a power-loss
+/// durability claim. What it does prove is that whatever a kill leaves behind is
+/// either a whole version or a state the next process repairs, which is the part a
+/// `?` on an `Err` cannot stand in for.
+#[test]
+#[cfg(windows)]
+fn a_killed_process_leaves_a_state_the_next_one_can_repair() {
+    use std::io::Write as _;
+    let dir = scratch("killed");
+    let source = dir.join("source.docx");
+    std::fs::copy(fixture("complex"), &source).expect("copy fixture");
+    let workdir = dir.join("wd");
+    let status = Command::new(bin())
+        .args([
+            "extract",
+            source.to_str().expect("path"),
+            "-o",
+            workdir.to_str().expect("path"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("extract");
+    assert!(status.success(), "extract failed");
+    let workdir = workdir.to_string_lossy().into_owned();
+    let out = dir.join("killed.docx");
+
+    // One clean publication first: this is the version any kill must leave intact
+    // or replace whole.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let good = std::fs::read(&out).expect("published");
+
+    // A second save, killed shortly after it starts.
+    let mut child = Command::new(bin())
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mcp");
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        for (tool, args) in [
+            ("document_open", json!({ "source": workdir })),
+            ("document_save", json!({ "output": out.to_string_lossy() })),
+        ] {
+            writeln!(stdin, "{}", json!({ "tool": tool, "args": args })).expect("write call");
+        }
+    }
+    // Kill it as soon as the save has written its staging file. A fixed delay
+    // sometimes landed before the save started, and then every assertion below
+    // would pass vacuously — so the injection point is an EVENT, not a guess: the
+    // staged build appearing means the save is inside its build, and the kill lands
+    // there.
+    let mut staged_seen = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if let Ok(entries) = std::fs::read_dir(&*dir) {
+            staged_seen = entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".building-"));
+        }
+        if staged_seen || child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let killed = child.kill().is_ok();
+    let _ = child.wait();
+    assert!(killed, "the process could not be killed at all");
+    assert!(
+        staged_seen,
+        "the save completed before its staging file could be seen, so this run proved \
+         nothing about a kill inside it"
+    );
+
+    // Whatever the kill left: the published file is either the version that was
+    // there, or a whole package. Never a half-written one — the staging rename is
+    // what makes that true, and this is where it is checked with a real kill
+    // instead of an injected failure.
+    if out.is_file() {
+        let bytes = std::fs::read(&out).expect("published");
+        if bytes != good {
+            let cursor = std::io::Cursor::new(bytes.clone());
+            let archive = zip::ZipArchive::new(cursor);
+            assert!(
+                archive.is_ok(),
+                "a killed save left a file that is not even a package: {archive:?}"
+            );
+        }
+    }
+
+    // The next process repairs: the state reaches one version, with the tools.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let repaired = std::fs::read(&out).expect("repaired");
+    let replies = mcp(&[(
+        "document_open",
+        json!({ "source": out.to_string_lossy(), "release_current": true }),
+    )]);
+    assert_eq!(
+        data(&replies[0])["sidecars"]["state"],
+        "consistent",
+        "the repair did not reach one version: {:?}",
+        data(&replies[0])["sidecars"]
+    );
+
+    // And repairing is idempotent: once more, same bytes.
+    let replies = mcp(&[
+        (
+            "document_open",
+            json!({ "source": workdir, "release_current": true }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(
+        std::fs::read(&out).expect("again"),
+        repaired,
+        "a second repair produced different bytes"
+    );
+}
+
 /// A publication that could not finish leaves work behind; the next call
 /// recovers, the repair reaches a consistent version, and repeating it changes
 /// nothing — the two properties that make a recovery worth having (reachable, and
