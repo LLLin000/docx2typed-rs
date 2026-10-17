@@ -260,6 +260,28 @@ pub fn plan_format(
     Ok((plan, snapshot))
 }
 
+/// Would this request be accepted? Plans it and throws the plan away — no sidecar,
+/// no projection, nothing written.
+///
+/// The member-level diagnosis needs exactly this: ask the engine about one target
+/// WITHOUT touching the workdir, so a batch that will fail can say which member
+/// fails before anything is attempted.
+pub fn probe_format(workdir: &Path, request: &FormatRequest) -> Result<(), CollaborationError> {
+    let existing = load_format_requests(workdir)?;
+    let mut probe = existing;
+    let same_span = |entry: &FormatRequest| {
+        entry.paragraph_id == request.paragraph_id
+            && entry.start == request.start
+            && entry.end == request.end
+    };
+    if let Some(index) = probe.iter().position(same_span) {
+        probe[index] = request.clone();
+    } else {
+        probe.push(request.clone());
+    }
+    plan_format(workdir, &probe).map(|_| ())
+}
+
 /// Record one request: dedupe it against the workdir's set, re-derive the plan
 /// from the whole set, and persist both.
 ///

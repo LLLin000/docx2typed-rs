@@ -39,6 +39,126 @@ use docx2typed_review::{collab, server::MutationError};
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// Probe every member of a selector-expanded batch before it runs, and report the
+/// ones that would refuse.
+///
+/// The dry run the surface already has covers `replace`; a `format` entry needs the
+/// engine's own planner, which the adapter exposes as `probe_format` — plans and
+/// discards. One decision, made by the engine, reported to the caller.
+fn selector_member_probe(
+    session: &mut McpSession,
+    args: &Value,
+    build_commit: &str,
+) -> Option<Value> {
+    if args.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let entries = args.get("edits").and_then(Value::as_array)?;
+    let selector = entries
+        .iter()
+        .find_map(|entry| entry.get("selector"))
+        .filter(|selector| !selector.is_null())?;
+    let workdir = session.open_workdir().map(str::to_string)?;
+    let handles = handles_for_selector(session, selector, build_commit).ok()?;
+    let target = std::path::Path::new(&workdir);
+    let mut failures: Vec<Value> = Vec::new();
+    for (index, handle) in handles.iter().enumerate() {
+        for entry in entries {
+            let kind = entry
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("replace");
+            if kind != "format" {
+                continue;
+            }
+            let resolved = match docx2typed_core::document_search::resolve_match_ref(target, handle)
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    failures.push(json!({
+                        "index": index,
+                        "handle": handle,
+                        "code": error.to_string().split(':').next().unwrap_or("refused").trim(),
+                    }));
+                    continue;
+                }
+            };
+            let length = resolved.text.chars().count();
+            let request = docx2typed_review::format_lane::FormatRequest {
+                paragraph_id: resolved.paragraph_id.clone(),
+                start: resolved.start,
+                end: resolved.start + length,
+                style_id: entry
+                    .get("style_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                attributes: entry.get("format").cloned(),
+            };
+            if let Err(error) = docx2typed_review::format_lane::probe_format(target, &request) {
+                failures.push(json!({
+                    "index": index,
+                    "handle": handle,
+                    "paragraph_id": resolved.paragraph_id,
+                    "range": {
+                        "start": resolved.start,
+                        "end": resolved.start + length,
+                        "unit": "unicode-scalars",
+                    },
+                    "code": error.code,
+                }));
+            }
+        }
+    }
+    if failures.is_empty() {
+        return None;
+    }
+    let mut refusal =
+        session.failure(
+            "document_edit",
+            "selector-member-rejected",
+            &format!(
+            "the selector matched {} target(s) and {} of them cannot be applied, so nothing was \
+             written (a selector batch is all-or-nothing). The members that would refuse: {}. \
+             Narrow the selector, or send the ones that work as their own edits",
+            handles.len(),
+            failures.len(),
+            failures
+                .iter()
+                .map(|failure| format!(
+                    "#{} {} {}",
+                    failure.get("index").and_then(Value::as_u64).unwrap_or(0),
+                    failure
+                        .get("paragraph_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    failure.get("code").and_then(Value::as_str).unwrap_or("refused")
+                ))
+                .collect::<Vec<String>>()
+                .join(", ")
+        ),
+            build_commit,
+        );
+    // The counts and the members as FIELDS, not only as prose: a caller that wants
+    // to act on them should not parse a sentence. `index`, `paragraph_id` and the
+    // range come from the resolution — never from the caller's arithmetic.
+    if let Some(data) = refusal
+        .get_mut("structuredContent")
+        .and_then(|envelope| envelope.get_mut("data"))
+        .and_then(Value::as_object_mut)
+    {
+        data.insert("matched".to_string(), json!(handles.len()));
+        data.insert(
+            "executable".to_string(),
+            json!(handles.len().saturating_sub(failures.len())),
+        );
+        data.insert("rejected".to_string(), json!(failures.len()));
+        data.insert("failures".to_string(), json!(failures));
+        data.insert("written".to_string(), json!(false));
+    }
+    Some(refusal)
+}
+
 /// Which member of a selector-expanded batch refused, and why.
 ///
 /// One dry run per member, through the same path the batch took, so the engine
@@ -416,6 +536,7 @@ fn edits_from(
             members.push(json!({
                 "index": index,
                 "handle": handle,
+                "kind": kind,
             }));
         }
         match kind {
@@ -975,6 +1096,15 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0);
+
+    // A batch a SELECTOR expanded is probed member by member BEFORE anything is
+    // attempted: the caller enumerated nothing and cannot reconstruct an index, so
+    // without this it bisects the set over several turns. Every probe plans and
+    // throws the plan away — nothing is written, and the batch stays
+    // all-or-nothing.
+    if let Some(diagnosis) = selector_member_probe(session, args, build_commit) {
+        return diagnosis;
+    }
     let Some(envelope) = applied.get("structuredContent") else {
         return applied;
     };
