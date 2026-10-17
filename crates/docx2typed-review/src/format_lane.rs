@@ -327,6 +327,21 @@ pub fn draft_package(workdir: &Path) -> Result<Vec<u8>, CollaborationError> {
     Ok(built.package)
 }
 
+/// The package the workdir is at RIGHT NOW: the template with the text islands,
+/// the structural edits and the format plan applied.
+///
+/// Not the plan's input (`draft_package`) — that one has no formatting, which is
+/// what makes planning a pure function. This one is what a build would write, so
+/// anything that reports "what the document holds" reads it.
+pub fn current_package(workdir: &Path) -> Result<Vec<u8>, CollaborationError> {
+    let package = draft_package(workdir)?;
+    let Some(plan) = load_format_plan(workdir)? else {
+        return Ok(package);
+    };
+    let snapshot = snapshot_for_plan(workdir, &plan)?;
+    apply_format_plan(&package, &plan, &snapshot)
+}
+
 /// Build the snapshot the engine plans against.
 fn snapshot_for(
     workdir: &Path,

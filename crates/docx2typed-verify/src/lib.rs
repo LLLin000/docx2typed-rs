@@ -296,20 +296,9 @@ impl IndependentVerifier {
                         let (expected_cmp, output_cmp) = if part_planned.is_empty() {
                             (expected.clone(), output_part.clone())
                         } else {
-                            let mask = RESTYLE_MASK.as_bytes();
                             match (
-                                mask_planned_runs(
-                                    &expected,
-                                    part_key.as_str(),
-                                    &part_planned,
-                                    mask,
-                                ),
-                                mask_planned_runs(
-                                    &output_part,
-                                    part_key.as_str(),
-                                    &part_planned,
-                                    mask,
-                                ),
+                                strip_planned_runs(&expected, part_key.as_str(), &part_planned),
+                                strip_planned_runs(&output_part, part_key.as_str(), &part_planned),
                             ) {
                                 (Ok(left), Ok(right)) => (left, right),
                                 (Err(message), _) | (_, Err(message)) => {
@@ -2051,8 +2040,6 @@ fn locate_paragraph_leaves(
 /// The placeholder a restyled run's `w:rPr` is replaced with before a part is
 /// compared. The bytes do not matter — only that both sides carry the same ones,
 /// so everything EXCEPT the restyled properties has to match.
-const RESTYLE_MASK: &str = "<w:rPr><w:masked/></w:rPr>";
-
 /// The package member path of a part key ("document" -> "word/document.xml").
 /// Named apart from the verifier's own `part_path`, which a caller's local of the
 /// same name shadows.
@@ -2141,6 +2128,32 @@ fn load_style_rpr_bytes(workdir: &Path) -> BTreeMap<String, String> {
     out
 }
 
+/// The byte range of the whole `<w:r>…</w:r>` that owns `text_start`.
+///
+/// A plan may SPLIT a run, so a check that compares bytes has to set the entire
+/// run aside rather than its properties: five runs where the baseline has one is
+/// not a formatting difference, and masking only the `w:rPr` regions made this
+/// verifier refuse a correct build.
+fn run_element_range(part: &[u8], text_start: usize) -> Option<(usize, usize)> {
+    let before = &part[..text_start.min(part.len())];
+    let mut run_start = None;
+    for index in 0..before.len().saturating_sub(3) {
+        if &before[index..index + 4] == b"<w:r"
+            && before
+                .get(index + 4)
+                .is_some_and(|byte| *byte == b' ' || *byte == b'>')
+        {
+            run_start = Some(index);
+        }
+    }
+    let run_start = run_start?;
+    let end = part[run_start..]
+        .windows(6)
+        .position(|window| window == b"</w:r>")
+        .map(|offset| run_start + offset + 6)?;
+    Some((run_start, end))
+}
+
 /// The byte range of the `w:rPr` of the run that owns `text_start`, or the point
 /// where one belongs when the run has none: `(start, end, run_open_end)`.
 fn run_rpr_range(part: &[u8], text_start: usize) -> Option<(usize, usize, usize)> {
@@ -2217,23 +2230,36 @@ fn planned_run_ranges(
 
 /// Replace every named run's `w:rPr` with `mask`, so two parts can be compared
 /// with the restyled properties set aside. Insertion where a run has none.
-fn mask_planned_runs(
+fn strip_planned_runs(
     part: &[u8],
     part_key: &str,
     edits: &[&PlannedRunCheck],
-    mask: &[u8],
 ) -> Result<Vec<u8>, String> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for edit in edits {
-        for (start, end, _) in planned_run_ranges(part, part_key, edit)? {
-            ranges.push((start, end));
+        let leaves = locate_paragraph_leaves(part, part_key, &edit.paragraph_id)?;
+        let mut cursor = 0usize;
+        for leaf in &leaves {
+            if leaf.text_start == leaf.text_end {
+                continue;
+            }
+            let length = String::from_utf8_lossy(&part[leaf.text_start..leaf.text_end])
+                .chars()
+                .count();
+            let (start, end) = (cursor, cursor + length);
+            cursor = end;
+            if start < edit.end && end > edit.start {
+                if let Some(range) = run_element_range(part, leaf.text_start) {
+                    ranges.push(range);
+                }
+            }
         }
     }
     ranges.sort();
     ranges.dedup();
     let mut out = part.to_vec();
     for (start, end) in ranges.into_iter().rev() {
-        out.splice(start..end, mask.iter().copied());
+        out.splice(start..end, std::iter::empty());
     }
     Ok(out)
 }

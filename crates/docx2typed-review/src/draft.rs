@@ -1271,7 +1271,12 @@ pub fn format_forecast(
     old: &str,
     start: usize,
 ) -> Option<Value> {
-    let view = ParagraphLeaves::load(workdir, paragraph_id).ok()?;
+    // The CURRENT package: the plan is part of what the build will produce, so a
+    // forecast read from the bare template reports the properties a restyle just
+    // replaced — which is how a blind run concluded five times that its format
+    // edit "did nothing" while every read agreed with it.
+    let package = crate::format_lane::current_package(workdir).ok()?;
+    let view = ParagraphLeaves::load_from(&package, workdir, paragraph_id).ok()?;
     let covered = view.covered(start, start + old.chars().count())?;
     let mut canonical_seen: Vec<String> = Vec::new();
     let mut signatures: Vec<String> = Vec::new();
@@ -2912,7 +2917,19 @@ impl ParagraphLeaves {
         let package = fs::read(workdir.join("_template.docx")).map_err(|error| {
             CollaborationError::new("workdir-unreadable", format!("{paragraph_id}: {error}"))
         })?;
-        let inventory = docx2typed_core::prose::enumerate_package_bytes(&package)
+        Self::load_from(&package, workdir, paragraph_id)
+    }
+
+    /// The same view of a paragraph, read from a package the caller supplies —
+    /// the CURRENT one (template + text islands + the format plan), not the bare
+    /// template. The forecast has to read what the build will produce, or a
+    /// caller cannot see a restyle it just recorded.
+    fn load_from(
+        package: &[u8],
+        workdir: &Path,
+        paragraph_id: &str,
+    ) -> Result<Self, CollaborationError> {
+        let inventory = docx2typed_core::prose::enumerate_package_bytes(package)
             .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
         let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)
             .ok_or_else(|| CollaborationError::new("invalid-edit", "unknown paragraph part"))?;
