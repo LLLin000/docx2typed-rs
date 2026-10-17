@@ -101,8 +101,13 @@ impl IndependentVerifier {
         // Read independently from the workdir sidecars.
         let islands = load_islands(&request.workdir).unwrap_or_default();
         let structure = load_structure(&request.workdir).unwrap_or_default();
+        // Format edits are a third mutation the output may implement. Read here
+        // too, or a restyled document fails verification for a change it was
+        // told to make.
+        let restyles = load_recorded_restyles(&request.workdir);
+        let styles = load_style_rpr_bytes(&request.workdir);
 
-        if islands.is_empty() && structure.is_empty() {
+        if islands.is_empty() && structure.is_empty() && restyles.is_empty() {
             self.verify_noop(
                 &template,
                 &output_parts,
@@ -117,6 +122,8 @@ impl IndependentVerifier {
                 &output_parts,
                 &islands,
                 &structure,
+                &restyles,
+                &styles,
                 &mut checks,
                 &template_sha256,
                 &output_sha256,
@@ -174,6 +181,7 @@ impl IndependentVerifier {
     /// surgery + structural synthesis) and comparing them byte-for-byte
     /// with the output, plus the opaque replay check.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn verify_edited(
         &self,
         template: &Path,
@@ -181,6 +189,8 @@ impl IndependentVerifier {
         output_parts: &BTreeMap<String, String>,
         islands: &[IslandEdit],
         structure: &StructureEdits,
+        restyles: &[RecordedRestyle],
+        styles: &BTreeMap<String, String>,
         checks: &mut Vec<VerificationCheck>,
         template_sha256: &str,
         output_sha256: &str,
@@ -191,6 +201,9 @@ impl IndependentVerifier {
         let mut edited_part_paths: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         for edit in islands {
+            edited_part_paths.insert(part_path(&edit.part));
+        }
+        for edit in restyles {
             edited_part_paths.insert(part_path(&edit.part));
         }
         if !structure.is_empty() {
@@ -228,7 +241,8 @@ impl IndependentVerifier {
         let mut edited_detail = String::new();
         let template_package = std::fs::read(template).unwrap_or_default();
         for part_path in &edited_part_paths {
-            let Some(part_key) = part_key_from_path(part_path) else {
+            let this_part: &str = part_path.as_str();
+            let Some(part_key) = part_key_from_path(this_part) else {
                 edited_exact = false;
                 edited_detail = format!("unknown edited part {part_path}");
                 break;
@@ -267,7 +281,41 @@ impl IndependentVerifier {
                                 }
                             }
                         }
-                        if expected != output_part {
+                        // A part that carries restyles is compared modulo the
+                        // runs those restyles name: their rPr is the one thing
+                        // this recompute does not derive, and it is checked on
+                        // its own below.
+                        let part_restyles: Vec<&RecordedRestyle> = restyles
+                            .iter()
+                            .filter(|edit| verify_part_path(&edit.part) == this_part)
+                            .collect();
+                        let (expected_cmp, output_cmp) = if part_restyles.is_empty() {
+                            (expected.clone(), output_part.clone())
+                        } else {
+                            let mask = RESTYLE_MASK.as_bytes();
+                            match (
+                                mask_restyled_runs(
+                                    &expected,
+                                    part_key.as_str(),
+                                    &part_restyles,
+                                    mask,
+                                ),
+                                mask_restyled_runs(
+                                    &output_part,
+                                    part_key.as_str(),
+                                    &part_restyles,
+                                    mask,
+                                ),
+                            ) {
+                                (Ok(left), Ok(right)) => (left, right),
+                                (Err(message), _) | (_, Err(message)) => {
+                                    edited_exact = false;
+                                    edited_detail = format!("part {part_path}: {message}");
+                                    continue;
+                                }
+                            }
+                        };
+                        if expected_cmp != output_cmp {
                             edited_exact = false;
                             edited_detail = format!(
                                 "part {part_path} differs from the independently recomputed edit"
@@ -294,6 +342,69 @@ impl IndependentVerifier {
             }),
         });
 
+        // Check 3b: every recorded restyle is what the output does — the runs
+        // covering the span carry exactly the named style's properties.
+        let mut restyle_detail = String::new();
+        let mut restyle_ok = true;
+        for edit in restyles {
+            let path = verify_part_path(&edit.part);
+            let Some(part_key) = part_key_from_path(&path) else {
+                restyle_ok = false;
+                restyle_detail = format!("unknown part {path}");
+                break;
+            };
+            let Some(style_rpr) = styles.get(&edit.style_id) else {
+                restyle_ok = false;
+                restyle_detail = format!(
+                    "{} names {} which styles.json does not hold",
+                    path, edit.style_id
+                );
+                break;
+            };
+            let template_package = std::fs::read(template).unwrap_or_default();
+            let output_package = std::fs::read(output).unwrap_or_default();
+            let template_part = read_member_bytes(&template_package, &path).unwrap_or_default();
+            let output_part = read_member_bytes(&output_package, &path).unwrap_or_default();
+            // The span was recorded against the DRAFT — the template with the
+            // text islands applied — so that is the baseline its offsets address.
+            // Measured: a text edit followed by a restyle in the same paragraph
+            // made this check resolve the span against the template and refuse a
+            // correct output.
+            let part_islands: Vec<&IslandEdit> = islands
+                .iter()
+                .filter(|island| island.part == part_key)
+                .collect();
+            let baseline = if part_islands.is_empty() {
+                Ok(template_part.clone())
+            } else {
+                recompute_edited_part(&template_part, &part_islands)
+            };
+            let baseline = match baseline {
+                Ok(baseline) => baseline,
+                Err(message) => {
+                    restyle_ok = false;
+                    restyle_detail = format!("part {path}: {message}");
+                    break;
+                }
+            };
+            if let Err(message) =
+                verify_restyle(&baseline, &output_part, part_key.as_str(), edit, style_rpr)
+            {
+                restyle_ok = false;
+                restyle_detail = format!("part {path}: {message}");
+                break;
+            }
+        }
+        checks.push(VerificationCheck {
+            name: "restyles-applied".to_string(),
+            status: if restyle_ok { "pass" } else { "fail" }.to_string(),
+            detail: Some(if restyle_detail.is_empty() {
+                format!("{} restyle(s) matched their style", restyles.len())
+            } else {
+                restyle_detail
+            }),
+        });
+
         // Check 4: opaque interiors replayed — every opaque block of the
         // template part appears verbatim in the output at its shifted
         // position (the edit never touches locked bytes).
@@ -302,7 +413,8 @@ impl IndependentVerifier {
         let mut untouched_preserved = true;
         let mut untouched_detail = String::new();
         for part_path in &edited_part_paths {
-            let Some(part_key) = part_key_from_path(part_path) else {
+            let this_part: &str = part_path.as_str();
+            let Some(part_key) = part_key_from_path(this_part) else {
                 continue;
             };
             let edits: Vec<&IslandEdit> = islands
@@ -350,6 +462,18 @@ impl IndependentVerifier {
                 for edit in &edits {
                     if let Ok(ranges) = edit_run_ranges(&template_part, &part_key, edit) {
                         collected.extend(ranges);
+                    }
+                }
+                // A restyled run is a target too: its properties are the point
+                // of the edit, so a check that compares "everything outside the
+                // edit" has to know where the edit is. Measured: without this the
+                // verifier refused its own restyle as `non-target-preserved`.
+                for edit in restyles
+                    .iter()
+                    .filter(|edit| verify_part_path(&edit.part) == this_part)
+                {
+                    if let Ok(ranges) = restyled_run_ranges(&template_part, &part_key, edit) {
+                        collected.extend(ranges.into_iter().map(|(start, end, _)| (start, end)));
                     }
                 }
                 collected
@@ -1907,6 +2031,215 @@ fn locate_paragraph_leaves(
 }
 
 /// Locate one paragraph's leaf by ordinal.
+/// The placeholder a restyled run's `w:rPr` is replaced with before a part is
+/// compared. The bytes do not matter — only that both sides carry the same ones,
+/// so everything EXCEPT the restyled properties has to match.
+const RESTYLE_MASK: &str = "<w:rPr><w:masked/></w:rPr>";
+
+/// The package member path of a part key ("document" -> "word/document.xml").
+/// Named apart from the verifier's own `part_path`, which a caller's local of the
+/// same name shadows.
+fn verify_part_path(part_key: &str) -> String {
+    if part_key == "document" {
+        "word/document.xml".to_string()
+    } else {
+        format!("word/{part_key}.xml")
+    }
+}
+
+/// One restyle the workdir recorded (`rpr_edits.json`), read independently of
+/// Core the same way islands and structure are.
+#[derive(Clone, Debug)]
+struct RecordedRestyle {
+    part: String,
+    paragraph_id: String,
+    text_start: usize,
+    text_end: usize,
+    style_id: String,
+}
+
+fn load_recorded_restyles(workdir: &Path) -> Vec<RecordedRestyle> {
+    let path = workdir.join("rpr_edits.json");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    value
+        .get("edits")
+        .and_then(|edits| edits.as_array())
+        .map(|edits| {
+            edits
+                .iter()
+                .filter_map(|edit| {
+                    let text = |name: &str| edit.get(name).and_then(|value| value.as_str());
+                    Some(RecordedRestyle {
+                        part: text("part")?.to_string(),
+                        paragraph_id: text("paragraph_id")?.to_string(),
+                        text_start: edit.get("text_start")?.as_u64()? as usize,
+                        text_end: edit.get("text_end")?.as_u64()? as usize,
+                        style_id: text("style_id")?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `style_id -> w:rPr` from `styles.json`, the registry the build splices from.
+fn load_style_rpr_bytes(workdir: &Path) -> BTreeMap<String, String> {
+    let path = workdir.join("styles.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return BTreeMap::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    if let Some(styles) = value.get("styles").and_then(|styles| styles.as_object()) {
+        for (style_id, entry) in styles {
+            if let Some(rpr) = entry.get("rPr").and_then(|rpr| rpr.as_str()) {
+                out.insert(style_id.clone(), rpr.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The byte range of the `w:rPr` of the run that owns `text_start`, or the point
+/// where one belongs when the run has none: `(start, end, run_open_end)`.
+fn run_rpr_range(part: &[u8], text_start: usize) -> Option<(usize, usize, usize)> {
+    let before = &part[..text_start.min(part.len())];
+    let mut run_start = None;
+    for index in 0..before.len().saturating_sub(3) {
+        if &before[index..index + 4] == b"<w:r"
+            && before
+                .get(index + 4)
+                .is_some_and(|byte| *byte == b' ' || *byte == b'>')
+        {
+            run_start = Some(index);
+        }
+    }
+    let run_start = run_start?;
+    let run_open_end = part[run_start..]
+        .iter()
+        .position(|byte| *byte == b'>')
+        .map(|offset| run_start + offset + 1)?;
+    let tail = &part[run_open_end..];
+    let rpr_start = tail
+        .windows(6)
+        .position(|window| window == b"<w:rPr")
+        .map(|offset| run_open_end + offset);
+    match rpr_start {
+        Some(start) => {
+            let end = part[start..]
+                .windows(8)
+                .position(|window| window == b"</w:rPr>")
+                .map(|offset| start + offset + 8)?;
+            Some((start, end, run_open_end))
+        }
+        None => Some((run_open_end, run_open_end, run_open_end)),
+    }
+}
+
+/// The runs a restyle names, located by the paragraph's visible-text offsets —
+/// this crate's own walker, not Core's.
+fn restyled_run_ranges(
+    part: &[u8],
+    part_key: &str,
+    edit: &RecordedRestyle,
+) -> Result<Vec<(usize, usize, usize)>, String> {
+    let leaves = locate_paragraph_leaves(part, part_key, &edit.paragraph_id)?;
+    let mut cursor = 0usize;
+    let mut ranges = Vec::new();
+    for leaf in &leaves {
+        if leaf.text_start == leaf.text_end {
+            continue;
+        }
+        let length = String::from_utf8_lossy(&part[leaf.text_start..leaf.text_end])
+            .chars()
+            .count();
+        let (start, end) = (cursor, cursor + length);
+        cursor = end;
+        if start < edit.text_end && end > edit.text_start {
+            let Some(range) = run_rpr_range(part, leaf.text_start) else {
+                return Err(format!(
+                    "{}: run for offset {} not found",
+                    edit.paragraph_id, leaf.text_start
+                ));
+            };
+            ranges.push(range);
+        }
+    }
+    if ranges.is_empty() {
+        return Err(format!(
+            "{}: no run covers [{}, {})",
+            edit.paragraph_id, edit.text_start, edit.text_end
+        ));
+    }
+    Ok(ranges)
+}
+
+/// Replace every named run's `w:rPr` with `mask`, so two parts can be compared
+/// with the restyled properties set aside. Insertion where a run has none.
+fn mask_restyled_runs(
+    part: &[u8],
+    part_key: &str,
+    edits: &[&RecordedRestyle],
+    mask: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for edit in edits {
+        for (start, end, _) in restyled_run_ranges(part, part_key, edit)? {
+            ranges.push((start, end));
+        }
+    }
+    ranges.sort();
+    ranges.dedup();
+    let mut out = part.to_vec();
+    for (start, end) in ranges.into_iter().rev() {
+        out.splice(start..end, mask.iter().copied());
+    }
+    Ok(out)
+}
+
+/// The output's named runs carry exactly the style's properties, and the rest of
+/// the paragraph is where the restyle says it is.
+fn verify_restyle(
+    template_part: &[u8],
+    output_part: &[u8],
+    part_key: &str,
+    edit: &RecordedRestyle,
+    style_rpr: &str,
+) -> Result<(), String> {
+    let expected_ranges = restyled_run_ranges(template_part, part_key, edit)?;
+    let output_ranges = restyled_run_ranges(output_part, part_key, edit)?;
+    if expected_ranges.len() != output_ranges.len() {
+        return Err(format!(
+            "{}: the output has {} run(s) where the restyle names {}",
+            edit.paragraph_id,
+            output_ranges.len(),
+            expected_ranges.len()
+        ));
+    }
+    for (index, ((_, _, _), (start, end, _))) in
+        expected_ranges.iter().zip(output_ranges.iter()).enumerate()
+    {
+        let actual = String::from_utf8_lossy(&output_part[*start..*end]);
+        if actual != style_rpr {
+            return Err(format!(
+                "{}: run {} carries {:?}, not the style's {:?}",
+                edit.paragraph_id, index, actual, style_rpr
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn locate_leaf(
     part: &[u8],
     part_key: &str,

@@ -30,6 +30,16 @@ use docx2typed_review::{collab, server::MutationError};
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// A format edit: give a span the character properties of a style the document
+/// already carries. There is no synthesis here — the style registry holds what
+/// the document has, and a style id it does not hold is refused before anything
+/// is written.
+#[derive(Clone, Debug)]
+pub(crate) struct FormatRequest {
+    pub(crate) handle: String,
+    pub(crate) style_id: String,
+}
+
 /// One edit, in the shape its kind requires.
 ///
 /// The kinds are a closed set and every one of them addresses its target the same
@@ -46,6 +56,7 @@ pub(crate) enum Edit {
     Delete {
         handle: String,
     },
+    Format(FormatRequest),
 }
 
 impl Edit {
@@ -55,6 +66,7 @@ impl Edit {
             Edit::Replace(request) => &request.handle,
             Edit::InsertAfter { handle, .. } => handle,
             Edit::Delete { handle } => handle,
+            Edit::Format(request) => &request.handle,
         }
     }
 }
@@ -160,6 +172,25 @@ fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<
             "delete" => parsed.push(Edit::Delete {
                 handle: handle.to_string(),
             }),
+            "format" => {
+                let Some(style_id) = edit.get("style_id").and_then(Value::as_str) else {
+                    return Err(session.failure(
+                        "document_edit",
+                        "invalid-arguments",
+                        &format!(
+                            "edit #{number} is kind `format` and needs `style_id`: one of the \
+                             style ids document_find reports for the span (they are the styles \
+                             the document already carries); got keys [{}]",
+                            keys()
+                        ),
+                        build_commit,
+                    ));
+                };
+                parsed.push(Edit::Format(FormatRequest {
+                    handle: handle.to_string(),
+                    style_id: style_id.to_string(),
+                }));
+            }
             other => {
                 return Err(session.failure(
                     "document_edit",
@@ -193,9 +224,111 @@ pub(crate) fn apply_and_sync(
 ) -> Result<Value, MutationError> {
     let mut requests: Vec<EditRequest> = Vec::new();
     let mut structural: Vec<Value> = Vec::new();
+    let mut restyles: Vec<Value> = Vec::new();
     for edit in edits {
         match edit {
             Edit::Replace(request) => requests.push(request.clone()),
+            Edit::Format(request) => {
+                // A format edit's span is measured against the text as it stands,
+                // so a batch that also rewrites text would make the span's
+                // meaning depend on the order of the entries. One transaction,
+                // one kind — the caller edits the text first, then formats what
+                // it produced.
+                if edits.iter().any(|other| !matches!(other, Edit::Format(_))) {
+                    return Err(MutationError::new(
+                        "format-and-text-in-one-batch",
+                        "a batch cannot mix text edits with format edits: a format edit's span \
+                         is measured against the text as it stands, so the two kinds would have \
+                         to run in a fixed order to mean anything. Send the text edits, then a \
+                         separate document_edit with the format edits",
+                    ));
+                }
+                let resolved =
+                    docx2typed_core::document_search::resolve_match_ref(target, &request.handle)
+                        .map_err(|error| {
+                            let message = error.to_string();
+                            match message.split_once(':') {
+                                Some((code, detail)) if !code.contains(' ') => {
+                                    MutationError::new(code, detail.trim())
+                                }
+                                _ => MutationError::new("invalid-edit", message),
+                            }
+                        })?;
+                let part = docx2typed_core::prose::part_for_paragraph_id(&resolved.paragraph_id)
+                    .ok_or_else(|| {
+                        MutationError::new(
+                            "invalid-edit",
+                            format!("unknown paragraph id: {}", resolved.paragraph_id),
+                        )
+                    })?;
+                // The style has to be one the document carries. The build refuses
+                // a style it does not hold (`format-style-unavailable`), and a
+                // caller should not have to build a document to be told that —
+                // so the registry is read here and the refusal lists what is
+                // available.
+                let available = docx2typed_core::prose::load_style_rprs_for(target)
+                    .map_err(|error| MutationError::new("workdir-invalid", error.to_string()))?;
+                if !available.contains_key(&request.style_id) {
+                    let mut listed: Vec<String> = available.keys().cloned().collect();
+                    listed.sort();
+                    return Err(MutationError::new(
+                        "format-style-unavailable",
+                        format!(
+                            "{} is not a style this document carries; it holds [{}]. A format \
+                             edit switches between the properties the document already has — it \
+                             never invents a style. document_find reports the style ids of the \
+                             runs a span covers",
+                            request.style_id,
+                            listed.join(", ")
+                        ),
+                    ));
+                }
+                // Two restyles over one run fight: the run has one `w:rPr`, so
+                // the later record would overwrite the earlier one and the
+                // earlier would read as not applied. Measured: two overlapping
+                // spans on one chemical formula made the save fail
+                // `restyles-applied` for the first of them.
+                let existing = docx2typed_core::prose::load_rpr_edits(target)
+                    .map_err(|error| MutationError::new("workdir-invalid", error.to_string()))?;
+                if let Some(clash) = existing.iter().find(|recorded| {
+                    recorded.part == part
+                        && recorded.paragraph_id == resolved.paragraph_id
+                        && recorded.text_start < resolved.start + resolved.text.chars().count()
+                        && resolved.start < recorded.text_end
+                }) {
+                    return Err(MutationError::new(
+                        "format-spans-overlap",
+                        format!(
+                            "this span [{}, {}) overlaps a restyle already recorded at [{}, {}) in \
+                             {}; a run has one set of character properties, so the later record \
+                             would overwrite the earlier one. Make it one span, or two that do \
+                             not overlap",
+                            resolved.start,
+                            resolved.start + resolved.text.chars().count(),
+                            clash.text_start,
+                            clash.text_end,
+                            resolved.paragraph_id
+                        ),
+                    ));
+                }
+                let span = docx2typed_core::prose::RprEdit {
+                    part,
+                    paragraph_id: resolved.paragraph_id.clone(),
+                    text_start: resolved.start,
+                    text_end: resolved.start + resolved.text.chars().count(),
+                    attributes: json!({ "style_id": request.style_id }),
+                    style_id: request.style_id.clone(),
+                };
+                let recorded = docx2typed_core::prose::record_format_span(target, span)
+                    .map_err(|error| MutationError::new("invalid-edit", error.to_string()))?;
+                restyles.push(json!({
+                    "kind": "format",
+                    "paragraph_id": resolved.paragraph_id,
+                    "text_start": resolved.start,
+                    "style_id": request.style_id,
+                    "recorded": recorded,
+                }));
+            }
             Edit::InsertAfter {
                 handle,
                 text,
@@ -236,7 +369,12 @@ pub(crate) fn apply_and_sync(
         // The facade stages every target before it applies any, so a blocked
         // batch has written nothing. Report it and let the caller decide; the
         // generation it returns is the one it started from.
-        return Ok(json!({ "edit": edited, "structural": structural, "synced": Value::Null }));
+        return Ok(json!({
+            "edit": edited,
+            "structural": structural,
+            "restyles": restyles,
+            "synced": Value::Null,
+        }));
     }
 
     // Bootstrap the review session BEFORE `apply_projection` rewrites typed.md.
@@ -256,6 +394,7 @@ pub(crate) fn apply_and_sync(
         return Ok(json!({
             "edit": edited,
             "structural": structural,
+            "restyles": restyles,
             "synced": {
                 "changed_paragraph_ids": [],
                 "state": "clean",
@@ -284,6 +423,7 @@ pub(crate) fn apply_and_sync(
     Ok(json!({
         "edit": edited,
         "structural": structural,
+        "restyles": restyles,
         "synced": {
             "changed_paragraph_ids": changed,
             "state": "clean",
@@ -423,6 +563,7 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
                 }
                 Edit::InsertAfter { handle, .. } => ("insert_after", handle),
                 Edit::Delete { handle } => ("delete", handle),
+                Edit::Format(request) => ("format", &request.handle),
             };
             match paragraph_of(workdir, handle) {
                 Ok(anchor) => structural.push(json!({
@@ -537,11 +678,13 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
             "operation_id": operation_id,
             "dry_run": false,
             // Replacements report through `edit` (the facade's staged targets);
-            // inserts and deletes through `structural`. A caller that asked for
-            // one kind gets the report for it and an explicit null for the other,
-            // rather than a field that silently is not there.
+            // inserts and deletes through `structural`; format edits through
+            // `restyles`. A caller that asked for one kind gets the report for it
+            // and an explicit null for the others, rather than a field that
+            // silently is not there.
             "edit": data.get("edit").cloned().unwrap_or(Value::Null),
             "structural": data.get("structural").cloned().unwrap_or(Value::Null),
+            "restyles": data.get("restyles").cloned().unwrap_or(Value::Null),
             "synced": data.get("synced").cloned().unwrap_or(Value::Null),
         })),
         build_commit,

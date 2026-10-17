@@ -1275,12 +1275,25 @@ pub fn format_forecast(
     let covered = view.covered(start, start + old.chars().count())?;
     let mut canonical_seen: Vec<String> = Vec::new();
     let mut signatures: Vec<String> = Vec::new();
+    let mut style_ids: Vec<String> = Vec::new();
+    let mut styles: Vec<Value> = Vec::new();
     for leaf in &covered {
         let canonical = docx2typed_core::prose::canonical_rpr_json(&leaf.rpr)
             .unwrap_or_else(|_| leaf.rpr.clone());
         if !canonical_seen.contains(&canonical) {
             canonical_seen.push(canonical.clone());
             signatures.push(readable_rpr(&canonical));
+            // The style id is what a `kind: "format"` edit names. Reported here
+            // because this is where a caller looks before editing: the ids the
+            // document carries for the runs a span covers, with the label the
+            // registry gives them.
+            let style_id =
+                docx2typed_core::document_projection::content_style_id(canonical.as_bytes());
+            let label = docx2typed_core::document_projection::rpr_semantics_for(&leaf.rpr)
+                .map(|(label, _)| label)
+                .unwrap_or_default();
+            styles.push(json!({ "style_id": style_id, "label": label, "rPr": signatures.last() }));
+            style_ids.push(style_id);
         }
     }
     let first = signatures.first().cloned().unwrap_or_default();
@@ -1305,6 +1318,8 @@ pub fn format_forecast(
         "distinct_rPr": signatures.len(),
         "rPr": signatures,
         "first_rPr": first,
+        "style_ids": style_ids,
+        "styles": styles,
         "effect": effect,
     }))
 }
