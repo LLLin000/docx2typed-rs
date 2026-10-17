@@ -734,19 +734,37 @@ impl McpSession {
     /// Settle a draft the caller did not settle, or report why it cannot be.
     ///
     /// Returns `None` when the draft was already settled or has now been, and
-    /// the failure envelope when settling was refused. The same body
+    /// the failure envelope when settling was refused. Settled means the three
+    /// workdir artifacts agree — the draft, its `@edit` header and
+    /// `edit.state.json` — as measured by `classify_edit_state`, not that the
+    /// draft matches the frozen baseline. The same body
     /// `document_edit` runs, for the same reason: one implementation, one
     /// verdict, and no path on which a caller can be told a document is ready
     /// when its draft was never applied.
     pub(crate) fn settle_draft(&self, build_commit: &str) -> Option<Value> {
         let workdir = self.workdir.clone()?;
-        let dirty = docx2typed_review::draft::diff_preview(Path::new(&workdir))
-            .ok()
-            .and_then(|data| data.get("changed_paragraph_ids").cloned())
-            .and_then(|ids| ids.as_array().map(|ids| !ids.is_empty()))
-            .unwrap_or(false);
-        if !dirty {
-            return None;
+        // A revert reads empty on the baseline diff (`changed_paragraph_ids`)
+        // while the committed state still moved, so the baseline diff must not
+        // gate the commit: it skipped the settle that would have reconciled the
+        // workdir and the build then refused it as `edit-dirty`. The commit below
+        // is a genuine no-op when the plan matches and the binding is clean, so a
+        // clean classification is the only skip; an `Err` cannot show agreement
+        // and settles rather than skips.
+        // `classify_edit_state` fails when the projection was never created
+        // (fresh extract: no `edit.md`, no `edit.state.json`) — and a missing
+        // projection is a clean workdir, not a dirty one. Only a positively
+        // non-clean state settles; any error meaning "nothing to settle"
+        // skips. (A save on a fresh workdir settled nothing and left nothing
+        // behind, so the next edit failed `edit-state-missing`.)
+        match docx2typed_core::edit_state::classify_edit_state(Path::new(&workdir)) {
+            Ok(state) if state.state == "clean" => return None,
+            Ok(_) => {}
+            Err(error) => {
+                let message = error.to_string();
+                if message.starts_with("edit-state-missing:") {
+                    return None;
+                }
+            }
         }
         let tracked = self.track;
         let author = self.author.clone();

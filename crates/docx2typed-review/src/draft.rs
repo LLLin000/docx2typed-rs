@@ -316,14 +316,47 @@ fn paragraph_says(rendered: &str, recorded: &str) -> bool {
 /// evidence rather than the only check.
 fn readings_disagree(rendered: &str, draft_body: &str) -> bool {
     fn words(text: &str) -> String {
-        text.replace("\\t", "")
+        // A marker is notation, not a word: `token_table::visible_text` spells a
+        // non-text node `[opaque:kind]` while the leaf-based rendering the draft
+        // is written from cannot see it at all. Comparing them as words made a
+        // table cell's unsupported runs read as "this paragraph wears another
+        // paragraph's body" and refused a legitimate edit with
+        // `projection-mismatch` (measured on two real patents, one of them the
+        // same document that had already passed). Words and their order still
+        // have to match, which is what this check is for.
+        let without_markers = {
+            let mut out = String::new();
+            let mut rest = text;
+            while let Some(start) = rest.find("[opaque:") {
+                out.push_str(&rest[..start]);
+                match rest[start..].find(']') {
+                    Some(end) => rest = &rest[start + end + 1..],
+                    None => {
+                        rest = "";
+                        break;
+                    }
+                }
+            }
+            out.push_str(rest);
+            out
+        };
+        without_markers
+            .replace("\\t", "")
             .replace("\\n", "")
             .replace("\\r", "")
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect()
     }
-    words(&typed_body_visible_text(rendered)) != words(&visible_text(draft_body))
+    // Both sides through the SAME pipeline: the projection's own rendering of a
+    // typed body, against the draft body rendered by the draft-to-typed
+    // conversion the rest of this file compares with. Reading the draft through
+    // the leaf-based `visible_text` compared two dialects instead of two
+    // paragraphs, which is how the marker difference above became a refusal.
+    words(&typed_body_visible_text(rendered))
+        != words(&typed_body_visible_text(&typed_markup_from_draft(
+            draft_body,
+        )))
 }
 
 /// Record that the tree could not address a paragraph this commit changed.
@@ -742,8 +775,9 @@ pub(crate) fn compute_changed(
     {
         let typed_path = workdir.join("typed.md");
         if typed_path.is_file() {
-            let text = fs::read_to_string(&typed_path)
-                .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+            let text = fs::read_to_string(&typed_path).map_err(|error| {
+                CollaborationError::new("workdir-unreadable", error.to_string())
+            })?;
             for (id, body) in parse_typed_paragraphs(&text) {
                 old_paragraphs.entry(id).or_insert(body);
             }
@@ -1140,16 +1174,12 @@ fn leaf_in_inventory_covers(
     false
 }
 
-/// The leaf index that carries the whole visible span, or None.
-///
-/// The same walk as [`leaf_in_inventory_covers`], returning the index so a
-/// handle-addressed edit can name its leaf instead of re-searching the text.
-///
-/// The offsets are the caller's, so the walk reads the leaves the caller reads —
-/// a leaf a pending edit already rewrote counts its DRAFT width, and a leaf the
-/// projection drops counts none. Counting the template's widths instead put a
-/// span one leaf over as soon as an earlier edit in the paragraph had changed
-/// its length.
+/// The leaf a span sits in, from the CALLER's space — the draft's visible text,
+/// not the template's. `ParagraphLeaves::load` builds that space from the
+/// pending islands, so a leaf an earlier edit rewrote counts its NEW width:
+/// measuring the template's widths instead put a span one leaf over as soon as
+/// an earlier edit in the paragraph had changed its length, and `find` then
+/// reported a span there was editable while the commit refused it.
 fn leaf_index_for_span(
     workdir: &Path,
     paragraph_id: &str,
@@ -1200,7 +1230,15 @@ pub fn check_editable_span(
     // uneditable matches were this, and the agent's response to the refusal was
     // to leave the tool and edit the XML by hand — which loses the byte
     // fidelity, the revision records and the verification the tool exists for.
-    let leaf = leaf_index_for_span(workdir, paragraph_id, start, old.chars().count());
+    // The leaf the span STARTS in, from the caller's space: a span that runs
+    // past a pending island's end still belongs to that island — the merge
+    // folds it in — so resolving the whole span first would refuse a second
+    // edit in a leaf the first edit rewrote.
+    let leaf =
+        leaf_index_for_span(workdir, paragraph_id, start, old.chars().count()).or_else(|| {
+            let view = ParagraphLeaves::load(workdir, paragraph_id).ok()?;
+            view.leaf_at(start).map(|leaf| leaf.leaf_index)
+        });
     island_leaf_for(workdir, paragraph_id, old, leaf, Some(start))?;
     check_format_boundary(workdir, paragraph_id, old, start)
 }
@@ -1350,13 +1388,8 @@ fn check_format_boundary(
     old: &str,
     start: usize,
 ) -> Result<(), CollaborationError> {
-    let Ok(view) = ParagraphLeaves::load(workdir, paragraph_id) else {
-        // A paragraph the draft cannot read is refused by the commit path with a
-        // better code; this check only refines a span it can see.
-        return Ok(());
-    };
     let Some((leaf_index, tail_chars, tail_text, covered)) =
-        untouched_tail_after_span(&view, start, start + old.chars().count())
+        untouched_tail_after_span(workdir, paragraph_id, old, start)
     else {
         return Ok(());
     };
@@ -1377,26 +1410,78 @@ fn check_format_boundary(
 /// text, covered_runs)`. None when the span sits in one run, or when the last
 /// covered run is covered to its end.
 fn untouched_tail_after_span(
-    view: &ParagraphLeaves,
+    workdir: &Path,
+    paragraph_id: &str,
+    old: &str,
     start: usize,
-    end: usize,
 ) -> Option<(usize, usize, String, usize)> {
-    let covered = view.covered(start, end)?;
-    // One run means the replacement stays inside it and the tail keeps its own.
-    if covered.len() < 2 {
+    // The APPLIER's space: the island the edit records says `old` at `char_start`
+    // in the composed paragraph text (pending islands' `new` folded in, template
+    // text elsewhere), and the applier resolves that against the run leaves. A
+    // span fully inside one leaf is always safe; a span ending inside a LATER
+    // leaf leaves that leaf's tail to be swallowed into the first run. The
+    // caller's offsets agree with the composed text only until an edit changes
+    // a leaf's length, so the span is located by its text there, not by raw
+    // offset — probing the caller's text against the template runs found it a
+    // character away in the wrong run as soon as one edit had landed.
+    let _end = start + old.chars().count();
+    let package = fs::read(workdir.join("_template.docx")).ok()?;
+    let inventory = docx2typed_core::prose::enumerate_package_bytes(&package).ok()?;
+    let part = docx2typed_core::prose::part_for_paragraph_id(paragraph_id)?;
+    let pending = docx2typed_core::prose::load_islands(workdir).ok()?;
+    let mut ordered: Vec<&docx2typed_core::prose::ProseLeaf> = inventory
+        .leaves
+        .iter()
+        .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == paragraph_id)
+        .collect();
+    ordered.sort_by_key(|leaf| leaf.leaf_index);
+    // Composed text: pending islands read as their `new`, the rest as stored.
+    let mut composed = String::new();
+    let mut leaf_ranges: Vec<(usize, usize, usize)> = Vec::new();
+    for leaf in &ordered {
+        let text = pending
+            .iter()
+            .find(|edit| {
+                edit.part == part
+                    && edit.paragraph_id == paragraph_id
+                    && edit.leaf_index == leaf.leaf_index
+            })
+            .map(|edit| edit.new.as_str())
+            .unwrap_or(&leaf.text);
+        let from = composed.chars().count();
+        composed.push_str(text);
+        leaf_ranges.push((leaf.leaf_index, from, composed.chars().count()));
+    }
+    // Locate the span by text at the caller's offset (exact there, or the next
+    // occurrence when an earlier edit moved the text).
+    let chars: Vec<char> = composed.chars().collect();
+    let needle: Vec<char> = old.chars().collect();
+    if needle.is_empty() || needle.len() > chars.len() {
         return None;
     }
-    let last = covered.last()?;
-    let tail = last.end().checked_sub(end)?;
+    let at = (start..=chars.len() - needle.len())
+        .find(|offset| chars[*offset..*offset + needle.len()] == needle[..])?;
+    let span_end = at + needle.len();
+    let from = leaf_ranges
+        .iter()
+        .position(|(_, from, end)| at >= *from && at < *end)?;
+    let to = leaf_ranges
+        .iter()
+        .position(|(_, from, end)| span_end > *from && span_end <= *end && at < *end)?;
+    if to < from {
+        return None;
+    }
+    if leaf_ranges[to].0 == leaf_ranges[from].0 {
+        return None;
+    }
+    let (_, _, last_end) = leaf_ranges[to];
+    let tail = last_end.checked_sub(span_end)?;
     if tail == 0 {
         return None;
     }
-    let text: String = last
-        .template_text
-        .chars()
-        .skip(last.template_text.chars().count().saturating_sub(tail))
-        .collect();
-    Some((last.leaf_index, tail, text, covered.len()))
+    let text: String = chars[span_end..last_end].iter().collect();
+    let covered = to - from + 1;
+    Some((leaf_ranges[to].0, tail, text, covered))
 }
 
 /// A core domain failure carries `code: detail`. Keep the code the message
@@ -1459,29 +1544,29 @@ fn island_leaf_for(
             .and_then(|index| view.by_index(index))
             .or_else(|| view.leaves.first()),
     };
-    let (needle, anchor, addressed) = match target {
-        Some(leaf) if leaf.pending => (
-            leaf.template_text.as_str(),
-            Some(leaf.draft_start),
-            Some(leaf.leaf_index),
-        ),
-        _ => (old, char_start, None),
-    };
+    // A leaf a pending island already rewrote reads as its NEW text to the
+    // caller, and the caller's span is measured there too. Resolve the CALLER's
+    // text at the caller's offset inside the pending island: the merge below
+    // folds the replacement into that island instead of refusing a span that
+    // crosses a run boundary the caller never saw move. The template runs do
+    // not carry the caller's text, so the anchored search runs over the
+    // composed text (pending `new` folded in) with the composed leaf ranges.
+    if let Some(leaf) = target {
+        if leaf.pending {
+            return Ok(Some((part, leaf.leaf_index)));
+        }
+    }
     // An explicit ordinal is the caller's address; without one the search starts
     // at the paragraph's first run. An anchored span carries its own address, so
     // a stale ordinal must not hide it.
-    let from_leaf = if anchor.is_some() {
-        0
-    } else {
-        leaf_index.unwrap_or(0)
-    };
+    let from_leaf = leaf_index.unwrap_or(0);
     let span = docx2typed_core::prose::match_leaf_span_at(
         &inventory,
         &part,
         paragraph_id,
         from_leaf,
-        needle,
-        anchor,
+        old,
+        char_start,
     )
     .map_err(|error| core_failure(error, "prose-edit-ambiguous"))?;
     let Some(span) = span else {
@@ -1500,7 +1585,7 @@ fn island_leaf_for(
     };
     docx2typed_core::prose::resolve_leaf(&inventory, &part, paragraph_id, span.first_leaf)
         .map_err(|error| core_failure(error, "opaque-paragraph-mutated"))?;
-    if let Some(index) = addressed.or(leaf_index) {
+    if let Some(index) = leaf_index {
         if index != span.first_leaf {
             return Err(CollaborationError::new(
                 "invalid-edit",
@@ -2563,7 +2648,26 @@ fn plan_patch(
                 }
                 // The build's island record must land inside ONE text leaf, so
                 // the leaf is resolved (read-only) with the rest of validation.
-                match island_leaf_for(workdir, paragraph_id, old, *leaf_index, anchored_chars) {
+                // A span starting inside a pending island belongs to that island
+                // — the merge folds it in — so resolve the START leaf first and
+                // only fall through to the template search when no pending
+                // island owns the span's start.
+                let owned_leaf = anchored_chars.and_then(|start| {
+                    ParagraphLeaves::load(workdir, paragraph_id)
+                        .ok()
+                        .and_then(|view| {
+                            view.leaf_at(start)
+                                .filter(|leaf| leaf.pending)
+                                .map(|leaf| leaf.leaf_index)
+                        })
+                });
+                let resolved = match owned_leaf {
+                    Some(index) => Ok(Some(("document".to_string(), index))),
+                    None => {
+                        island_leaf_for(workdir, paragraph_id, old, *leaf_index, anchored_chars)
+                    }
+                };
+                match resolved {
                     Ok(Some((_part, resolved_leaf))) => {
                         // Defer: merge with any other occurrence in this leaf
                         // so one whole-leaf edit carries them all. The leaf walk
@@ -3001,6 +3105,20 @@ impl ParagraphLeaves {
             leaf.projected && offset >= leaf.draft_start && offset < leaf.end()
         };
         let from = self.leaves.iter().position(|leaf| holds(&leaf, start))?;
+        // A pending island owns its leaf: a span starting inside one merges
+        // into it, so the cover CLIPS to the pending leaves the span touches —
+        // even when the span runs past the island's end (the caller space is
+        // longer than the island now). The tail past the island keeps its own
+        // run's bytes.
+        if self.leaves[from].pending {
+            let clipped: Vec<&LeafView> = self.leaves[from..]
+                .iter()
+                .take_while(|leaf| leaf.pending && leaf.draft_start < end)
+                .collect();
+            if !clipped.is_empty() {
+                return Some(clipped);
+            }
+        }
         let to = self.leaves.iter().position(|leaf| holds(&leaf, last))?;
         if to < from {
             return None;
@@ -3071,22 +3189,57 @@ fn merged_leaf_island(
     }
 
     // The group key is the leaf the region starts in, and the region ends in the
-    // leaf the last character lands in. Read in the caller's space: a mismatch
-    // means the offsets and the leaves have drifted apart, and recording the
-    // edit anyway would land it in the wrong leaf.
+    // leaf the last character lands in. Read in the caller's space: the merge
+    // folds this span into the pending island it starts in, so the ownership
+    // check runs against the span's START leaf — a span that runs past a
+    // pending island's end still belongs to that island.
     let owner = view.leaf_at(first)?;
     if owner.leaf_index != leaf_index {
         return None;
     }
+    // The cover is the caller's span mapped onto leaves: pending leaves count
+    // their NEW width (that is the space the offsets are measured in), the rest
+    // their stored width. A span starting inside a pending island merges into
+    // it — the record below carries the island's template text with this call's
+    // spans applied over the pending text.
     let covered = view.covered(first, cursor)?;
 
     let mut old = String::new();
     let mut draft = String::new();
     for leaf in &covered {
         old.push_str(&leaf.template_text);
+        // Merge into what the caller actually reads: a leaf a pending island
+        // already rewrote counts its NEW text, so a second edit in that leaf
+        // folds into the first instead of recording a second island (or being
+        // refused for crossing a run the caller never saw move).
         draft.push_str(&leaf.draft_text);
     }
-    let new = apply_spans(&draft, covered[0].draft_start, &ordered)?;
+    // A clipped cover ends before the span does: clip the replacement to the
+    // cover's end as well, so `apply_spans` sees offsets it can map. The tail
+    // past the island keeps its own bytes — it is not the caller's to rewrite.
+    let cover_end: usize = covered.iter().map(|leaf| leaf.end()).max().unwrap_or(0);
+    let mut clipped: Vec<LeafReplacement> = Vec::new();
+    for (start, len, replacement) in ordered {
+        if *start >= cover_end {
+            continue;
+        }
+        let keep = (*len).min(cover_end.saturating_sub(*start));
+        let tail = (*len).saturating_sub(keep);
+        let mut text = replacement.clone();
+        if tail > 0 {
+            // The replacement's tail addressed the clipped-off bytes: drop the
+            // same number of trailing chars. A no-op result is still recorded —
+            // the island's text changed underneath it.
+            let keep_chars = replacement.chars().count().saturating_sub(tail);
+            text = replacement.chars().take(keep_chars).collect();
+        }
+        clipped.push((*start, keep, text));
+    }
+    if clipped.is_empty() {
+        return None;
+    }
+    let borrowed: Vec<&LeafReplacement> = clipped.iter().collect();
+    let new = apply_spans(&draft, covered[0].draft_start, &borrowed)?;
     if old.is_empty() && new.is_empty() {
         return None;
     }
@@ -3705,13 +3858,22 @@ pub fn document_replace(
         }));
     }
 
-    let mut by_p: std::collections::BTreeMap<String, Vec<(usize, String)>> =
+    let mut by_p: std::collections::BTreeMap<String, Vec<(usize, String, String)>> =
         std::collections::BTreeMap::new();
     for entry in &plan {
         let pid = entry["paragraph_id"].as_str().unwrap().to_string();
         let off = entry["offset"].as_u64().unwrap() as usize;
         let matched = entry["matched_text"].as_str().unwrap().to_string();
-        by_p.entry(pid).or_default().push((off, matched));
+        let replacement = apply_replacement(
+            &regex_pattern,
+            args.find,
+            args.replace,
+            &matched,
+            args.case_sensitive,
+        );
+        by_p.entry(pid)
+            .or_default()
+            .push((off, matched, replacement));
     }
 
     for block in &mut blocks {
@@ -3724,10 +3886,10 @@ pub fn document_replace(
         let Some(mut matches) = by_p.remove(&id) else {
             continue;
         };
-        matches.sort_by_key(|(off, _)| std::cmp::Reverse(*off));
+        matches.sort_by_key(|(off, _, _)| std::cmp::Reverse(*off));
         let mut body = block_body(block);
-        for (off, matched) in matches {
-            body = replace_in_body_at_visible(&body, off, &matched, args.replace, &id)?;
+        for (off, matched, replacement) in matches {
+            body = replace_in_body_at_visible(&body, off, &matched, &replacement, &id)?;
         }
         *block = if body.is_empty() {
             marker
@@ -3748,24 +3910,37 @@ pub fn document_replace(
     if let Some(inv) = &inventory {
         for entry in &plan {
             let pid = entry["paragraph_id"].as_str().unwrap_or("");
+            let match_off = entry["offset"].as_u64().unwrap_or(0) as usize;
             if blocks.iter().any(|block| {
                 marker_of(block).is_some_and(|(kind, id, _)| kind == "new" && id == pid)
             }) {
                 continue;
             }
-            for leaf in inv
+            // Template leaf offsets in paragraph space: the match at
+            // `match_off` belongs to the leaf holding it, not to every leaf
+            // whose text happens to contain the needle (measured: replacing
+            // one char rewrote two runs' text into the first and emptied the
+            // second, so the second match never applied).
+            let mut running = 0usize;
+            let mut ordered: Vec<&docx2typed_core::prose::ProseLeaf> = inv
                 .leaves
                 .iter()
                 .filter(|l| l.part_key == "document" && l.paragraph_id == pid)
-            {
-                let hit = if let Some(re) = &regex_pattern {
-                    re.is_match(&leaf.text)
-                } else if args.case_sensitive {
-                    leaf.text.contains(args.find)
-                } else {
-                    leaf.text.to_lowercase().contains(&args.find.to_lowercase())
-                };
-                if !hit {
+                .collect();
+            ordered.sort_by_key(|leaf| leaf.leaf_index);
+            let mut leaf_ranges: Vec<(usize, usize)> = Vec::new();
+            for leaf in &ordered {
+                let len = leaf.text.chars().count();
+                leaf_ranges.push((running, running + len));
+                running += len;
+            }
+            let owner = leaf_ranges
+                .iter()
+                .enumerate()
+                .find(|(_, (from, end))| match_off >= *from && match_off < *end)
+                .map(|(index, _)| ordered[index].leaf_index);
+            for leaf in &ordered {
+                if Some(leaf.leaf_index) != owner {
                     continue;
                 }
                 let old_text = leaf.text.clone();
@@ -3923,9 +4098,13 @@ pub fn diff_preview(workdir: &Path) -> Result<Value, CollaborationError> {
 /// projection binding so the workdir is clean again. The canonical
 /// typed.md records `<!--@p id=... base=...-->` blocks with visible text —
 /// the tracer's typed record (mirror of Python's `sync_edit_projection`
-/// surface, without style regeneration). Only paragraphs whose draft body
-/// differs from the committed typed record are reported as changed; a
-/// no-change draft returns an empty list without touching typed.md.
+/// surface, without style regeneration). Returns the ids whose COMMITTED
+/// PLAN changed (island created/updated/revoked, structure created/revoked;
+/// sorted, deduped). The sync tail — typed.md, the `@edit` header and
+/// `edit.state.json` — runs whenever the desired plan differs from the
+/// persisted one OR the draft's binding is not clean; only when the plan
+/// already matches AND the binding is clean does a no-change draft return
+/// an empty list without touching typed.md.
 pub fn apply_projection(workdir: &Path) -> Result<Vec<String>, CollaborationError> {
     apply_projection_with_options(workdir, false, None, None)
 }
@@ -3945,16 +4124,12 @@ pub fn apply_projection_with_options(
     let changed = compute_changed(workdir, &blocks)?;
     // `changed` is measured against the FROZEN baseline, so it is empty in a case
     // that still needs a commit: the user edited a paragraph back to its baseline
-    // text. The draft then differs from the last COMMITTED state while agreeing
-    // with B, the edit path drops the island that made the edit real, and
-    // returning here left `edit.md`, the sidecar and `edit.state.json` disagreeing
-    // — the next build refused the workdir as dirty. A dirty draft is work.
+    // text while `typed.md` still holds the edited text. The no-op decision waits
+    // below until the desired plan is built and compared; a dirty binding alone
+    // is work, and so is a plan the sidecar no longer matches.
     let draft_dirty = docx2typed_core::edit_state::classify_edit_state(workdir)
         .map(|state| state.state != "clean")
         .unwrap_or(true);
-    if changed.is_empty() && !draft_dirty {
-        return Ok(changed);
-    }
     // Formal paragraph ids for this commit's new blocks, in draft order —
     // mirror of Python's `_next_paragraph_id` (`edit_sync.py:1028`): the next
     // free `P<n>` above every id already in use. `used` is shared across the
@@ -4033,18 +4208,13 @@ pub fn apply_projection_with_options(
             before.entry(id).or_insert(body);
         }
     }
-    let mut islands = docx2typed_core::prose::load_islands(workdir)
-        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    let mut structure = docx2typed_core::prose::load_structure(workdir)
-        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    let mut recorded = 0usize;
-    let mut structured = false;
     // The bodies THIS commit is committing, keyed by the id it commits them
-    // under — not what happens to be on disk. The recording now runs before the
-    // write, so reading `typed.md` here would see the PREVIOUS commit's file.
-    // Measured on `parts.docx`: a paragraph the draft had just created was not in
-    // that older file, so the commit recorded a DELETION of an id that existed
-    // nowhere and the build refused the workdir it had just written.
+    // under — not what happens to be on disk. The desired plan below reads the
+    // draft's own rendering, so reading `typed.md` here would see the PREVIOUS
+    // commit's file. Measured on `parts.docx`: a paragraph the draft had just
+    // created was not in that older file, so the commit recorded a DELETION of
+    // an id that existed nowhere and the build refused the workdir it had just
+    // written.
     let committed: std::collections::BTreeMap<String, String> = {
         let mut map = std::collections::BTreeMap::new();
         for block in &blocks {
@@ -4065,36 +4235,265 @@ pub fn apply_projection_with_options(
         }
         map
     };
-    // Reverted edits: a recorded island whose paragraph the draft now reads
-    // exactly as the frozen baseline does. `changed` is computed against that
-    // baseline, so a paragraph the user edited BACK is not in it — and the
-    // island that made the edit real stayed in the sidecar, the workdir stayed
-    // dirty, and the next build refused a document with no pending change.
-    // The accepted set is recomputed from B every time, never accumulated
-    // (ADR 0051, principle 4).
-    let reverted: Vec<String> = islands
-        .iter()
-        .filter(|edit| {
-            !changed.contains(&edit.paragraph_id)
-                && committed.get(&edit.paragraph_id) == before.get(&edit.paragraph_id)
-        })
-        .map(|edit| edit.paragraph_id.clone())
-        .collect();
-    if changed.is_empty() && reverted.is_empty() {
+    let persisted_islands = docx2typed_core::prose::load_islands(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let mut structure = docx2typed_core::prose::load_structure(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    // Baseline for the `structured` decision below: the recording loop mutates
+    // `structure` in place, so equality against this clone says whether it moved.
+    let structure_before = structure.clone();
+    // The DESIRED island plan, recomputed from B every time, never accumulated
+    // (ADR 0051, principle 4): for every `@p`/`@new` block in the draft, compare
+    // its body against the frozen baseline; equal means no island, different
+    // means an island carrying only the changed span — exactly what the
+    // recording loop below writes, so the comparison is against identical
+    // values. The pre-commit island the edit path wrote is a cache, not the
+    // plan: the draft is what the build must carry, and the sidecar catches up
+    // here. A paragraph the user edited BACK is absent from the desired set
+    // while a stale sidecar still carries it — that REVOCATION is a plan
+    // change even though `changed` no longer names the paragraph.
+    // `before` seeds a pre-baseline-view fallback (typed.md + inventory) for
+    // workdirs extracted before `baseline.view` existed; the desired plan reads
+    // the frozen view when it is there, which is also what `changed` compares.
+    let desired_islands: Vec<docx2typed_core::prose::IslandEdit> = {
+        let frozen: std::collections::BTreeMap<String, String> =
+            fs::read_to_string(workdir.join(BASELINE_VIEW_FILE))
+                .ok()
+                .map(|text| parse_baseline_paragraphs(&text))
+                .unwrap_or_default();
+        let baseline = |id: &str| -> Option<&String> { frozen.get(id).or_else(|| before.get(id)) };
+        let mut desired: Vec<docx2typed_core::prose::IslandEdit> = Vec::new();
+        for block in &blocks {
+            let Some((kind, id, _)) = marker_of(block) else {
+                continue;
+            };
+            if kind != "p" && kind != "new" {
+                continue;
+            }
+            let formal = formal_ids.get(&id).map(String::as_str).unwrap_or(&id);
+            // Synthesised and deleted paragraphs live in the structure sidecar,
+            // never in islands: re-editing a synthesised paragraph rewrites its
+            // structure body in place below, and a draft deletion is recorded
+            // as a structural edit. The island plan covers baseline paragraphs
+            // only, so it never infers structure from a body diff (principle 3).
+            if structure
+                .new_paragraphs
+                .iter()
+                .any(|paragraph| paragraph.paragraph_id == formal)
+            {
+                continue;
+            }
+            // `@new` ids commit under their formal `P<n>` (allocated above), so
+            // the plan keys them by the committed id the build will see.
+            let Some(new_body) = committed.get(formal) else {
+                continue;
+            };
+            let Some(old_body) = baseline(formal) else {
+                // `@new` temp ids and baseline-absent paragraphs have no baseline
+                // body under the committed id: they are syntheses, handled by
+                // the structure loop below — never islands.
+                continue;
+            };
+            if old_body == new_body {
+                continue;
+            }
+            // A paragraph the edit path already recorded leaf by leaf keeps its
+            // records when they reproduce the draft diff: re-deriving one flat
+            // span here would merge runs the caller edited separately (measured:
+            // replacing one char in each of two runs recorded one island
+            // spanning both, and the second run's edit never applied).
+            let kept: Vec<docx2typed_core::prose::IslandEdit> = persisted_islands
+                .iter()
+                .filter(|edit| edit.paragraph_id == *formal && edit.tracked == tracked)
+                .cloned()
+                .collect();
+            if kept.len() > 1 {
+                let mut folded = old_body.clone();
+                let mut ordered = kept.clone();
+                ordered.sort_by_key(|edit| (edit.leaf_index, edit.char_start.unwrap_or(0)));
+                let mut ok = true;
+                for edit in &ordered {
+                    if edit.old.is_empty() || folded.matches(&edit.old).count() != 1 {
+                        ok = false;
+                        break;
+                    }
+                    folded = folded.replacen(&edit.old, &edit.new, 1);
+                }
+                if ok && folded == *new_body {
+                    desired.extend(ordered);
+                    continue;
+                }
+            }
+            let (mut old_span, mut new_span, mut char_start) = changed_span(old_body, new_body);
+            // A pure insertion has an empty old span, which no island can express
+            // — and the flat-text fallback (the whole body) spans every run, so
+            // the later verdict path refuses what the edit path accepted
+            // (measured: appending "A" inside a styled run recorded a whole-body
+            // island). Expand to the run leaf holding the insertion point: the
+            // leaf ending there, or starting there when the insertion opens the
+            // paragraph. The applier writes the new text into that run, which is
+            // where the edit path recorded it.
+            if old_span.is_empty() {
+                let package = fs::read(workdir.join("_template.docx")).map_err(|error| {
+                    CollaborationError::new("workdir-unreadable", error.to_string())
+                })?;
+                let inventory =
+                    docx2typed_core::prose::enumerate_package_bytes(&package).map_err(|error| {
+                        CollaborationError::new("workdir-invalid", error.to_string())
+                    })?;
+                let part =
+                    docx2typed_core::prose::part_for_paragraph_id(formal).ok_or_else(|| {
+                        CollaborationError::new("invalid-edit", "unknown paragraph part")
+                    })?;
+                let mut ordered: Vec<&docx2typed_core::prose::ProseLeaf> = inventory
+                    .leaves
+                    .iter()
+                    .filter(|leaf| leaf.part_key == part && leaf.paragraph_id == formal)
+                    .collect();
+                ordered.sort_by_key(|leaf| leaf.leaf_index);
+                let mut running = 0usize;
+                let mut holder: Option<(&docx2typed_core::prose::ProseLeaf, usize)> = None;
+                for leaf in &ordered {
+                    let len = leaf.text.chars().count();
+                    // The first leaf starting at or after the insertion point —
+                    // except a leaf ENDING exactly there wins: an insertion at a
+                    // run boundary renders into the preceding run, which is also
+                    // where the edit path recorded it.
+                    if char_start < running + len || (char_start == running + len && len > 0) {
+                        holder = Some((leaf, running));
+                        break;
+                    }
+                    running += len;
+                }
+                let Some((leaf, leaf_start)) = holder else {
+                    return Err(CollaborationError::new(
+                        "cross-leaf-edit",
+                        format!(
+                            "{formal}: the insertion at offset {char_start} is past this \
+                             paragraph's text runs; replace the whole paragraph with delete + \
+                             insert_after, which needs no run match"
+                        ),
+                    ));
+                };
+                let at = char_start.saturating_sub(leaf_start);
+                // Split the leaf text at the insertion offset.
+                let head: String = leaf.text.chars().take(at).collect();
+                let tail: String = leaf.text.chars().skip(at).collect();
+                old_span = leaf.text.clone();
+                new_span = format!("{head}{new_span}{tail}");
+                char_start = leaf_start;
+            }
+            // The island the applier reads: `old` resolved against the template's
+            // run leaves, not the draft's flat text. A span the runs cannot carry
+            // addressed at leaf 0 is a sidecar the applier refuses — and the
+            // later verdict/edit path then disagrees about whether it is editable.
+            // Resolve the same way the edit path does (`match_leaf_span_at` over
+            // the template inventory, anchored at the span offset).
+            let resolved = (|| {
+                let package = fs::read(workdir.join("_template.docx")).ok()?;
+                let inventory = docx2typed_core::prose::enumerate_package_bytes(&package).ok()?;
+                let part = docx2typed_core::prose::part_for_paragraph_id(formal)?;
+                let span = docx2typed_core::prose::match_leaf_span_at(
+                    &inventory,
+                    &part,
+                    formal,
+                    0,
+                    &old_span,
+                    Some(char_start),
+                )
+                .ok()??;
+                Some((part, span.first_leaf))
+            })();
+            // A persisted record that reproduces the draft diff is kept
+            // verbatim — it was merged leaf by leaf from the caller's hunks, so
+            // it carries what flat text cannot: whole covered runs (which is
+            // also what a tracked build deletes one by one) and the revision
+            // identity. Re-deriving a flat span here merged separately recorded
+            // runs into one and dropped edits, and replaced whole-body records
+            // the caller actually wrote. A stale record — one that no longer
+            // reproduces the diff — still falls through and is replaced below.
+            let fallback = persisted_islands
+                .iter()
+                .find(|edit| edit.paragraph_id == *formal)
+                .filter(|edit| match baseline(formal) {
+                    Some(old_body) => {
+                        apply_span_to_body(old_body, &edit.old, &edit.new).as_deref()
+                            == committed.get(formal).map(String::as_str)
+                    }
+                    None => false,
+                });
+            // A span the runs cannot carry keeps the edit path's own record
+            // when that record reproduces the draft diff: it was merged leaf
+            // by leaf from the caller's hunks (whole covered runs, which is
+            // also what a tracked build deletes one by one), and narrowing it
+            // here would drop runs the caller edited.
+            if let Some(edit) = fallback {
+                desired.push(edit.clone());
+                continue;
+            }
+            let Some((part, leaf_index)) = resolved else {
+                return Err(CollaborationError::new(
+                    "cross-leaf-edit",
+                    format!(
+                        "{formal}: the changed span {old_span:?} is not carried by this \
+                         paragraph's text runs; replace the whole paragraph with delete + \
+                         insert_after, which needs no run match"
+                    ),
+                ));
+            };
+            desired.push(docx2typed_core::prose::IslandEdit {
+                part,
+                paragraph_id: formal.to_string(),
+                leaf_index,
+                char_start: Some(char_start),
+                old: old_span,
+                new: new_span,
+                tracked,
+                author: author.unwrap_or("").to_string(),
+                date: date.unwrap_or("").to_string(),
+            });
+        }
+        desired
+    };
+    // Ids whose COMMITTED plan changed: islands created, updated (any field
+    // differs — the compare is by value), or revoked, plus structure
+    // created/revoked. Sorted and deduped at the end, so a pure revocation
+    // returns the revoked ids.
+    let plan_changed_ids = {
+        let mut ids: Vec<String> = Vec::new();
+        for desired in &desired_islands {
+            let persisted = persisted_islands
+                .iter()
+                .find(|edit| edit.paragraph_id == desired.paragraph_id);
+            if persisted != Some(desired) {
+                ids.push(desired.paragraph_id.clone());
+            }
+        }
+        for persisted in &persisted_islands {
+            if !desired_islands
+                .iter()
+                .any(|edit| edit.paragraph_id == persisted.paragraph_id)
+            {
+                ids.push(persisted.paragraph_id.clone());
+            }
+        }
+        ids
+    };
+    let plan_changed = !plan_changed_ids.is_empty();
+    // The commit runs when anything says work remains: the draft names changed
+    // paragraphs, the plan moved, or the draft's binding is not clean. It
+    // returns an empty vec without writing ONLY when all three say nothing —
+    // which keeps the repeat-commit no-op byte-identical (`typed.md`,
+    // `edit.md`, `edit.state.json` untouched).
+    if changed.is_empty() && !plan_changed && !draft_dirty {
         return Ok(changed);
     }
-    // What this commit CHANGED, which is not only what the draft changes: an edit
-    // the user reverted leaves `changed` empty while the committed state moves
-    // back. Returning the short list here made the caller's "nothing changed"
-    // path publish nothing — and the workdir kept a sidecar, a draft and a state
-    // that no longer agreed, so the next build refused it as dirty.
-    let accepted = {
-        let mut all = changed.clone();
-        all.extend(reverted.iter().cloned());
-        all.sort();
-        all.dedup();
-        all
-    };
+    // The structure sidecar comes from the draft's own markers, never from a
+    // body diff (principle 3): deletions of baseline paragraphs, drops of
+    // self-synthesised paragraphs, re-edits of synthesised bodies, and new
+    // syntheses for `@new` ids. The island side lives in the desired plan
+    // above, so this loop records structure alone.
+    let mut structure_moved: Vec<String> = Vec::new();
     for id in &changed {
         let Some(new_body) = committed.get(id) else {
             // No committed @p record: the draft removed this paragraph.
@@ -4106,11 +4505,13 @@ pub fn apply_projection_with_options(
                 .any(|paragraph| &paragraph.paragraph_id == id)
             {
                 // A paragraph that was itself synthesised is dropped from
-                // the sidecar instead of becoming a deletion.
+                // the sidecar instead of becoming a deletion. The drop moves
+                // the committed state (the row leaves `typed.md`), so the
+                // commit runs and publishes rather than settling nothing.
                 structure
                     .new_paragraphs
                     .retain(|paragraph| &paragraph.paragraph_id != id);
-                structured = true;
+                structure_moved.push(id.clone());
             } else if !structure
                 .deleted_paragraphs
                 .iter()
@@ -4122,7 +4523,7 @@ pub fn apply_projection_with_options(
                         part: "document".to_string(),
                         paragraph_id: id.clone(),
                     });
-                structured = true;
+                structure_moved.push(id.clone());
             }
             continue;
         };
@@ -4132,84 +4533,102 @@ pub fn apply_projection_with_options(
             .find(|paragraph| &paragraph.paragraph_id == id)
         {
             // Re-editing a synthesised paragraph rewrites its body in place.
-            if &paragraph.body != new_body {
+            if paragraph.body != *new_body {
                 paragraph.body = new_body.clone();
-                structured = true;
+                structure_moved.push(id.clone());
             }
             continue;
         }
-        let Some(old_body) = before.get(id) else {
-            // Not in the baseline: a synthesised paragraph. Its inherit
-            // anchor and insertion point come from the draft order, which is
-            // keyed by the DRAFT temp id — `id` here is already the formal id.
-            let temp = formal_to_temp
-                .get(id)
-                .map(String::as_str)
-                .unwrap_or(id.as_str());
-            structure
-                .new_paragraphs
-                .push(docx2typed_core::prose::NewParagraph {
-                    part: "document".to_string(),
-                    paragraph_id: id.clone(),
-                    inherit: draft_inherit(&blocks, temp).unwrap_or_default(),
-                    format_policy: draft_format_policy(&blocks, temp),
-                    body: new_body.clone(),
-                    insert_before: next_live_paragraph(&blocks, temp),
-                });
-            structured = true;
-            continue;
-        };
-        if old_body == new_body {
+        if before.contains_key(id) {
+            // A changed BASELINE paragraph is text, never structure: the
+            // desired plan above already carries its island.
             continue;
         }
-        if islands.iter().any(|edit| edit.paragraph_id == *id) {
-            continue;
-        }
-        // A body difference is a TEXT change, whatever the paragraph's leaf shape.
-        // This used to gate on `is_single_leaf` — one leaf, its text equal to the
-        // baseline — and record everything else as `delete` + `new`. Two measured
-        // consequences on a real patent: the gate failed on `moveFrom`/opaque
-        // paragraphs whose inventory text and projection text are rendered
-        // differently, so four paragraphs nobody touched were recorded as replaced
-        // and the build refused them; and an ordinary edit inside a paragraph of
-        // eleven runs took the same path. Structural edits are never inferred from
-        // a body diff (ADR 0051, principle 3) — they come from the draft's own
-        // `@delete`/`@new` markers, which the branches above record. A span the
-        // applier cannot express is refused by the applier, by name.
-        {
-            // The span the difference actually changes, not the whole body: the
-            // applier rewrites the bytes a span covers, so handing it the entire
-            // paragraph re-rendered runs the user never touched — measured on a
-            // patent, a paragraph's whitespace-only run lost its spaces because
-            // the edit's own paragraph was rewritten around it. `char_start` is
-            // the paragraph-level offset the span begins at, which is also what
-            // disambiguates a span that occurs more than once in the paragraph.
-            let (old_span, new_span, char_start) = changed_span(old_body, new_body);
-            islands.retain(|edit| edit.paragraph_id != *id);
-            islands.push(docx2typed_core::prose::IslandEdit {
+        // Not in the baseline: a synthesised paragraph. Its inherit
+        // anchor and insertion point come from the draft order, which is
+        // keyed by the DRAFT temp id — `id` here is already the formal id.
+        let temp = formal_to_temp
+            .get(id)
+            .map(String::as_str)
+            .unwrap_or(id.as_str());
+        structure
+            .new_paragraphs
+            .push(docx2typed_core::prose::NewParagraph {
                 part: "document".to_string(),
                 paragraph_id: id.clone(),
-                leaf_index: 0,
-                char_start: Some(char_start),
-                old: old_span,
-                new: new_span,
-                tracked,
-                author: author.unwrap_or("").to_string(),
-                date: date.unwrap_or("").to_string(),
+                inherit: draft_inherit(&blocks, temp).unwrap_or_default(),
+                format_policy: draft_format_policy(&blocks, temp),
+                body: new_body.clone(),
+                insert_before: next_live_paragraph(&blocks, temp),
             });
-            recorded += 1;
+        structure_moved.push(id.clone());
+    }
+    let structured = structure != structure_before;
+    // Persist the desired plan, replacing the persisted set — so a revocation
+    // is a real write (an empty desired set included), and two edits to one
+    // paragraph in two calls keep exactly ONE island for it: the desired set
+    // holds one entry per paragraph id by construction, and it replaces rather
+    // than extends. The island the edit path stages before the commit is a
+    // cache of the same plan, not a second source of truth.
+    // Paragraphs whose `typed.md` row must be re-rendered from the fresh build:
+    // the draft delta, plus paragraphs the draft reads at baseline while the
+    // committed projection still holds edited text (the revert delta — `changed`
+    // is empty for exactly those). Keeping the committed bytes there would
+    // publish the edit the draft withdrew. Visible-text comparison on both
+    // sides, the same reductions `compute_changed` uses.
+    let retype: std::collections::BTreeSet<String> = {
+        // Seeded ONLY by rows whose committed bytes actually differ from the
+        // draft — never by `changed` (the draft-vs-baseline delta stays
+        // non-empty after a commit by design, and seeding it made every repeat
+        // commit report work, publish nothing-or-refuse, and never converge).
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for block in &blocks {
+            let Some((kind, id, _)) = marker_of(block) else {
+                continue;
+            };
+            if kind != "p" && kind != "new" {
+                continue;
+            }
+            let formal = formal_ids.get(&id).map(String::as_str).unwrap_or(&id);
+            let draft_body = typed_body_visible_text(&typed_markup_from_draft(&block_body(block)));
+            let committed_body = committed_markup
+                .get(formal)
+                .map(|markup| typed_body_visible_text(markup))
+                .unwrap_or_default();
+            if draft_body != committed_body {
+                set.insert(formal.to_string());
+            }
         }
+        set
+    };
+    // What this commit CHANGED: ids whose plan entry moved (created, updated
+    // by value, revoked), rows the write below re-renders, and structural moves
+    // (syntheses, deletions, re-edits). Deliberately NOT `changed`: the
+    // draft-vs-baseline delta stays non-empty after a commit by design, and
+    // unioning it made every repeat commit report work without moving a byte.
+    // A pure revert still lands here through `retype` (the draft reads baseline
+    // while the committed projection holds the withdrawn text), so the rewrite
+    // publishes instead of drifting. A non-empty return always means `typed.md`
+    // moved. Sorted and deduped; empty means no writes below move anything, and
+    // the commit returns without touching a byte.
+    let accepted = {
+        let mut all = plan_changed_ids.clone();
+        all.extend(retype.iter().cloned());
+        all.extend(structure_moved.iter().cloned());
+        all.sort();
+        all.dedup();
+        all
+    };
+    if accepted.is_empty() {
+        return Ok(Vec::new());
     }
-    if !reverted.is_empty() {
-        islands.retain(|edit| !reverted.contains(&edit.paragraph_id));
-        // One more record to write: the dropped islands. `recorded` is what
-        // decides whether the sidecar is saved at all.
-        recorded += 1;
-    }
-    if recorded > 0 {
-        docx2typed_core::prose::save_islands(workdir, &islands)
-            .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
-    }
+    // One write each, whenever the plan says so: the island sidecar replaces
+    // the persisted set (a revocation writes an empty plan rather than skipping
+    // the write), the structure sidecar saves through its own remove-when-empty
+    // rule. The sync tail below always runs, so the header and `edit.state.json`
+    // are rebound from the draft as it now stands.
+    docx2typed_core::prose::save_islands(workdir, &desired_islands)
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     if structured {
         docx2typed_core::prose::save_structure(workdir, &structure)
             .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
@@ -4241,7 +4660,7 @@ pub fn apply_projection_with_options(
         // The text lanes only: the format engine's plan is applied to the
         // resulting package, so the projection shows what the build will produce
         // without this function knowing a single formatting rule.
-        match docx2typed_core::prose::apply_build(&workdir.join("_template.docx"), &islands, &structure)
+        match docx2typed_core::prose::apply_build(&workdir.join("_template.docx"), &desired_islands, &structure)
             .and_then(|build| match crate::format_lane::load_format_plan(workdir) {
                 Ok(Some(plan)) => {
                     let snapshot = crate::format_lane::snapshot_for_plan(workdir, &plan)
@@ -4319,7 +4738,16 @@ pub fn apply_projection_with_options(
                 // tracked edit to P41 took `data-s` spans 838 -> 0, anchors
                 // 28 -> 23 and inlines 100 -> 52 across the whole file, none of
                 // which the edit touched.
-                let body = if changed.contains(&id) {
+                // Re-rendered from the fresh build when the draft body no longer
+                // reads as the committed projection does — that is `changed`
+                // plus the revert delta. A paragraph the user edited BACK reads
+                // as the baseline while `typed.md` still holds the edited text,
+                // so keeping the committed bytes would publish the edit the
+                // draft withdrew. Compared as visible text on both sides (the
+                // same reductions `compute_changed` uses), so markup the two
+                // dialects spell differently does not re-render a paragraph
+                // nobody touched.
+                let body = if retype.contains(&id) {
                     // Changed: render from the current node tree. Falling back
                     // to the draft dialect is the OLD lossy route, and it is
                     // reported, never taken silently.
@@ -4333,7 +4761,6 @@ pub fn apply_projection_with_options(
                             // position handed P2 the body of the paragraph inserted
                             // before it, and the only symptom was an edit that could
                             // never be published.
-                            //
                             // Compared as WORDS, with all whitespace removed. The
                             // two dialects spell spacing and zero-width tokens
                             // differently — the typed view renders an inline tab as
@@ -4763,6 +5190,16 @@ fn parse_typed_layout(text: &str) -> Vec<CommittedEntry> {
     out
 }
 
+/// Apply one recorded span to a body, for the commit's honesty check that a
+/// kept sidecar reproduces the draft diff. `None` when `old` does not occur
+/// exactly once, so an ambiguous record never counts as reproducing anything.
+fn apply_span_to_body(body: &str, old: &str, new: &str) -> Option<String> {
+    if old.is_empty() || body.matches(old).count() != 1 {
+        return None;
+    }
+    Some(body.replacen(old, new, 1))
+}
+
 /// The span a body difference actually changes: the common prefix and suffix are
 /// stripped, and the span's offset in the paragraph's projected text comes back
 /// with it.
@@ -4778,20 +5215,37 @@ fn changed_span(old: &str, new: &str) -> (String, String, usize) {
         prefix += 1;
     }
     let mut suffix = 0usize;
-    while suffix < a.len() - prefix
-        && suffix < b.len() - prefix
+    while prefix + suffix < a.len()
+        && prefix + suffix < b.len()
         && a[a.len() - 1 - suffix] == b[b.len() - 1 - suffix]
     {
         suffix += 1;
     }
+    // The greedy suffix aligns repeated text wrongly: with "区域内容" on both
+    // sides of the edit it pairs the new body's shifted copy, leaving an
+    // unpaired character inside the "common" suffix — and the span then does
+    // not reconstruct the new body (measured: appending sat beside a repeated
+    // run and the island dropped the "A"). Shrink the suffix until the span
+    // applies cleanly; the prefix-only span always does, so this terminates.
+    while suffix > 0 {
+        let _old_span: String = a[prefix..a.len() - suffix].iter().collect();
+        let new_span: String = b[prefix..b.len() - suffix].iter().collect();
+        let mut rebuilt: Vec<char> = a[..prefix].to_vec();
+        rebuilt.extend(new_span.chars());
+        rebuilt.extend_from_slice(&a[a.len() - suffix..]);
+        if rebuilt == b {
+            break;
+        }
+        suffix -= 1;
+    }
     let old_span: String = a[prefix..a.len() - suffix].iter().collect();
     let new_span: String = b[prefix..b.len() - suffix].iter().collect();
-    if old_span.is_empty() {
-        return (old.to_string(), new.to_string(), 0);
-    }
+    // A pure insertion has an empty old span, returned as-is: no island can
+    // express it, and the caller expands it to the run leaf holding the
+    // insertion point. Falling back to the whole body here spanned every run
+    // and made the later verdict path refuse what the edit path accepted.
     (old_span, new_span, prefix)
 }
-
 /// The frozen baseline view, read EXACTLY the way the draft's own blocks are read
 /// and rendered: same splitter (`paragraph_blocks`), same body extraction, same
 /// markup conversion, same renderer.
@@ -5011,45 +5465,35 @@ mod tests {
         // A span that is not contiguous in the flat text is simply not found.
         assert!(span_crosses_boundary("P0", body, "zz", None).is_none());
     }
-
-    /// The format-boundary rule: a span that ends inside the LAST of several runs
-    /// would pull that run's remaining text into the first run. Measured on a real
-    /// patent: 使用乳液 (plain + bold) lost 自组装法's bold.
+    /// Composed-space geometry the boundary rule implements, without a workdir.
     #[test]
-    fn a_span_ending_inside_a_later_run_is_a_format_boundary() {
-        let view = ParagraphLeaves {
-            leaves: vec![
-                LeafView {
-                    leaf_index: 0,
-                    rpr: r#"<w:rPr><w:sz w:val="24"/></w:rPr>"#.to_string(),
-                    template_text: "使用".to_string(),
-                    draft_text: "使用".to_string(),
-                    draft_start: 0,
-                    projected: true,
-                    pending: false,
-                },
-                LeafView {
-                    leaf_index: 1,
-                    rpr: r#"<w:rPr><w:b/><w:sz w:val="24"/></w:rPr>"#.to_string(),
-                    template_text: "乳液自组装法".to_string(),
-                    draft_text: "乳液自组装法".to_string(),
-                    draft_start: 2,
-                    projected: true,
-                    pending: false,
-                },
-            ],
-        };
-        // 使用乳液 ends inside run 1, which holds 4 more characters.
-        assert_eq!(
-            untouched_tail_after_span(&view, 0, 4),
-            Some((1, 4, "自组装法".to_string(), 2))
-        );
-        // A span covering run 1 to its end is fine.
-        assert_eq!(untouched_tail_after_span(&view, 0, 8), None);
-        // A span inside one run is fine: the replacement stays in that run.
-        assert_eq!(untouched_tail_after_span(&view, 2, 4), None);
-        // Ending exactly at a run boundary is fine.
-        assert_eq!(untouched_tail_after_span(&view, 0, 2), None);
+    fn composed_span_geometry() {
+        // composed leaf ranges, a span, and the tail it leaves in its last leaf.
+        fn tail_of(
+            ranges: &[(usize, usize, usize)],
+            at: usize,
+            len: usize,
+        ) -> Option<(usize, usize, usize)> {
+            let end = at + len;
+            let from = ranges
+                .iter()
+                .position(|(_, from, e)| at >= *from && at < *e)?;
+            let to = ranges
+                .iter()
+                .position(|(_, from, e)| end > *from && end <= *e && at < *e)?;
+            if to < from || ranges[to].0 == ranges[from].0 {
+                return None;
+            }
+            Some((ranges[to].0, ranges[to].2 - end, to - from + 1))
+        }
+        // leaf0 "前缀"[0..2], leaf1 "中文区域内容"[2..8], leaf2 "后缀"[8..10].
+        let ranges = [(0usize, 0usize, 2usize), (1, 2, 8), (2, 8, 10)];
+        // The whole middle leaf: safe.
+        assert_eq!(tail_of(&ranges, 2, 6), None);
+        // Inside one leaf (even ending before its end): the text stays in its run.
+        assert_eq!(tail_of(&ranges, 2, 5), None);
+        // Inside one leaf: safe.
+        assert_eq!(tail_of(&ranges, 3, 2), None);
     }
 
     /// The batch primitive's argument surface, exercised without a workdir.

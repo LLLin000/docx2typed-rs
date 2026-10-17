@@ -798,7 +798,7 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), Se
     let mut saved_any = false;
 
     for step in 1..=steps {
-        match rng.below(8) {
+        match rng.below(9) {
             // Move one span to a different text: longer, shorter, or back to the
             // one the document came with. The last composes to a no-op island.
             0 | 1 => {
@@ -1016,6 +1016,62 @@ fn run_sequence(seed: u64, steps: usize, log: &mut Vec<String>) -> Result<(), Se
                     ));
                 }
                 log.push(format!("{step}: stale handle refused"));
+            }
+            // A revert: move an edited slot back to the text the document came
+            // with, then save — a reverted workdir must stay publishable. When
+            // every slot is already home there is nothing to revoke, and the
+            // step skips rather than saving.
+            6 => {
+                let edited: Vec<usize> = (0..3)
+                    .filter(|slot| slots[*slot] != SLOT_TARGETS[*slot][0])
+                    .collect();
+                if edited.is_empty() {
+                    log.push(format!("{step}: revert skipped, every slot is home"));
+                    continue;
+                }
+                let slot = edited[rng.below(edited.len() as u64) as usize];
+                let baseline = SLOT_TARGETS[slot][0];
+                let handle = find_handle(&workdir, &slots[slot])
+                    .map_err(|detail| SequenceFailure::new(step, "find", detail))?;
+                let replies = mcp(&[
+                    ("document_open", json!({ "source": workdir })),
+                    (
+                        "document_edit",
+                        json!({ "edits": [{ "handle": handle, "replace_with": baseline }] }),
+                    ),
+                ]);
+                if outcome(&replies[1]) != "success" {
+                    return Err(SequenceFailure::new(
+                        step,
+                        "replace",
+                        format!(
+                            "revert slot {slot} {:?} -> {baseline:?} failed: {:?}",
+                            slots[slot], replies[1]
+                        ),
+                    ));
+                }
+                log.push(format!(
+                    "{step}: revert slot {slot} {:?} -> {baseline:?}",
+                    slots[slot]
+                ));
+                slots[slot] = baseline.to_string();
+                assert_islands_cover_distinct_leaves(wd)
+                    .map_err(|detail| SequenceFailure::new(step, "island-per-leaf", detail))?;
+                // A reverted workdir must save: pre-fix the revoked island kept
+                // the draft dirty, so this save failed with `edit-dirty`.
+                let replies = mcp(&[
+                    ("document_open", json!({ "source": workdir })),
+                    ("document_save", json!({ "output": out.to_string_lossy() })),
+                ]);
+                if outcome(&replies[1]) != "success" {
+                    return Err(SequenceFailure::new(
+                        step,
+                        "save",
+                        format!("save after revert failed: {:?}", replies[1]),
+                    ));
+                }
+                saved_any = true;
+                log.push(format!("{step}: save after revert"));
             }
             // A save: the file has to say what the sequence says, and nothing it
             // has replaced or deleted.
@@ -2221,18 +2277,343 @@ fn an_edit_sequence_across_calls_keeps_one_island_per_leaf_and_one_version() {
     );
 }
 
-/// One island per leaf, across every call the sequence made. A workdir that has
-/// recorded nothing yet satisfies it trivially.
-fn assert_islands_cover_distinct_leaves(workdir: &Path) -> Result<(), String> {
+/// Reverting an edit back to its baseline text revokes its island.
+///
+/// The pre-fix engine kept the composed no-op island and left the draft dirty,
+/// so a revert followed by a save failed with `edit-dirty`. The assertion that
+/// catches the missing revocation is the clean classification right after the
+/// revert in (a): it is the first failure point, and the save it unlocks pins
+/// the user-visible symptom behind it.
+#[test]
+fn reverting_an_edit_back_to_its_baseline_revokes_its_island() {
+    // a. Away and back on one leaf: the island the first edit recorded must be
+    // gone, the draft clean, and the save it unlocks must publish the baseline
+    // text again.
+    let (dir, workdir) = opened("revert-simple");
+    let wd = Path::new(&workdir);
+    let first = handle(&workdir, "中文区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": first, "replace_with": "中文区块区域内容" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+
+    let back = handle(&workdir, "中文区块区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": back, "replace_with": "中文区域内容" }] }),
+        ),
+        ("document_status", json!({})),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+    assert_eq!(
+        data(&replies[2])["state"]["state"],
+        "clean",
+        "the revert kept its island, so the draft is still dirty: {:?}",
+        data(&replies[2])
+    );
+    // REVIEW-SENSITIVE: `next` reads the review snapshot, which only tracks the
+    // last commit's typed.md — so a fully reverted draft still asks for a save
+    // that would republish the baseline. The regression this pins is the DIRTY
+    // half above: a stale island must not hold the draft open. If a later
+    // engine fix teaches the snapshot to recognise a no-op (typed.md identical
+    // to its pinned hash), `next` should read Null here too.
+    assert_eq!(
+        data(&replies[2])["versions"]["draft_dirty"],
+        json!(false),
+        "a reverted draft still asks to be settled: {:?}",
+        data(&replies[2])
+    );
+    let out = dir.join("reverted.docx");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let built = built_text(&out);
+    assert!(built.contains("中文区域内容"), "{built}");
+    assert!(!built.contains("中文区块区域内容"), "{built}");
+    let islands = island_edits(wd).expect("islands.json");
+    assert!(
+        islands.is_empty(),
+        "the revert left an island behind: {islands:?}"
+    );
+
+    // b. Away through two texts and back across three calls: the composed edits
+    // must collapse to nothing, not to two islands over one leaf.
+    let (dir, workdir) = opened("revert-composed");
+    let wd = Path::new(&workdir);
+    for (from, to) in [
+        ("中文区域内容", "中文区块区域内容"),
+        ("中文区块区域内容", "中文区域内容A"),
+        ("中文区域内容A", "中文区域内容"),
+    ] {
+        let target = handle(&workdir, from);
+        let replies = mcp(&[
+            ("document_open", json!({ "source": workdir })),
+            (
+                "document_edit",
+                json!({ "edits": [{ "handle": target, "replace_with": to }] }),
+            ),
+        ]);
+        assert_eq!(
+            outcome(&replies[0]),
+            "success",
+            "{from:?} -> {to:?}: {:?}",
+            replies[0]
+        );
+        assert_eq!(
+            outcome(&replies[1]),
+            "success",
+            "{from:?} -> {to:?}: {:?}",
+            replies[1]
+        );
+        assert_islands_cover_distinct_leaves(wd).expect("one island per leaf");
+    }
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_status", json!({})),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(
+        data(&replies[1])["state"]["state"],
+        "clean",
+        "three composed edits left the draft dirty: {:?}",
+        data(&replies[1])
+    );
+    let out = dir.join("recomposed.docx");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let built = built_text(&out);
+    assert!(built.contains("中文区域内容"), "{built}");
+    assert!(!built.contains("中文区块区域内容"), "{built}");
+    assert!(!built.contains("中文区域内容A"), "{built}");
+    let islands = island_edits(wd).expect("islands.json");
+    assert!(
+        islands.is_empty(),
+        "the composed edits left islands behind: {islands:?}"
+    );
+
+    // c. A save between the edit and its revert: the second save must publish
+    // the reverted text, and reopening the produced file must read it back.
+    let (dir, workdir) = opened("revert-after-save");
+    let out = dir.join("resaved.docx");
+    let first = handle(&workdir, "中文区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": first, "replace_with": "中文区块区域内容" }] }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+
+    let back = handle(&workdir, "中文区块区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": back, "replace_with": "中文区域内容" }] }),
+        ),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+    let built = built_text(&out);
+    assert!(built.contains("中文区域内容"), "{built}");
+    assert!(!built.contains("中文区块区域内容"), "{built}");
+
+    // The produced file reopens as its own document, carrying the reverted text.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": out.to_string_lossy() })),
+        ("document_status", json!({})),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let replies = mcp(&[
+        ("document_open", json!({ "source": out.to_string_lossy() })),
+        ("document_find", json!({ "query": "中文区域内容" })),
+        ("document_find", json!({ "query": "中文区块区域内容" })),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+    assert_eq!(
+        data(&replies[1])["counts"]["occurrences"].as_u64(),
+        Some(1),
+        "the reopened document does not read the reverted text: {:?}",
+        data(&replies[1])
+    );
+    assert_eq!(
+        data(&replies[2])["counts"]["occurrences"].as_u64(),
+        Some(0),
+        "the reopened document still reads the reverted-away text: {:?}",
+        data(&replies[2])
+    );
+
+    // d. Two leaves edited, one reverted: the surviving leaf keeps its island
+    // and its text, the reverted one keeps neither.
+    let (dir, workdir) = opened("revert-one-of-two");
+    let wd = Path::new(&workdir);
+    let first = handle(&workdir, "中文区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": first, "replace_with": "中文区块区域内容" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let second = handle(&workdir, "EnglishRegion");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": second, "replace_with": "GAMMA" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+
+    let back = handle(&workdir, "中文区块区域内容");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": back, "replace_with": "中文区域内容" }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    assert_islands_cover_distinct_leaves(wd).expect("one island per leaf");
+    let islands = island_edits(wd).expect("islands.json");
+    assert_eq!(
+        islands.len(),
+        1,
+        "the revert took the wrong island with it: {islands:?}"
+    );
+    assert_eq!(
+        islands[0]["old"].as_str(),
+        Some("EnglishRegion"),
+        "the surviving island is not the surviving edit's span: {islands:?}"
+    );
+    assert_eq!(
+        islands[0]["new"].as_str(),
+        Some("GAMMA"),
+        "the island that survived is the reverted one, not the surviving edit: {islands:?}"
+    );
+    let out = dir.join("partial.docx");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let built = built_text(&out);
+    assert!(
+        built.contains("GAMMA"),
+        "the surviving edit did not reach the file: {built}"
+    );
+    assert!(built.contains("中文区域内容"), "{built}");
+    assert!(!built.contains("中文区块区域内容"), "{built}");
+
+    // e. Revert, then edit the same leaf again: the new edit records exactly one
+    // island, not one beside the revoked one.
+    let (dir, workdir) = opened("revert-reedit");
+    let wd = Path::new(&workdir);
+    for (from, to) in [
+        ("中文区域内容", "中文区块区域内容"),
+        ("中文区块区域内容", "中文区域内容"),
+        ("中文区域内容", "中文区域内容A"),
+    ] {
+        let target = handle(&workdir, from);
+        let replies = mcp(&[
+            ("document_open", json!({ "source": workdir })),
+            (
+                "document_edit",
+                json!({ "edits": [{ "handle": target, "replace_with": to }] }),
+            ),
+        ]);
+        assert_eq!(
+            outcome(&replies[0]),
+            "success",
+            "{from:?} -> {to:?}: {:?}",
+            replies[0]
+        );
+        assert_eq!(
+            outcome(&replies[1]),
+            "success",
+            "{from:?} -> {to:?}: {:?}",
+            replies[1]
+        );
+    }
+    assert_islands_cover_distinct_leaves(wd).expect("one island per leaf");
+    let islands = island_edits(wd).expect("islands.json");
+    assert_eq!(
+        islands.len(),
+        1,
+        "the re-edit recorded a second island for one leaf: {islands:?}"
+    );
+    assert_eq!(
+        islands[0]["old"].as_str(),
+        Some("中文区域内容"),
+        "the one island left does not span the re-edit: {islands:?}"
+    );
+    assert_eq!(
+        islands[0]["new"].as_str(),
+        Some("中文区域内容A"),
+        "the one island left is not the re-edit: {islands:?}"
+    );
+    let out = dir.join("reedited.docx");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        ("document_save", json!({ "output": out.to_string_lossy() })),
+    ]);
+    assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
+    assert_eq!(outcome(&replies[1]), "success", "{:?}", replies[1]);
+    let built = built_text(&out);
+    assert!(built.contains("中文区域内容A"), "{built}");
+    assert!(!built.contains("中文区块区域内容"), "{built}");
+}
+
+/// The `edits` array of `islands.json`. A workdir that has recorded nothing has
+/// no array — which reads as empty, not as missing.
+fn island_edits(workdir: &Path) -> Result<Vec<Value>, String> {
     let path = workdir.join("islands.json");
     if !path.is_file() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let islands = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let parsed: Value = serde_json::from_str(&islands).map_err(|error| error.to_string())?;
-    let edits = parsed["edits"]
+    parsed["edits"]
         .as_array()
-        .ok_or_else(|| format!("islands.json carries no edits array: {islands}"))?;
+        .cloned()
+        .ok_or_else(|| format!("islands.json carries no edits array: {islands}"))
+}
+
+/// One island per leaf, across every call the sequence made. A workdir that has
+/// recorded nothing yet satisfies it trivially.
+fn assert_islands_cover_distinct_leaves(workdir: &Path) -> Result<(), String> {
+    let edits = island_edits(workdir)?;
     let mut leaves: Vec<(String, u64)> = edits
         .iter()
         .map(|edit| {
@@ -2246,6 +2627,8 @@ fn assert_islands_cover_distinct_leaves(workdir: &Path) -> Result<(), String> {
     let mut unique = leaves.clone();
     unique.dedup();
     if unique.len() != leaves.len() {
+        let islands = std::fs::read_to_string(workdir.join("islands.json"))
+            .unwrap_or_else(|_| "<unreadable>".to_string());
         return Err(format!(
             "two islands address one leaf, which the build cannot splice: {islands}"
         ));

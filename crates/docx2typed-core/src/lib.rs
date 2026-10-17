@@ -523,6 +523,11 @@ fn stale_baseline_assets(outdir: &Path) -> Vec<Asset> {
     [
         crate::prose::ISLANDS_FILE,
         crate::prose::STRUCTURE_FILE,
+        // The frozen editable baseline the diff and the unrecorded-edit check
+        // compare against: it was rendered from the OLD template, so leaving
+        // it behind makes every paragraph of the incoming document read as an
+        // unrecorded user edit.
+        "baseline.view",
         // The format engine's plan and requests are expressed against the old
         // template too, so a baseline replacement clears them with the rest.
         "format_plan.json",
