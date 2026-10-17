@@ -2242,15 +2242,30 @@ impl McpSession {
                 style_id.as_deref(),
             )
             .map_err(coded)?;
-            let total =
-                docx2typed_core::prose::record_format_span(target, edit.clone()).map_err(coded)?;
+            // The request goes to the format engine, which plans it; this tool
+            // records the intent and reports the plan's shape. It does not write
+            // a replay record — that path is gone (ADR 0050).
+            let (plan, _snapshot, requests) =
+                docx2typed_review::format_lane::record_format_request(
+                    target,
+                    docx2typed_review::format_lane::FormatRequest {
+                        paragraph_id: edit.paragraph_id.clone(),
+                        start: edit.text_start,
+                        end: edit.text_end,
+                        style_id: edit.style_id.clone(),
+                    },
+                )
+                .map_err(|error| MutationError::new(error.code, error.detail))?;
+            let paragraph = plan.paragraph(&edit.paragraph_id);
             Ok(json!({
                 "paragraph_id": edit.paragraph_id,
                 "text_start": edit.text_start,
                 "text_end": edit.text_end,
                 "style_id": edit.style_id,
                 "attributes": edit.attributes,
-                "recorded_edits": total,
+                "recorded_edits": requests.len(),
+                "segments": paragraph.map(|plan| plan.segments.len()),
+                "runs": paragraph.map(|plan| plan.runs.len()),
             }))
         })
     }

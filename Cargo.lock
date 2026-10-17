@@ -136,6 +136,7 @@ version = "0.2.1"
 dependencies = [
  "docx2typed-core",
  "docx2typed-protocol",
+ "docx2typed-review",
  "docx2typed-store",
  "docx2typed-verify",
  "serde_json",

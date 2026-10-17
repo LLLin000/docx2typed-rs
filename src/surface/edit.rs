@@ -254,79 +254,35 @@ pub(crate) fn apply_and_sync(
                                 _ => MutationError::new("invalid-edit", message),
                             }
                         })?;
-                let part = docx2typed_core::prose::part_for_paragraph_id(&resolved.paragraph_id)
-                    .ok_or_else(|| {
-                        MutationError::new(
-                            "invalid-edit",
-                            format!("unknown paragraph id: {}", resolved.paragraph_id),
-                        )
-                    })?;
-                // The style has to be one the document carries. The build refuses
-                // a style it does not hold (`format-style-unavailable`), and a
-                // caller should not have to build a document to be told that —
-                // so the registry is read here and the refusal lists what is
-                // available.
-                let available = docx2typed_core::prose::load_style_rprs_for(target)
-                    .map_err(|error| MutationError::new("workdir-invalid", error.to_string()))?;
-                if !available.contains_key(&request.style_id) {
-                    let mut listed: Vec<String> = available.keys().cloned().collect();
-                    listed.sort();
-                    return Err(MutationError::new(
-                        "format-style-unavailable",
-                        format!(
-                            "{} is not a style this document carries; it holds [{}]. A format \
-                             edit switches between the properties the document already has — it \
-                             never invents a style. document_find reports the style ids of the \
-                             runs a span covers",
-                            request.style_id,
-                            listed.join(", ")
-                        ),
-                    ));
-                }
-                // Two restyles over one run fight: the run has one `w:rPr`, so
-                // the later record would overwrite the earlier one and the
-                // earlier would read as not applied. Measured: two overlapping
-                // spans on one chemical formula made the save fail
-                // `restyles-applied` for the first of them.
-                let existing = docx2typed_core::prose::load_rpr_edits(target)
-                    .map_err(|error| MutationError::new("workdir-invalid", error.to_string()))?;
-                if let Some(clash) = existing.iter().find(|recorded| {
-                    recorded.part == part
-                        && recorded.paragraph_id == resolved.paragraph_id
-                        && recorded.text_start < resolved.start + resolved.text.chars().count()
-                        && resolved.start < recorded.text_end
-                }) {
-                    return Err(MutationError::new(
-                        "format-spans-overlap",
-                        format!(
-                            "this span [{}, {}) overlaps a restyle already recorded at [{}, {}) in \
-                             {}; a run has one set of character properties, so the later record \
-                             would overwrite the earlier one. Make it one span, or two that do \
-                             not overlap",
-                            resolved.start,
-                            resolved.start + resolved.text.chars().count(),
-                            clash.text_start,
-                            clash.text_end,
-                            resolved.paragraph_id
-                        ),
-                    ));
-                }
-                let span = docx2typed_core::prose::RprEdit {
-                    part,
-                    paragraph_id: resolved.paragraph_id.clone(),
-                    text_start: resolved.start,
-                    text_end: resolved.start + resolved.text.chars().count(),
-                    attributes: json!({ "style_id": request.style_id }),
-                    style_id: request.style_id.clone(),
-                };
-                let recorded = docx2typed_core::prose::record_format_span(target, span)
-                    .map_err(|error| MutationError::new("invalid-edit", error.to_string()))?;
+                // The surface decides nothing about formatting here. It resolves
+                // the handle to a character range and hands the request to the
+                // engine, which validates the style, settles overlaps and derives
+                // the run structure. A second opinion here is the second authority
+                // the split exists to remove.
+                let length = resolved.text.chars().count();
+                let (plan, _snapshot, _requests) =
+                    docx2typed_review::format_lane::record_format_request(
+                        target,
+                        docx2typed_review::format_lane::FormatRequest {
+                            paragraph_id: resolved.paragraph_id.clone(),
+                            start: resolved.start,
+                            end: resolved.start + length,
+                            style_id: request.style_id.clone(),
+                        },
+                    )
+                    .map_err(|error| MutationError::new(error.code, error.detail))?;
+                let paragraph_plan = plan.paragraph(&resolved.paragraph_id);
                 restyles.push(json!({
                     "kind": "format",
                     "paragraph_id": resolved.paragraph_id,
-                    "text_start": resolved.start,
+                    "range": {
+                        "start": resolved.start,
+                        "end": resolved.start + length,
+                        "unit": "unicode-scalars",
+                    },
                     "style_id": request.style_id,
-                    "recorded": recorded,
+                    "segments": paragraph_plan.map(|plan| plan.segments.len()),
+                    "runs": paragraph_plan.map(|plan| plan.runs.len()),
                 }));
             }
             Edit::InsertAfter {

@@ -104,10 +104,10 @@ impl IndependentVerifier {
         // Format edits are a third mutation the output may implement. Read here
         // too, or a restyled document fails verification for a change it was
         // told to make.
-        let restyles = load_recorded_restyles(&request.workdir);
+        let planned = load_planned_runs(&request.workdir);
         let styles = load_style_rpr_bytes(&request.workdir);
 
-        if islands.is_empty() && structure.is_empty() && restyles.is_empty() {
+        if islands.is_empty() && structure.is_empty() && planned.is_empty() {
             self.verify_noop(
                 &template,
                 &output_parts,
@@ -122,7 +122,7 @@ impl IndependentVerifier {
                 &output_parts,
                 &islands,
                 &structure,
-                &restyles,
+                &planned,
                 &styles,
                 &mut checks,
                 &template_sha256,
@@ -189,7 +189,7 @@ impl IndependentVerifier {
         output_parts: &BTreeMap<String, String>,
         islands: &[IslandEdit],
         structure: &StructureEdits,
-        restyles: &[RecordedRestyle],
+        planned: &[PlannedRunCheck],
         styles: &BTreeMap<String, String>,
         checks: &mut Vec<VerificationCheck>,
         template_sha256: &str,
@@ -203,8 +203,9 @@ impl IndependentVerifier {
         for edit in islands {
             edited_part_paths.insert(part_path(&edit.part));
         }
-        for edit in restyles {
-            edited_part_paths.insert(part_path(&edit.part));
+        if !planned.is_empty() {
+            // A plan's runs live in the document part.
+            edited_part_paths.insert(part_path("document"));
         }
         if !structure.is_empty() {
             edited_part_paths.insert(part_path("document"));
@@ -281,29 +282,32 @@ impl IndependentVerifier {
                                 }
                             }
                         }
-                        // A part that carries restyles is compared modulo the
-                        // runs those restyles name: their rPr is the one thing
-                        // this recompute does not derive, and it is checked on
-                        // its own below.
-                        let part_restyles: Vec<&RecordedRestyle> = restyles
-                            .iter()
-                            .filter(|edit| verify_part_path(&edit.part) == this_part)
-                            .collect();
-                        let (expected_cmp, output_cmp) = if part_restyles.is_empty() {
+                        // A part a plan touches is compared modulo the runs that
+                        // plan names: the plan decides their structure and their
+                        // properties, and `format-plan-applied` checks those
+                        // against the output on its own. What this comparison
+                        // keeps proving is that nothing ELSE moved.
+                        let part_planned: Vec<&PlannedRunCheck> =
+                            if this_part == verify_part_path("document") {
+                                planned.iter().collect()
+                            } else {
+                                Vec::new()
+                            };
+                        let (expected_cmp, output_cmp) = if part_planned.is_empty() {
                             (expected.clone(), output_part.clone())
                         } else {
                             let mask = RESTYLE_MASK.as_bytes();
                             match (
-                                mask_restyled_runs(
+                                mask_planned_runs(
                                     &expected,
                                     part_key.as_str(),
-                                    &part_restyles,
+                                    &part_planned,
                                     mask,
                                 ),
-                                mask_restyled_runs(
+                                mask_planned_runs(
                                     &output_part,
                                     part_key.as_str(),
-                                    &part_restyles,
+                                    &part_planned,
                                     mask,
                                 ),
                             ) {
@@ -342,24 +346,33 @@ impl IndependentVerifier {
             }),
         });
 
-        // Check 3b: every recorded restyle is what the output does — the runs
-        // covering the span carry exactly the named style's properties.
+        // Check 3b: the plan, checked against the output — contract conformance
+        // only. The plan's rules are not re-derived here (ADR 0050); what is
+        // checked is that the artifact is what the approved plan describes, and
+        // that a run the plan does not restyle kept the properties of the run it
+        // came from.
         let mut restyle_detail = String::new();
         let mut restyle_ok = true;
-        for edit in restyles {
-            let path = verify_part_path(&edit.part);
+        for edit in planned {
+            let path = verify_part_path("document");
             let Some(part_key) = part_key_from_path(&path) else {
                 restyle_ok = false;
                 restyle_detail = format!("unknown part {path}");
                 break;
             };
-            let Some(style_rpr) = styles.get(&edit.style_id) else {
-                restyle_ok = false;
-                restyle_detail = format!(
-                    "{} names {} which styles.json does not hold",
-                    path, edit.style_id
-                );
-                break;
+            let expected_rpr = match &edit.style {
+                Some(style_id) => match styles.get(style_id) {
+                    Some(rpr) => rpr.clone(),
+                    None => {
+                        restyle_ok = false;
+                        restyle_detail = format!(
+                            "{} names {} which styles.json does not hold",
+                            path, style_id
+                        );
+                        break;
+                    }
+                },
+                None => String::new(),
             };
             let template_package = std::fs::read(template).unwrap_or_default();
             let output_package = std::fs::read(output).unwrap_or_default();
@@ -387,19 +400,23 @@ impl IndependentVerifier {
                     break;
                 }
             };
-            if let Err(message) =
-                verify_restyle(&baseline, &output_part, part_key.as_str(), edit, style_rpr)
-            {
+            if let Err(message) = verify_planned_run(
+                &baseline,
+                &output_part,
+                part_key.as_str(),
+                edit,
+                &expected_rpr,
+            ) {
                 restyle_ok = false;
                 restyle_detail = format!("part {path}: {message}");
                 break;
             }
         }
         checks.push(VerificationCheck {
-            name: "restyles-applied".to_string(),
+            name: "format-plan-applied".to_string(),
             status: if restyle_ok { "pass" } else { "fail" }.to_string(),
             detail: Some(if restyle_detail.is_empty() {
-                format!("{} restyle(s) matched their style", restyles.len())
+                format!("{} planned run(s) matched the plan", planned.len())
             } else {
                 restyle_detail
             }),
@@ -468,12 +485,12 @@ impl IndependentVerifier {
                 // of the edit, so a check that compares "everything outside the
                 // edit" has to know where the edit is. Measured: without this the
                 // verifier refused its own restyle as `non-target-preserved`.
-                for edit in restyles
-                    .iter()
-                    .filter(|edit| verify_part_path(&edit.part) == this_part)
-                {
-                    if let Ok(ranges) = restyled_run_ranges(&template_part, &part_key, edit) {
-                        collected.extend(ranges.into_iter().map(|(start, end, _)| (start, end)));
+                if this_part == verify_part_path("document") {
+                    for edit in planned {
+                        if let Ok(ranges) = planned_run_ranges(&template_part, &part_key, edit) {
+                            collected
+                                .extend(ranges.into_iter().map(|(start, end, _)| (start, end)));
+                        }
                     }
                 }
                 collected
@@ -2047,47 +2064,61 @@ fn verify_part_path(part_key: &str) -> String {
     }
 }
 
-/// One restyle the workdir recorded (`rpr_edits.json`), read independently of
-/// Core the same way islands and structure are.
+/// One run a plan says the output must carry: the characters it holds, and the
+/// properties it must have (a style the registry holds, or `None` for "the run
+/// it came from").
 #[derive(Clone, Debug)]
-struct RecordedRestyle {
-    part: String,
+struct PlannedRunCheck {
     paragraph_id: String,
-    text_start: usize,
-    text_end: usize,
-    style_id: String,
+    start: usize,
+    end: usize,
+    style: Option<String>,
 }
 
-fn load_recorded_restyles(workdir: &Path) -> Vec<RecordedRestyle> {
-    let path = workdir.join("rpr_edits.json");
-    if !path.is_file() {
-        return Vec::new();
-    }
+/// The format engine's plan, read independently of Core the same way islands and
+/// structure are. The verifier CHECKS the plan against the artifact; it does not
+/// re-derive the plan's rules (ADR 0050).
+fn load_planned_runs(workdir: &Path) -> Vec<PlannedRunCheck> {
+    let path = workdir.join("format_plan.json");
     let Ok(bytes) = std::fs::read(&path) else {
         return Vec::new();
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Vec::new();
     };
-    value
-        .get("edits")
-        .and_then(|edits| edits.as_array())
-        .map(|edits| {
-            edits
-                .iter()
-                .filter_map(|edit| {
-                    let text = |name: &str| edit.get(name).and_then(|value| value.as_str());
-                    Some(RecordedRestyle {
-                        part: text("part")?.to_string(),
-                        paragraph_id: text("paragraph_id")?.to_string(),
-                        text_start: edit.get("text_start")?.as_u64()? as usize,
-                        text_end: edit.get("text_end")?.as_u64()? as usize,
-                        style_id: text("style_id")?.to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut out = Vec::new();
+    let Some(paragraphs) = value.get("paragraphs").and_then(|rows| rows.as_array()) else {
+        return out;
+    };
+    for paragraph in paragraphs {
+        let Some(paragraph_id) = paragraph.get("paragraph_id").and_then(|id| id.as_str()) else {
+            continue;
+        };
+        let Some(runs) = paragraph.get("runs").and_then(|rows| rows.as_array()) else {
+            continue;
+        };
+        for run in runs {
+            let range = run.get("range");
+            let start = range
+                .and_then(|range| range.get("start"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize;
+            let end = range
+                .and_then(|range| range.get("end"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize;
+            out.push(PlannedRunCheck {
+                paragraph_id: paragraph_id.to_string(),
+                start,
+                end,
+                style: run
+                    .get("style")
+                    .and_then(|style| style.as_str())
+                    .map(str::to_string),
+            });
+        }
+    }
+    out
 }
 
 /// `style_id -> w:rPr` from `styles.json`, the registry the build splices from.
@@ -2148,10 +2179,10 @@ fn run_rpr_range(part: &[u8], text_start: usize) -> Option<(usize, usize, usize)
 
 /// The runs a restyle names, located by the paragraph's visible-text offsets —
 /// this crate's own walker, not Core's.
-fn restyled_run_ranges(
+fn planned_run_ranges(
     part: &[u8],
     part_key: &str,
-    edit: &RecordedRestyle,
+    edit: &PlannedRunCheck,
 ) -> Result<Vec<(usize, usize, usize)>, String> {
     let leaves = locate_paragraph_leaves(part, part_key, &edit.paragraph_id)?;
     let mut cursor = 0usize;
@@ -2165,7 +2196,7 @@ fn restyled_run_ranges(
             .count();
         let (start, end) = (cursor, cursor + length);
         cursor = end;
-        if start < edit.text_end && end > edit.text_start {
+        if start < edit.end && end > edit.start {
             let Some(range) = run_rpr_range(part, leaf.text_start) else {
                 return Err(format!(
                     "{}: run for offset {} not found",
@@ -2178,7 +2209,7 @@ fn restyled_run_ranges(
     if ranges.is_empty() {
         return Err(format!(
             "{}: no run covers [{}, {})",
-            edit.paragraph_id, edit.text_start, edit.text_end
+            edit.paragraph_id, edit.start, edit.end
         ));
     }
     Ok(ranges)
@@ -2186,15 +2217,15 @@ fn restyled_run_ranges(
 
 /// Replace every named run's `w:rPr` with `mask`, so two parts can be compared
 /// with the restyled properties set aside. Insertion where a run has none.
-fn mask_restyled_runs(
+fn mask_planned_runs(
     part: &[u8],
     part_key: &str,
-    edits: &[&RecordedRestyle],
+    edits: &[&PlannedRunCheck],
     mask: &[u8],
 ) -> Result<Vec<u8>, String> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for edit in edits {
-        for (start, end, _) in restyled_run_ranges(part, part_key, edit)? {
+        for (start, end, _) in planned_run_ranges(part, part_key, edit)? {
             ranges.push((start, end));
         }
     }
@@ -2207,35 +2238,54 @@ fn mask_restyled_runs(
     Ok(out)
 }
 
-/// The output's named runs carry exactly the style's properties, and the rest of
-/// the paragraph is where the restyle says it is.
-fn verify_restyle(
-    template_part: &[u8],
+/// One planned run, checked against the output: it exists, it holds exactly the
+/// characters the plan gives it, and it carries the properties the plan says —
+/// the style's bytes when the plan names one, and otherwise the properties of the
+/// run it came from, which is the baseline's.
+fn verify_planned_run(
+    baseline_part: &[u8],
     output_part: &[u8],
     part_key: &str,
-    edit: &RecordedRestyle,
+    edit: &PlannedRunCheck,
     style_rpr: &str,
 ) -> Result<(), String> {
-    let expected_ranges = restyled_run_ranges(template_part, part_key, edit)?;
-    let output_ranges = restyled_run_ranges(output_part, part_key, edit)?;
-    if expected_ranges.len() != output_ranges.len() {
+    let output_ranges = planned_run_ranges(output_part, part_key, edit)?;
+    if output_ranges.len() != 1 {
         return Err(format!(
-            "{}: the output has {} run(s) where the restyle names {}",
+            "{}: the output has {} run(s) where the plan names one for [{}, {})",
             edit.paragraph_id,
             output_ranges.len(),
-            expected_ranges.len()
+            edit.start,
+            edit.end
         ));
     }
-    for (index, ((_, _, _), (start, end, _))) in
-        expected_ranges.iter().zip(output_ranges.iter()).enumerate()
-    {
-        let actual = String::from_utf8_lossy(&output_part[*start..*end]);
-        if actual != style_rpr {
-            return Err(format!(
-                "{}: run {} carries {:?}, not the style's {:?}",
-                edit.paragraph_id, index, actual, style_rpr
-            ));
+    let (start, end, _) = output_ranges[0];
+    let actual = String::from_utf8_lossy(&output_part[start..end]).to_string();
+    let expected = match &edit.style {
+        Some(_) => style_rpr.to_string(),
+        // Untouched: the properties must be the ones the run had. The baseline is
+        // the template with the text islands applied — what the plan was derived
+        // from — so a run the plan leaves alone must read identically there.
+        None => {
+            let baseline_ranges = planned_run_ranges(baseline_part, part_key, edit)?;
+            if baseline_ranges.len() != 1 {
+                return Err(format!(
+                    "{}: the baseline has {} run(s) where the plan names one for [{}, {})",
+                    edit.paragraph_id,
+                    baseline_ranges.len(),
+                    edit.start,
+                    edit.end
+                ));
+            }
+            let (start, end, _) = baseline_ranges[0];
+            String::from_utf8_lossy(&baseline_part[start..end]).to_string()
         }
+    };
+    if actual != expected {
+        return Err(format!(
+            "{}: the run holding [{}, {}) carries {:?}, not {:?}",
+            edit.paragraph_id, edit.start, edit.end, actual, expected
+        ));
     }
     Ok(())
 }

@@ -4023,8 +4023,6 @@ pub fn apply_build(
     template: &Path,
     islands: &[IslandEdit],
     structure: &StructureEdits,
-    rpr_edits: &[RprEdit],
-    styles: &BTreeMap<String, String>,
 ) -> Result<BuildOutput, CoreError> {
     let package = apply_edits(template, islands)?;
     // Structural synthesis first: it decides which paragraphs exist, and a
@@ -4041,12 +4039,13 @@ pub fn apply_build(
             ids,
         )
     };
-    // A restyle whose paragraph a structure edit removed is reported, never
-    // dropped silently and never resurrected (#26's class).
-    let (package, stale_restyles) = apply_rpr_edits(&package, rpr_edits, styles)?;
+    // Formatting is not this function's business: the format engine's plan is
+    // applied by the caller, after the paragraph set is settled (ADR 0050). The
+    // old replay lane's helpers still exist below, uncalled by anything — the
+    // deletion of that code is a separate cleanup, not a cutover.
     Ok(BuildOutput {
         package,
-        stale_restyles,
+        stale_restyles: Vec::new(),
         document_ids,
     })
 }
@@ -5150,8 +5149,8 @@ mod tests {
             insert_before: Some("P2".to_string()),
             format_policy: FormatPolicy::SafeInherit,
         });
-        let build = apply_build(&template, &[], &structure, &[], &BTreeMap::new())
-            .expect("build with one inserted paragraph");
+        let build =
+            apply_build(&template, &[], &structure).expect("build with one inserted paragraph");
         assert_eq!(
             build.document_ids,
             vec![
@@ -5244,8 +5243,7 @@ mod tests {
             }],
         };
         validate_structure(&template, &edits).expect("valid structure edits");
-        let build =
-            apply_build(&template, &[], &edits, &[], &BTreeMap::new()).expect("apply structure");
+        let build = apply_build(&template, &[], &edits).expect("apply structure");
         let (bytes, stale) = (build.package, build.stale_restyles);
         assert!(stale.is_empty(), "no restyles were recorded: {stale:?}");
         let package = std::io::Cursor::new(bytes);

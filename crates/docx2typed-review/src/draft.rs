@@ -4171,13 +4171,24 @@ pub fn apply_projection_with_options(
     // disagree is a refusal, because that projection would be a lie about the
     // file.
     let current_markup: std::collections::BTreeMap<String, String> =
-        match docx2typed_core::prose::apply_build(
-            &workdir.join("_template.docx"),
-            &islands,
-            &structure,
-            &docx2typed_core::prose::load_rpr_edits(workdir).unwrap_or_default(),
-            &docx2typed_core::prose::load_style_rprs_for(workdir).unwrap_or_default(),
-        ) {
+        // The text lanes only: the format engine's plan is applied to the
+        // resulting package, so the projection shows what the build will produce
+        // without this function knowing a single formatting rule.
+        match docx2typed_core::prose::apply_build(&workdir.join("_template.docx"), &islands, &structure)
+            .and_then(|build| match crate::format_lane::load_format_plan(workdir) {
+                Ok(Some(plan)) => {
+                    let snapshot = crate::format_lane::snapshot_for_plan(workdir, &plan)
+                        .map_err(|error| docx2typed_core::CoreError::Domain(error.detail))?;
+                    let package = crate::format_lane::apply_format_plan(&build.package, &plan, &snapshot)
+                        .map_err(|error| docx2typed_core::CoreError::Domain(error.detail))?;
+                    Ok(docx2typed_core::prose::BuildOutput {
+                        package,
+                        ..build
+                    })
+                }
+                _ => Ok(build),
+            })
+        {
             Ok(build) if build.document_ids.is_empty() => {
                 docx2typed_core::prose::paragraph_markup_map(&build.package).unwrap_or_default()
             }

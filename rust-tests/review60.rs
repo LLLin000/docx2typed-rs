@@ -1634,13 +1634,28 @@ fn format_span_restyles_a_span_and_the_build_applies_it() {
         results[2]
     );
 
-    // The record is on disk and the built document carries the properties.
-    let record: Value = serde_json::from_str(
-        &fs::read_to_string(workdir.join("rpr_edits.json")).expect("rpr_edits.json"),
+    // The request and the plan it derives are on disk — the format engine's two
+    // sidecars, not the retired replay record — and the built document carries
+    // the properties the plan names.
+    let requests: Value = serde_json::from_str(
+        &fs::read_to_string(workdir.join("format_intents.json")).expect("format_intents.json"),
     )
-    .expect("record json");
-    assert_eq!(record["edits"][0]["paragraph_id"], "P0");
-    assert_eq!(record["edits"][0]["style_id"], target);
+    .expect("requests json");
+    assert_eq!(requests["requests"][0]["paragraph_id"], "P0");
+    assert_eq!(requests["requests"][0]["style_id"], target);
+    let plan: Value = serde_json::from_str(
+        &fs::read_to_string(workdir.join("format_plan.json")).expect("format_plan.json"),
+    )
+    .expect("plan json");
+    assert_eq!(plan["unit"], "unicode-scalars");
+    assert!(
+        plan["paragraphs"][0]["runs"]
+            .as_array()
+            .expect("runs")
+            .iter()
+            .any(|run| run["style"] == target),
+        "the plan names the style for a run: {plan}"
+    );
 
     let bytes = fs::read(workdir.join("out.docx")).expect("built docx");
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");

@@ -77,6 +77,10 @@ pub fn plan_format(
     workdir: &Path,
     requests: &[FormatRequest],
 ) -> Result<(FormatPlan, Snapshot), CollaborationError> {
+    // A plan's coordinates are the DRAFT's, so the draft has to exist before one
+    // can be derived — a workdir straight out of `extract` has none, and asking
+    // for a revision token there used to be a refusal rather than a projection.
+    crate::draft::ensure_projection(workdir)?;
     let snapshot = snapshot_for(workdir, requests)?;
     let intents: Vec<FormatIntent> = requests
         .iter()
@@ -89,6 +93,68 @@ pub fn plan_format(
     let plan = plan(&snapshot, &intents)
         .map_err(|error| CollaborationError::new(error.code, error.detail))?;
     Ok((plan, snapshot))
+}
+
+/// Record one request: dedupe it against the workdir's set, re-derive the plan
+/// from the whole set, and persist both.
+///
+/// The surface calls this and reads the plan's structure back for its reply. It
+/// makes no format decision of its own — no style check, no overlap rule, no run
+/// arithmetic: those live in the engine, and a caller that re-implemented one of
+/// them would be the second authority the split exists to remove.
+pub fn record_format_request(
+    workdir: &Path,
+    request: FormatRequest,
+) -> Result<(FormatPlan, Snapshot, Vec<FormatRequest>), CollaborationError> {
+    let mut requests = load_format_requests(workdir)?;
+    if !requests.contains(&request) {
+        requests.push(request);
+    }
+    let (plan, snapshot) = plan_format(workdir, &requests)?;
+    save_format_requests(workdir, &requests)?;
+    save_format_plan(workdir, &plan)?;
+    Ok((plan, snapshot, requests))
+}
+
+/// The snapshot a plan was derived from, rebuilt from the workdir and checked
+/// against the plan's digest. A plan made against another document is refusable
+/// rather than silently applied.
+pub fn snapshot_for_plan(
+    workdir: &Path,
+    plan: &FormatPlan,
+) -> Result<Snapshot, CollaborationError> {
+    let paragraph_ids: Vec<String> = plan
+        .paragraphs
+        .iter()
+        .map(|paragraph| paragraph.paragraph_id.clone())
+        .collect();
+    let requests: Vec<FormatRequest> = paragraph_ids
+        .iter()
+        .map(|paragraph_id| FormatRequest {
+            paragraph_id: paragraph_id.clone(),
+            start: 0,
+            end: 1,
+            style_id: plan
+                .paragraphs
+                .iter()
+                .find(|paragraph| &paragraph.paragraph_id == paragraph_id)
+                .and_then(|paragraph| paragraph.segments.first())
+                .map(|segment| segment.style_id.clone())
+                .unwrap_or_default(),
+        })
+        .collect();
+    let snapshot = snapshot_for(workdir, &requests)?;
+    if snapshot.base_digest != plan.base_digest {
+        return Err(CollaborationError::new(
+            "format-plan-stale",
+            format!(
+                "this plan was derived from {} and the workdir now holds {}; re-plan before \
+                 building",
+                plan.base_digest, snapshot.base_digest
+            ),
+        ));
+    }
+    Ok(snapshot)
 }
 
 /// Persist the requests and the plan they derive.
@@ -148,16 +214,8 @@ pub fn draft_package(workdir: &Path) -> Result<Vec<u8>, CollaborationError> {
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let structure = prose::load_structure(workdir)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    let styles = prose::load_style_rprs_for(workdir)
+    let built = prose::apply_build(&workdir.join("_template.docx"), &islands, &structure)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    let built = prose::apply_build(
-        &workdir.join("_template.docx"),
-        &islands,
-        &structure,
-        &[],
-        &styles,
-    )
-    .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     Ok(built.package)
 }
 
