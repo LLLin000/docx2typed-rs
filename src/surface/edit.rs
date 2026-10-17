@@ -154,7 +154,14 @@ pub(crate) struct FormatRequest {
     /// Either a style id the caller named, or empty with `attributes` set.
     pub(crate) style_id: String,
     pub(crate) attributes: Option<Value>,
+    /// True when a selector expanded this entry: a target that already holds the
+    /// requested properties is then satisfied rather than a refusal.
+    pub(crate) from_selector: bool,
 }
+
+/// The marker the selector expansion leaves on an entry. Not part of the schema:
+/// it never leaves this module.
+const FROM_SELECTOR: &str = "__from_selector";
 
 /// One edit, in the shape its kind requires.
 ///
@@ -226,6 +233,12 @@ fn edits_from(
                     if let Some(object) = concrete.as_object_mut() {
                         object.remove("selector");
                         object.insert("handle".to_string(), json!(handle));
+                        // Marked, because a whole-set request means "make all of
+                        // these so": a target that already IS so is satisfied, not
+                        // a conflict. An explicit single edit keeps the stricter
+                        // reading — asking for one thing that is already true is
+                        // worth a refusal.
+                        object.insert(FROM_SELECTOR.to_string(), json!(true));
                     }
                     expanded.push(concrete);
                 }
@@ -328,11 +341,19 @@ fn edits_from(
                         handle: handle.to_string(),
                         style_id: style_id.to_string(),
                         attributes: None,
+                        from_selector: edit
+                            .get(FROM_SELECTOR)
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                     })),
                     (None, Some(attributes)) => parsed.push(Edit::Format(FormatRequest {
                         handle: handle.to_string(),
                         style_id: String::new(),
                         attributes: Some(Value::Object(attributes.clone())),
+                        from_selector: edit
+                            .get(FROM_SELECTOR)
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                     })),
                     (None, None) => {
                         return Err(session.failure(
@@ -385,6 +406,7 @@ pub(crate) fn apply_and_sync(
     let mut requests: Vec<EditRequest> = Vec::new();
     let mut structural: Vec<Value> = Vec::new();
     let mut restyles: Vec<Value> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
     for edit in edits {
         match edit {
             Edit::Replace(request) => requests.push(request.clone()),
@@ -434,6 +456,30 @@ pub(crate) fn apply_and_sync(
                     }
                     _ => request.style_id.clone(),
                 };
+                // "Make every X bold" is satisfied by the ones that already are.
+                // Refusing the batch over them made the ordinary case impossible:
+                // one blind run could not bold twelve phrases because the first was
+                // bold in the source. Reported, not silent — the reply names what
+                // was skipped and why.
+                if request.from_selector
+                    && docx2typed_review::format_lane::already_holds(
+                        target,
+                        &resolved.paragraph_id,
+                        start,
+                        end,
+                        &style_id,
+                    )
+                    .map_err(|error| MutationError::new(error.code, error.detail))?
+                {
+                    skipped.push(json!({
+                        "kind": "format",
+                        "paragraph_id": resolved.paragraph_id,
+                        "range": { "start": start, "end": end, "unit": "unicode-scalars" },
+                        "style_id": style_id,
+                        "reason": "already holds these properties",
+                    }));
+                    continue;
+                }
                 let (plan, _snapshot, _requests) =
                     docx2typed_review::format_lane::record_format_request(
                         target,
@@ -504,6 +550,7 @@ pub(crate) fn apply_and_sync(
             "edit": edited,
             "structural": structural,
             "restyles": restyles,
+            "skipped": skipped,
             "synced": Value::Null,
         }));
     }
@@ -526,6 +573,7 @@ pub(crate) fn apply_and_sync(
             "edit": edited,
             "structural": structural,
             "restyles": restyles,
+            "skipped": skipped,
             "synced": {
                 "changed_paragraph_ids": [],
                 "state": "clean",
@@ -555,6 +603,7 @@ pub(crate) fn apply_and_sync(
         "edit": edited,
         "structural": structural,
         "restyles": restyles,
+        "skipped": skipped,
         "synced": {
             "changed_paragraph_ids": changed,
             "state": "clean",
@@ -816,6 +865,8 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
             "edit": data.get("edit").cloned().unwrap_or(Value::Null),
             "structural": data.get("structural").cloned().unwrap_or(Value::Null),
             "restyles": data.get("restyles").cloned().unwrap_or(Value::Null),
+            // A whole-set request reports what it did not need to do.
+            "skipped": data.get("skipped").cloned().unwrap_or(Value::Null),
             "synced": data.get("synced").cloned().unwrap_or(Value::Null),
         })),
         build_commit,

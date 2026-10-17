@@ -48,6 +48,65 @@ pub struct FormatRequest {
     pub attributes: Option<serde_json::Value>,
 }
 
+/// True when every run the span covers already carries the style's properties.
+///
+/// A whole-set request ("make all of these bold") is satisfied by the ones that
+/// already are. Refusing the batch over them made the ordinary case impossible:
+/// one blind run could not bold twelve phrases because the first was bold in the
+/// source, and the refusal named the attributes rather than the occurrence.
+pub fn already_holds(
+    workdir: &Path,
+    paragraph_id: &str,
+    start: usize,
+    end: usize,
+    style_id: &str,
+) -> Result<bool, CollaborationError> {
+    let styles = prose::load_style_rprs_for(workdir)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let Some(style_rpr) = styles.get(style_id) else {
+        return Err(CollaborationError::new(
+            "format-style-unavailable",
+            format!("{style_id} is not a style this document carries"),
+        ));
+    };
+    let package = draft_package(workdir)?;
+    let inventory = prose::enumerate_package_bytes(&package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let leaves: Vec<&ProseLeaf> = inventory
+        .leaves
+        .iter()
+        .filter(|leaf| leaf.paragraph_id == paragraph_id)
+        .collect();
+    let mut cursor = 0usize;
+    let mut covered = 0usize;
+    for leaf in leaves {
+        if leaf.text_start == leaf.text_end {
+            continue;
+        }
+        let length = leaf.text.chars().count();
+        let (leaf_start, leaf_end) = (cursor, cursor + length);
+        cursor = leaf_end;
+        if leaf_start < end && leaf_end > start {
+            covered += 1;
+            // Canonical, not textual: the registry's rPr and a run's raw rPr are
+            // the same formatting spelled differently (attribute order,
+            // self-closing tags), and comparing the strings reported every
+            // already-styled run as needing the edit.
+            let same = match (
+                prose::canonical_rpr_json(&leaf.rpr),
+                prose::canonical_rpr_json(style_rpr),
+            ) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => false,
+            };
+            if !same {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(covered > 0)
+}
+
 /// The style a set of requested properties resolves to for a span, against the
 /// styles the document already carries.
 ///
@@ -459,33 +518,62 @@ pub fn paragraph_ranges(
 ) -> Result<ParagraphRanges, CollaborationError> {
     let inventory = prose::enumerate_package_bytes(package)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    let part = prose::part_path("document");
-    let mut ordered: Vec<&str> = Vec::new();
-    for entry in &inventory.paragraphs {
-        if entry.part_key == "document" {
-            ordered.push(entry.paragraph_id.as_str());
-        }
-    }
-    let ranges = paragraph_element_ranges(package, &part);
+    let part = member_bytes(package, &prose::part_path("document"))?;
+    let tags = docx2typed_format::xml::scan_tags(&part);
     let mut out = Vec::new();
     for planned in &plan.paragraphs {
-        let Some(ordinal) = ordered.iter().position(|id| *id == planned.paragraph_id) else {
+        // The range comes from the ENGINE's own inventory — the leaves it says
+        // belong to this paragraph id — never from a second enumeration of `w:p`
+        // elements. A naive tag scan disagrees with the inventory as soon as a
+        // paragraph is nested (a table cell, a box, a content control), and the
+        // mismatch lands the plan on a different paragraph: measured, a restyle
+        // addressed to P18 was applied to whatever a tag scan counts as the
+        // eighteenth, and the build refused `format-snapshot-stale` naming two
+        // different texts.
+        let leaves: Vec<&ProseLeaf> = inventory
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.paragraph_id == planned.paragraph_id && leaf.part_key == "document")
+            .collect();
+        if leaves.is_empty() {
             return Err(CollaborationError::new(
                 "format-paragraph-unknown",
                 format!("{} is not in the package", planned.paragraph_id),
             ));
-        };
-        let Some(range) = ranges.get(ordinal) else {
-            return Err(CollaborationError::new(
-                "format-paragraph-unsupported",
-                format!(
-                    "{} is not a plain paragraph this adapter can address (nested in a table, a \
-                     box or a content control)",
-                    planned.paragraph_id
-                ),
-            ));
-        };
-        out.push((planned.paragraph_id.clone(), *range));
+        }
+        let first = leaves
+            .iter()
+            .map(|leaf| leaf.text_start)
+            .min()
+            .unwrap_or_default();
+        let last = leaves
+            .iter()
+            .map(|leaf| leaf.text_end)
+            .max()
+            .unwrap_or_default();
+        let start = tags
+            .iter()
+            .filter(|tag| tag.name == "r" && !tag.closing && tag.start <= first)
+            .map(|tag| tag.start)
+            .next_back()
+            .ok_or_else(|| {
+                CollaborationError::new(
+                    "format-paragraph-unsupported",
+                    format!("{}: no run holds its first text", planned.paragraph_id),
+                )
+            })?;
+        let end = tags
+            .iter()
+            .filter(|tag| tag.name == "r" && tag.closing && tag.end >= last)
+            .map(|tag| tag.end)
+            .next()
+            .ok_or_else(|| {
+                CollaborationError::new(
+                    "format-paragraph-unsupported",
+                    format!("{}: no run holds its last text", planned.paragraph_id),
+                )
+            })?;
+        out.push((planned.paragraph_id.clone(), (start, end)));
     }
     Ok(out)
 }
@@ -505,36 +593,6 @@ pub fn member_bytes(package: &[u8], member: &str) -> Result<Vec<u8>, Collaborati
     Ok(bytes)
 }
 
-/// The byte ranges of the `w:p` elements of one part, in document order.
-fn paragraph_element_ranges(package: &[u8], part_path: &str) -> Vec<(usize, usize)> {
-    let Ok(part) = member_bytes(package, part_path) else {
-        return Vec::new();
-    };
-    let tags = docx2typed_format::xml::scan_tags(&part);
-    let mut ranges = Vec::new();
-    let mut open: Option<usize> = None;
-    let mut depth = 0usize;
-    for tag in &tags {
-        if tag.name != "p" {
-            continue;
-        }
-        if !tag.closing {
-            if depth == 0 {
-                open = Some(tag.start);
-            }
-            depth += 1;
-        } else {
-            depth = depth.saturating_sub(1);
-            if depth == 0 {
-                if let Some(start) = open.take() {
-                    ranges.push((start, tag.end));
-                }
-            }
-        }
-    }
-    ranges
-}
-
 /// Apply a plan to the draft package: the single run-splitting and property-
 /// writing path in the tree.
 pub fn apply_format_plan(
@@ -542,7 +600,12 @@ pub fn apply_format_plan(
     plan: &FormatPlan,
     snapshot: &Snapshot,
 ) -> Result<Vec<u8>, CollaborationError> {
-    let ranges = paragraph_ranges(package, plan)?;
+    let mut ranges = paragraph_ranges(package, plan)?;
+    // Back to front: every paragraph is materialised into the CURRENT part, and a
+    // splice moves everything after it. Ascending order made the second
+    // paragraph's range address the wrong bytes — measured as
+    // `format-paragraph-has-no-runs` on a plan that covered twelve of them.
+    ranges.sort_by_key(|(_, range)| std::cmp::Reverse(range.0));
     let mut current = package.to_vec();
     for (paragraph_id, range) in ranges {
         // Every paragraph is materialised against the SAME package: the ranges

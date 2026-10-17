@@ -141,7 +141,14 @@ pub fn schema(name: &str) -> Option<Value> {
                                 "default": null,
                             },
                         },
-                        "required": ["handle"],
+                        // A target is named EITHER by a handle or by a selector:
+                        // the skill says a selector may replace a handle, and a
+                        // schema that demanded both was a refusal an agent could
+                        // only work around (it did: handle + selector together).
+                        "anyOf": [
+                            {"required": ["handle"]},
+                            {"required": ["selector"]},
+                        ],
                         "additionalProperties": false,
                     },
                 },
@@ -240,6 +247,11 @@ mod schema_forwarding_tests {
                 declared.keys().collect::<Vec<_>>()
             );
         }
+        assert!(
+            item["anyOf"].as_array().is_some_and(|rows| rows.len() == 2),
+            "an edit must be addressable by handle OR selector: {:?}",
+            item["anyOf"]
+        );
         assert_eq!(
             item["additionalProperties"],
             serde_json::json!(false),
