@@ -116,6 +116,13 @@ pub fn schema(name: &str) -> Option<Value> {
                             "handle": {"type": "string"},
                             "replace_with": {"type": ["string", "null"], "default": null},
                             "text": {"type": ["string", "null"], "default": null},
+                            // A selector names the targets by QUERY instead of a handle:
+                            // {"text": "...", "match": "all"|"first", "scope": ...,
+                            //  "expected_count": N}. The surface enumerates every match
+                            // (the caller never transcribes handles); `expected_count`
+                            // that disagrees, an incomplete search, or no match at all
+                            // are refusals.
+                            "selector": {"type": ["object", "null"], "default": null},
                             // kind `format`: the style the covered characters take.
                             // Name it (`style_id`, from document_find's verdict) or
                             // name properties (`format: {"bold": true}`) and let the

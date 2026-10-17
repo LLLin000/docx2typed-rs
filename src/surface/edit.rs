@@ -39,6 +39,111 @@ use docx2typed_review::{collab, server::MutationError};
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// Every handle a `selector` names, in document order.
+///
+/// A caller that wants "every 四氧化三铁 in the body" should say exactly that. The
+/// enumeration is deterministic selection — the surface's job — and it used to be
+/// the caller's: a blind run transcribed thirty-one handles out of a 968-line
+/// reply and rebuilt truncated ones from their base64 structure. `expected_count`
+/// is honoured when the caller gives it: a count that disagrees is a refusal, not
+/// a surprise edit.
+fn handles_for_selector(
+    session: &mut McpSession,
+    selector: &Value,
+    build_commit: &str,
+) -> Result<Vec<String>, Value> {
+    let Some(text) = selector.get("text").and_then(Value::as_str) else {
+        return Err(session.failure(
+            "document_edit",
+            "invalid-arguments",
+            "a selector needs `text`: the text to enumerate. `match` may be `all` (the default) \
+             or `first`, and `expected_count` is checked when given",
+            build_commit,
+        ));
+    };
+    let match_mode = selector
+        .get("match")
+        .and_then(Value::as_str)
+        .unwrap_or("all");
+    if !matches!(match_mode, "all" | "first") {
+        return Err(session.failure(
+            "document_edit",
+            "invalid-arguments",
+            &format!("selector `match` is `{match_mode}`; it may be `all` or `first`"),
+            build_commit,
+        ));
+    }
+    let mut search_args = json!({ "query": text, "limit": 1000 });
+    if let Some(scope) = selector.get("scope") {
+        search_args["scope"] = scope.clone();
+    }
+    // The SURFACE's own find, not the engine's raw search: the raw payload has a
+    // different shape, and reading the wrong one is how this first enumerated
+    // nothing while reporting a count of zero.
+    let searched = super::find::document_find(session, &search_args, build_commit);
+    let Some(envelope) = searched.get("structuredContent") else {
+        return Err(searched);
+    };
+    if envelope.get("outcome").and_then(Value::as_str) != Some("success") {
+        return Err(searched);
+    }
+    let data = envelope.get("data").cloned().unwrap_or(Value::Null);
+    let mut handles: Vec<String> = Vec::new();
+    if let Some(matches) = data.get("matches").and_then(Value::as_array) {
+        for entry in matches {
+            if let Some(occurrences) = entry.get("occurrences").and_then(Value::as_array) {
+                for occurrence in occurrences {
+                    if let Some(handle) = occurrence.get("handle").and_then(Value::as_str) {
+                        handles.push(handle.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let complete = data
+        .get("counts")
+        .and_then(|counts| counts.get("complete"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !complete {
+        return Err(session.failure(
+            "document_edit",
+            "selector-incomplete",
+            &format!(
+                "the search for {text:?} did not cover every match, so a selector that edits \
+                 \"all\" of them would be a guess. Narrow the query"
+            ),
+            build_commit,
+        ));
+    }
+    if match_mode == "first" {
+        handles.truncate(1);
+    }
+    if let Some(expected) = selector.get("expected_count").and_then(Value::as_u64) {
+        if handles.len() as u64 != expected {
+            return Err(session.failure(
+                "document_edit",
+                "selector-count-mismatch",
+                &format!(
+                    "the selector expected {expected} match(es) of {text:?} and the document \
+                     holds {}; nothing was written",
+                    handles.len()
+                ),
+                build_commit,
+            ));
+        }
+    }
+    if handles.is_empty() {
+        return Err(session.failure(
+            "document_edit",
+            "selector-matched-nothing",
+            &format!("no match for {text:?}; nothing was written"),
+            build_commit,
+        ));
+    }
+    Ok(handles)
+}
+
 /// A format edit: give a span the character properties of a style the document
 /// already carries. There is no synthesis here — the style registry holds what
 /// the document has, and a style id it does not hold is refused before anything
@@ -83,7 +188,11 @@ impl Edit {
 }
 
 /// The edits, or a refusal that names the shape rather than only the mistake.
-fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<Vec<Edit>, Value> {
+fn edits_from(
+    session: &mut McpSession,
+    args: &Value,
+    build_commit: &str,
+) -> Result<Vec<Edit>, Value> {
     let Some(edits) = args.get("edits").and_then(Value::as_array) else {
         return Err(session.failure(
             "document_edit",
@@ -102,8 +211,30 @@ fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<
             build_commit,
         ));
     }
-    let mut parsed = Vec::with_capacity(edits.len());
-    for (index, edit) in edits.iter().enumerate() {
+    // A selector names its targets by QUERY and the surface enumerates them, so a
+    // caller never transcribes handles: "every 四氧化三铁 in the body" is one entry,
+    // not thirty-one copied ids. The enumeration is deterministic selection, which
+    // is this layer's job — the format engine still decides what each span becomes,
+    // and one target that cannot be applied refuses the whole batch.
+    let mut expanded: Vec<Value> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        match edit.get("selector") {
+            Some(selector) if !selector.is_null() => {
+                let handles = handles_for_selector(session, selector, build_commit)?;
+                for handle in handles {
+                    let mut concrete = edit.clone();
+                    if let Some(object) = concrete.as_object_mut() {
+                        object.remove("selector");
+                        object.insert("handle".to_string(), json!(handle));
+                    }
+                    expanded.push(concrete);
+                }
+            }
+            _ => expanded.push(edit.clone()),
+        }
+    }
+    let mut parsed = Vec::with_capacity(expanded.len());
+    for (index, edit) in expanded.iter().enumerate() {
         let number = index + 1;
         let keys = || {
             edit.as_object()

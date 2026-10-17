@@ -71,7 +71,7 @@ pub fn resolve_style(
         .filter(|leaf| leaf.paragraph_id == paragraph_id)
         .collect();
     let mut cursor = 0usize;
-    let mut first_covered: Option<&ProseLeaf> = None;
+    let mut covered: Vec<&ProseLeaf> = Vec::new();
     for leaf in leaves {
         if leaf.text_start == leaf.text_end {
             continue;
@@ -80,16 +80,41 @@ pub fn resolve_style(
         let (leaf_start, leaf_end) = (cursor, cursor + length);
         cursor = leaf_end;
         if leaf_start < end && leaf_end > start {
-            first_covered = Some(leaf);
-            break;
+            covered.push(leaf);
         }
     }
+    let first_covered = covered.first().copied();
     let Some(base) = first_covered else {
         return Err(CollaborationError::new(
             "format-range-invalid",
             format!("[{start}, {end}) of {paragraph_id} covers no editable text"),
         ));
     };
+    // A property request derives ONE style from ONE run's properties. If the span
+    // covers runs whose properties differ, that derivation would quietly unify
+    // them — "make these bold" is not "make these all look like the first one".
+    // Refused, with the way out named: a `style_id` replaces the span's formatting
+    // deliberately, and `document_find` reports the properties the span covers.
+    let covered_properties: Vec<&str> = covered.iter().map(|leaf| leaf.rpr.as_str()).collect();
+    let mut distinct: Vec<&str> = Vec::new();
+    for properties in &covered_properties {
+        if !distinct.contains(properties) {
+            distinct.push(properties);
+        }
+    }
+    if distinct.len() > 1 {
+        return Err(CollaborationError::new(
+            "format-baseline-mixed",
+            format!(
+                "[{start}, {end}) of {paragraph_id} covers {} runs with {} different sets of \
+                 character properties; a property request is derived from one of them and would \
+                 unify the rest. Name a `style_id` to replace the span's formatting deliberately, \
+                 or make one request per run",
+                covered_properties.len(),
+                distinct.len()
+            ),
+        ));
+    }
     let available = prose::load_style_rprs_for(workdir)
         .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
     let ids: std::collections::BTreeSet<String> = available.keys().cloned().collect();
