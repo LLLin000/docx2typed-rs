@@ -64,6 +64,11 @@ pub fn schema(name: &str) -> Option<Value> {
                 "author": {"type": ["string", "null"], "default": null},
                 "date": {"type": ["string", "null"], "default": null},
                 "track": {"type": ["boolean", "null"], "default": null},
+                // One connection drives one workdir. Leaving it to open another
+                // is a decision the caller makes explicitly, and this is where
+                // it makes it — the refusal it replaces costs nothing to take,
+                // because a workdir keeps its state on disk.
+                "release_current": {"type": ["boolean", "null"], "default": null},
             },
             "required": ["source"],
             "additionalProperties": false,
@@ -74,6 +79,13 @@ pub fn schema(name: &str) -> Option<Value> {
                 "query": {"type": "string"},
                 "scope": {"type": ["string", "null"], "default": null},
                 "limit": {"type": ["integer", "null"], "default": null},
+                // The engine pages by block and its own `next.call` names this
+                // parameter when a page is short, so a schema without it made the
+                // tool refuse the call it had just told the caller to make.
+                // Measured: an agent following that instruction got
+                // `unknown argument \`offset\`` and, on a real patent, never
+                // reached the 15 of 35 blocks the first page left out.
+                "offset": {"type": ["integer", "null"], "default": null},
             },
             "required": ["query"],
             "additionalProperties": false,
@@ -89,9 +101,13 @@ pub fn schema(name: &str) -> Option<Value> {
                             // A closed set, not free text: an invented kind is
                             // refused naming the allowed ones. `replace` is the
                             // default, so the common case needs no `kind` at all.
+                            // `format` names a style the document already carries
+                            // for the characters the handle covers; its own key is
+                            // `style_id`, and the ids are the ones document_find
+                            // reports for the span.
                             "kind": {
                                 "type": "string",
-                                "enum": ["replace", "insert_after", "delete"],
+                                "enum": ["replace", "insert_after", "delete", "format"],
                                 "default": "replace",
                             },
                             // Every kind addresses its target the same way: a
@@ -100,8 +116,39 @@ pub fn schema(name: &str) -> Option<Value> {
                             "handle": {"type": "string"},
                             "replace_with": {"type": ["string", "null"], "default": null},
                             "text": {"type": ["string", "null"], "default": null},
+                            // A selector names the targets by QUERY instead of a handle:
+                            // {"text": "...", "match": "all"|"first", "scope": ...,
+                            //  "expected_count": N}. The surface enumerates every match
+                            // (the caller never transcribes handles); `expected_count`
+                            // that disagrees, an incomplete search, or no match at all
+                            // are refusals.
+                            "selector": {"type": ["object", "null"], "default": null},
+                            // kind `format`: the style the covered characters take.
+                            // Name it (`style_id`, from document_find's verdict) or
+                            // name properties (`format: {"bold": true}`) and let the
+                            // engine resolve the style this document already carries.
+                            "style_id": {"type": ["string", "null"], "default": null},
+                            "format": {"type": ["object", "null"], "default": null},
+                            // How much of the anchor's formatting the new
+                            // paragraph takes. `safe_inherit` is the default and
+                            // copies only what may be copied — no revision
+                            // record, no section break, no unknown property.
+                            // `none` writes the paragraph with no inherited
+                            // properties at all.
+                            "format_policy": {
+                                "type": ["string", "null"],
+                                "enum": ["safe_inherit", "none", null],
+                                "default": null,
+                            },
                         },
-                        "required": ["handle"],
+                        // A target is named EITHER by a handle or by a selector:
+                        // the skill says a selector may replace a handle, and a
+                        // schema that demanded both was a refusal an agent could
+                        // only work around (it did: handle + selector together).
+                        "anyOf": [
+                            {"required": ["handle"]},
+                            {"required": ["selector"]},
+                        ],
                         "additionalProperties": false,
                     },
                 },
@@ -144,5 +191,110 @@ pub fn dispatch(session: &mut McpSession, tool: &str, args: &Value, build_commit
             &format!("{other} is not part of the agent surface"),
             build_commit,
         ),
+    }
+}
+
+#[cfg(test)]
+mod schema_forwarding_tests {
+    /// Every key the surface forwards must be declared, because an undeclared
+    /// key is refused before the forward ever happens — and the engine's own
+    /// `next.call` names `offset` when a search page is short. A schema without
+    /// it made `document_find` refuse the very call it had just recommended:
+    /// measured on a real patent, the agent never reached the 15 of 35 blocks
+    /// the first page left out.
+    #[test]
+    fn every_forwarded_key_is_declared() {
+        for (tool, forwarded) in [
+            ("document_find", &["scope", "limit", "offset"][..]),
+            (
+                "document_open",
+                &["author", "date", "track", "release_current"][..],
+            ),
+            ("document_edit", &["edits"][..]),
+            ("document_save", &["output"][..]),
+        ] {
+            let declared = crate::mcp::declared_parameters(tool).expect("schema");
+            for key in forwarded {
+                assert!(
+                    declared.contains(*key),
+                    "{tool} forwards `{key}` but does not declare it: {declared:?}"
+                );
+            }
+        }
+    }
+
+    /// The same rule one level down. An edit object is validated against its own
+    /// schema, and that schema is closed — so a per-edit key the code reads but
+    /// the schema omits is refused before the read, exactly like a top-level one.
+    /// Every field the schema declares is CONSUMED by each kind that may carry it,
+    /// or refused when that kind cannot use it.
+    ///
+    /// The invariant that was missing: `replace` accepted `format` and dropped it.
+    /// A field read as accepted and then ignored is worse than an unknown one, and
+    /// this is the test that keeps the matrix total.
+    #[test]
+    fn every_declared_field_is_consumed_or_refused() {
+        let schema = crate::surface::schema("document_edit").expect("schema");
+        let item = &schema["properties"]["edits"]["items"];
+        let declared: Vec<String> = item["properties"]
+            .as_object()
+            .expect("edit properties")
+            .keys()
+            .cloned()
+            .collect();
+        for kind in ["replace", "insert_after", "delete", "format"] {
+            for field in &declared {
+                let mut object = serde_json::Map::new();
+                object.insert("kind".to_string(), serde_json::json!(kind));
+                object.insert(field.clone(), serde_json::json!("x"));
+                let entry = serde_json::Value::Object(object);
+                let unconsumed = crate::surface::edit::unconsumed_field(kind, &entry);
+                let consumed = unconsumed.is_none();
+                let universal = matches!(field.as_str(), "kind" | "handle" | "selector");
+                assert!(
+                    consumed || universal || unconsumed == Some(field.as_str()),
+                    "kind `{kind}` neither consumes nor refuses `{field}`"
+                );
+                if !universal {
+                    assert!(
+                        consumed || unconsumed.is_some(),
+                        "`{field}` must be consumed by `{kind}` or refused when sent with it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `format_policy` was taught to `document_edit` and not declared here, and
+    /// the tool rejected the parameter it had just been given a way to honour.
+    #[test]
+    fn every_per_edit_key_is_declared() {
+        let schema = crate::surface::schema("document_edit").expect("schema");
+        let item = &schema["properties"]["edits"]["items"];
+        let declared = item["properties"].as_object().expect("edit properties");
+        for key in [
+            "kind",
+            "handle",
+            "replace_with",
+            "text",
+            "format_policy",
+            "style_id",
+        ] {
+            assert!(
+                declared.contains_key(key),
+                "document_edit reads `{key}` off an edit but does not declare it: {:?}",
+                declared.keys().collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            item["anyOf"].as_array().is_some_and(|rows| rows.len() == 2),
+            "an edit must be addressable by handle OR selector: {:?}",
+            item["anyOf"]
+        );
+        assert_eq!(
+            item["additionalProperties"],
+            serde_json::json!(false),
+            "an open edit schema would let a mistyped key reach the engine as a silent default"
+        );
     }
 }

@@ -119,6 +119,7 @@ version = "0.2.1"
 dependencies = [
  "docx2typed-app",
  "docx2typed-core",
+ "docx2typed-format",
  "docx2typed-protocol",
  "docx2typed-review",
  "docx2typed-store",
@@ -135,6 +136,7 @@ version = "0.2.1"
 dependencies = [
  "docx2typed-core",
  "docx2typed-protocol",
+ "docx2typed-review",
  "docx2typed-store",
  "docx2typed-verify",
  "serde_json",
@@ -157,6 +159,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "docx2typed-format"
+version = "0.2.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "docx2typed-protocol"
 version = "0.2.1"
 dependencies = [
@@ -173,6 +183,7 @@ version = "0.2.1"
 dependencies = [
  "docx2typed-app",
  "docx2typed-core",
+ "docx2typed-format",
  "docx2typed-protocol",
  "docx2typed-store",
  "getrandom 0.2.17",
@@ -181,6 +192,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "zip",
 ]
 
 [[package]]

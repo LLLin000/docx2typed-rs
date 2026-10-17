@@ -91,11 +91,10 @@ pub struct BuildPlan {
     /// PR 3: structural edits (new / deleted paragraphs) applied after the
     /// island edits. Validated against the template during planning.
     pub structure: crate::prose::StructureEdits,
-    /// #33: character-formatting edits, applied last, after the paragraph set
-    /// is settled. Each names a style that `styles` holds.
-    pub rpr_edits: Vec<crate::prose::RprEdit>,
-    /// The `style_id -> w:rPr` map from `styles.json`.
-    pub styles: BTreeMap<String, String>,
+    /// The format engine's plan for this workdir, read from `format_plan.json`.
+    /// The build EXECUTES it and the verifier checks it; neither re-derives the
+    /// rules (ADR 0050).
+    pub format_plan: Option<serde_json::Value>,
 }
 
 /// Workdir metadata produced by validation, shared by build/verify/open.
@@ -274,10 +273,16 @@ fn applied_edit_count(workdir: &Path) -> usize {
     let structure = crate::prose::load_structure(workdir)
         .map(|edits| edits.new_paragraphs.len() + edits.deleted_paragraphs.len())
         .unwrap_or(0);
-    let rpr = crate::prose::load_rpr_edits(workdir)
-        .map(|edits| edits.len())
+    let format = std::fs::read_to_string(workdir.join("format_plan.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|plan| {
+            plan.get("paragraphs")
+                .and_then(|rows| rows.as_array())
+                .map(Vec::len)
+        })
         .unwrap_or(0);
-    islands + structure + rpr
+    islands + structure + format
 }
 
 /// What `plan_extract` does when the target workdir has already moved past its
@@ -518,7 +523,10 @@ fn stale_baseline_assets(outdir: &Path) -> Vec<Asset> {
     [
         crate::prose::ISLANDS_FILE,
         crate::prose::STRUCTURE_FILE,
-        crate::prose::RPR_EDITS_FILE,
+        // The format engine's plan and requests are expressed against the old
+        // template too, so a baseline replacement clears them with the rest.
+        "format_plan.json",
+        "format_intents.json",
         crate::edit_state::PROJECTION_FILE,
         crate::edit_state::STATE_FILE,
         POINTER_FILE,
@@ -631,37 +639,6 @@ pub fn validate_workdir(workdir: &Path) -> Result<WorkdirMeta, CoreError> {
     })
 }
 
-/// Plan a build: a pristine workdir replays the template bytes (no-op);
-/// an edited workdir is rejected in this slice (edits land in #56+).
-///
-/// Issue #56: workdirs with an edit projection (edit.state.json present)
-/// additionally enforce Python's `require_clean_edit` freshness gate — a
-/// non-clean state blocks the build with the same diagnostic code Python
-/// emits. Workdirs without an edit projection (e.g. Rust-extracted no-op
-/// workdirs, which have no edit.md/edit.state.json) keep the #55
-/// pristine-replay behavior; Python refuses those with edit-state-missing,
-/// and the divergence is deliberate to preserve the frozen no-op contract.
-/// The `style_id -> w:rPr` map from `styles.json`. A workdir without the file
-/// has no styles, which is the pre-#48 state rather than an error.
-fn load_style_rprs(root: &Path) -> Result<BTreeMap<String, String>, CoreError> {
-    let path = root.join("styles.json");
-    if !path.is_file() {
-        return Ok(BTreeMap::new());
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).map_err(CoreError::io)?)
-            .map_err(|error| CoreError::Domain(format!("invalid styles.json: {error}")))?;
-    let mut out = BTreeMap::new();
-    if let Some(styles) = value.get("styles").and_then(|v| v.as_object()) {
-        for (style_id, entry) in styles {
-            if let Some(rpr) = entry.get("rPr").and_then(|v| v.as_str()) {
-                out.insert(style_id.clone(), rpr.to_string());
-            }
-        }
-    }
-    Ok(out)
-}
-
 pub fn plan_build(workdir: &Path) -> Result<BuildPlan, CoreError> {
     let meta = validate_workdir(workdir)?;
     // Island edits (issue #58) are the one supported edited-build path: when
@@ -669,14 +646,18 @@ pub fn plan_build(workdir: &Path) -> Result<BuildPlan, CoreError> {
     // applies those edits to the template bytes instead of replaying them.
     let islands = crate::prose::load_islands(&meta.root)?;
     let structure = crate::prose::load_structure(&meta.root)?;
-    let rpr_edits = crate::prose::load_rpr_edits(&meta.root)?;
-    let styles = load_style_rprs(&meta.root)?;
+    // The format engine's plan, if this workdir has one. The build executes it;
+    // it does not read the requests or re-derive the rules.
+    let format_plan: Option<serde_json::Value> =
+        std::fs::read_to_string(meta.root.join("format_plan.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
     let is_store = meta.root.join(".docx2typed-store").is_dir();
     if !meta.pristine
         && !is_store
         && islands.is_empty()
         && structure.is_empty()
-        && rpr_edits.is_empty()
+        && format_plan.is_none()
     {
         return Err(CoreError::Domain(
             "workdir-invalid: typed edits are not implemented in the protocol-major-1 Rust slice (issue #55; edits land in #56+)".to_string(),
@@ -729,8 +710,7 @@ pub fn plan_build(workdir: &Path) -> Result<BuildPlan, CoreError> {
         replay: true,
         edits: islands,
         structure,
-        rpr_edits,
-        styles,
+        format_plan,
     })
 }
 

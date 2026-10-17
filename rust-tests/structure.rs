@@ -529,14 +529,21 @@ fn tracked_revisions_and_anchors_refuse_deletion() {
 }
 
 #[test]
-fn a_new_paragraph_cannot_inherit_protected_structure() {
-    let workdir = scratch("refuse-inherit");
+fn a_new_paragraph_inherits_only_safe_properties() {
+    // Position and format are two questions. The anchor answers the first, and
+    // Safe Paragraph Synthesis answers the second by copying only the properties
+    // that may be copied — so a paragraph carrying a field or the section break
+    // is a perfectly good anchor. Before this, both were refused, and a real
+    // patent cost a restricted agent fourteen attempts at anchors that were
+    // refused for reasons it could not see and could not act on.
+    let workdir = scratch("safe-inherit");
     extract(&fixture("complex"), &workdir);
+    let wd = workdir.to_string_lossy().into_owned();
+    let out = workdir.join("out.docx");
+    let out_str = out.to_string_lossy().into_owned();
+    let source_before = std::fs::read(fixture("complex")).expect("source bytes");
     let results = mcp(&[
-        (
-            "workdir_open",
-            json!({ "workdir": workdir.to_string_lossy() }),
-        ),
+        ("workdir_open", json!({ "workdir": wd })),
         (
             "insert_paragraph",
             json!({
@@ -555,7 +562,85 @@ fn a_new_paragraph_cannot_inherit_protected_structure() {
                 "operation_id": "op-insert-section",
             }),
         ),
+        ("commit_sync", json!({ "operation_id": "op-commit" })),
+        (
+            "build_docx",
+            json!({ "output": out_str, "operation_id": "op-build" }),
+        ),
     ]);
-    assert!(refused(&results[1], "invalid-structure").contains("structural content"));
-    assert!(refused(&results[2], "invalid-structure").contains("section properties"));
+    // P12 carries a field, P17 carries the section break: neither is formatting.
+    assert_eq!(ok(&results[1])["inherit"], "P12");
+    let section = ok(&results[2]);
+    assert_eq!(section["inherit"], "P17");
+    // The section break IS a real difference — the new paragraph lands in the
+    // next section — and the engine reports it instead of refusing.
+    assert!(
+        section["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|text| text.contains("NEXT section")))),
+        "landing in the next section must be reported: {section}"
+    );
+    ok(&results[3]);
+    ok(&results[4]);
+
+    // Acceptance: the document's section count is unchanged, and no revision
+    // was manufactured by the insertion.
+    let before = document_xml(&fixture("complex"));
+    let after = document_xml(&out);
+    assert_eq!(
+        after.matches("<w:sectPr").count(),
+        before.matches("<w:sectPr").count(),
+        "the insertion must not add a section"
+    );
+    assert_eq!(
+        after.matches("<w:ins ").count() + after.matches("<w:del ").count(),
+        before.matches("<w:ins ").count() + before.matches("<w:del ").count(),
+        "the insertion must not manufacture a revision"
+    );
+    // Bookmark and comment-range ids are unique by definition, so copying one
+    // would duplicate it. The new paragraph takes PROPERTIES only — never a body
+    // node — so the id sets cannot change. Assert it rather than assume it.
+    let ids = |xml: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        for tag in ["bookmarkStart", "commentRangeStart"] {
+            let needle = format!("<w:{tag} ");
+            let mut rest = xml;
+            while let Some(at) = rest.find(&needle) {
+                rest = &rest[at..];
+                let Some(end) = rest.find('>') else { break };
+                if let Some(id) = rest[..end]
+                    .split("w:id=\"")
+                    .nth(1)
+                    .and_then(|value| value.split('"').next())
+                {
+                    out.push(format!("{tag}:{id}"));
+                }
+                rest = &rest[end..];
+            }
+        }
+        out.sort();
+        out
+    };
+    assert_eq!(
+        ids(&after),
+        ids(&before),
+        "the insertion must not duplicate a bookmark or comment-range id"
+    );
+
+    // The new paragraph carries no section break of its own.
+    let at = after.find("新段落").expect("the new w:p");
+    let opening = after[..at].rfind("<w:p>").map(|start| &after[start..at]);
+    assert!(
+        opening.is_some_and(|opening| !opening.contains("sectPr")),
+        "the new paragraph must not inherit the section break"
+    );
+
+    // The original source DOCX is byte-unchanged.
+    assert_eq!(
+        std::fs::read(fixture("complex")).expect("source bytes"),
+        source_before,
+        "the source DOCX must never be written"
+    );
 }

@@ -73,6 +73,7 @@ fn fixture(tag: &str) -> Fixture {
 /// the rest of the range from `(leaf_index, old)`.
 fn edit(fixture: &Fixture, tracked: bool, new: &str) -> IslandEdit {
     IslandEdit {
+        char_start: None,
         part: fixture.part.clone(),
         paragraph_id: fixture.paragraph_id.clone(),
         leaf_index: fixture.span.first_leaf,

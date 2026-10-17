@@ -685,7 +685,14 @@ fn draft_replace_insert_delete_diff_commit_revert() {
     assert_eq!(diff["changed_paragraph_ids"], json!(["P0"]));
     // insert after P0 (only P0 exists in the tracer inventory? no — every
     // paragraph exists; insert after P2).
-    let inserted = draft::insert_paragraph(&wd, "P2", "插入段落", None).expect("insert");
+    let inserted = draft::insert_paragraph(
+        &wd,
+        "P2",
+        "插入段落",
+        None,
+        docx2typed_core::prose::FormatPolicy::default(),
+    )
+    .expect("insert");
     let temp_id = inserted["temp_id"].as_str().unwrap_or("").to_string();
     assert!(temp_id.starts_with('N'));
     let diff = draft::diff_preview(&wd).expect("diff");
@@ -755,9 +762,23 @@ fn draft_replace_insert_delete_diff_commit_revert() {
 fn draft_blocks_container_and_part_paragraph_edits() {
     let wd = workdir("draft-containers", "plain");
     draft::ensure_projection(&wd).expect("projection");
-    let error = draft::insert_paragraph(&wd, "T0", "x", None).expect_err("table target");
+    let error = draft::insert_paragraph(
+        &wd,
+        "T0",
+        "x",
+        None,
+        docx2typed_core::prose::FormatPolicy::default(),
+    )
+    .expect_err("table target");
     assert_eq!(error.code, "table-structure-immutable");
-    let error = draft::insert_paragraph(&wd, "B1", "x", None).expect_err("text box target");
+    let error = draft::insert_paragraph(
+        &wd,
+        "B1",
+        "x",
+        None,
+        docx2typed_core::prose::FormatPolicy::default(),
+    )
+    .expect_err("text box target");
     assert_eq!(error.code, "table-structure-immutable");
     let error = draft::delete_paragraph(&wd, "T0").expect_err("table delete");
     assert_eq!(error.code, "table-structure-immutable");
