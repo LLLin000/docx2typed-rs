@@ -319,12 +319,20 @@ fn paragraph_says(rendered: &str, recorded: &str) -> bool {
 
 /// Do the projection and the draft read as different paragraphs?
 ///
-/// The comparison is over the WORDS, with whitespace and the spellings of
-/// zero-width tokens removed. The two dialects disagree on notation — the typed
-/// view writes a tab as a tab character, the draft as a token with no text — and
-/// a check that refuses a correctly edited document because of notation is worse
-/// than no check at all. Measured: `sync_guard`'s styling fixture tripped exactly
-/// that way.
+/// This compares the WHITESPACE-FREE CHARACTER SEQUENCE, not words and not
+/// semantics. The two dialects disagree on notation — the typed view writes a tab as
+/// a tab character, the draft as a token with no text — and a check that refuses a
+/// correctly edited document because of notation is worse than no check at all
+/// (measured: `sync_guard`'s styling fixture tripped exactly that way), so the
+/// notation is removed along with all whitespace.
+///
+/// That is enough to catch the defect it exists for — a paragraph wearing another
+/// paragraph's body — and it is NOT a proof that the two records read the same:
+/// `AB C` and `A BC` both become `ABC` and compare equal. The limit is deliberate
+/// and recorded in ADR 0049; removing it means one shared visible-atom stream for
+/// both dialects, which is not part of this freeze. The identity this guards is
+/// also carried by the build's own id list, so this comparison is additional
+/// evidence rather than the only check.
 fn readings_disagree(rendered: &str, draft_body: &str) -> bool {
     fn words(text: &str) -> String {
         text.replace("\\t", "")
@@ -4721,6 +4729,15 @@ mod reading_tests {
         ));
         // Leading spaces: a draft body may carry them, the projection drops them.
         assert!(!readings_disagree("starts here", "        starts here",));
+    }
+
+    /// The documented blind spot, pinned so it cannot change silently: moving a
+    /// space is not detected, because the comparison drops whitespace entirely.
+    /// Removing this test should mean replacing the comparison with one shared
+    /// visible-atom stream (ADR 0049), not loosening the check.
+    #[test]
+    fn whitespace_only_displacement_is_not_detected() {
+        assert!(!readings_disagree("AB C", "A BC"));
     }
 
     /// What it DOES catch: a paragraph wearing another paragraph's body, which is
