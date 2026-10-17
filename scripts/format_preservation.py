@@ -35,7 +35,9 @@ Usage:
 
 from __future__ import annotations
 
+import io
 import json
+import pathlib
 import sys
 import zipfile
 
@@ -177,6 +179,141 @@ def outside(runs, spans):
     return kept
 
 
+def rpr_signature(rpr_xml: str) -> tuple:
+    """The PROPERTIES of an rPr, namespace declarations aside.
+
+    Comparing canonical XML would compare the document's own namespace
+    declarations with the registry's: two spellings of the same formatting, and a
+    mismatch that has nothing to do with formatting. What matters is the children
+    — each property and the attributes that give it a value.
+    """
+    from lxml import etree
+
+    if not rpr_xml.strip():
+        return ()
+    root = parse(rpr_xml)
+    out = []
+    for child in root:
+        name = local(child.tag)
+        attributes = tuple(sorted((local(key), value) for key, value in child.attrib.items()))
+        out.append((name, attributes))
+    return tuple(sorted(out))
+
+
+def character_properties(package: bytes, paragraph_index: int) -> list[tuple[str, str]]:
+    """`(character, canonical rPr)` for every character of a paragraph.
+
+    This is the ownership model the format checks need: a character-level edit may
+    split a run, so "the run is unchanged" is the wrong question and "the
+    character kept its properties" is the right one. Runs without text (a tab, a
+    break) contribute no characters.
+    """
+    body = paragraph_body(package, paragraph_index)
+    out: list[tuple[str, str]] = []
+    for run in run_slices(package, paragraph_index):
+        rpr = run["rpr"]
+        signature = (
+            rpr_signature(etree_tostring(rpr)) if rpr is not None else (("(none)", ()),)
+        )
+        out.extend((character, signature) for character in run["text"])
+    return out
+
+
+def member_bytes(package: bytes, member: str) -> bytes:
+    with zipfile.ZipFile(io.BytesIO(package)) as archive:
+        return archive.read(member)
+
+
+def tag_positions(part: bytes) -> list[tuple[str, int, int, bool, bool]]:
+    """`(name, start, end, closing, self_closing)` for every tag, in order.
+
+    A byte scanner, because the checks need offsets: an lxml element does not
+    carry where it was, and re-serialising one to find it does not survive
+    namespace declarations.
+    """
+    out = []
+    index = 0
+    while index < len(part):
+        if part[index] != ord("<"):
+            index += 1
+            continue
+        if part[index : index + 4] == b"<!--":
+            end = part.find(b"-->", index)
+            index = len(part) if end == -1 else end + 3
+            continue
+        end = part.find(b">", index)
+        if end == -1:
+            break
+        inner = part[index + 1 : end]
+        closing = inner[:1] == b"/"
+        body = inner[1:] if closing else inner
+        self_closing = body[-1:] == b"/"
+        name_end = 0
+        while name_end < len(body) and not (
+            body[name_end : name_end + 1].isspace() or body[name_end : name_end + 1] == b"/"
+        ):
+            name_end += 1
+        name = body[:name_end].decode("utf-8", "replace").rsplit(":", 1)[-1]
+        if name:
+            out.append((name, index, end + 1, closing, self_closing))
+        index = end + 1
+    return out
+
+
+def paragraph_element_ranges(part: bytes) -> list[tuple[int, int]]:
+    """Byte ranges of the `w:p` elements, in document order."""
+    ranges = []
+    depth = 0
+    start = 0
+    for name, tag_start, tag_end, closing, self_closing in tag_positions(part):
+        if name != "p":
+            continue
+        if not closing and not self_closing:
+            if depth == 0:
+                start = tag_start
+            depth += 1
+        elif closing:
+            depth = max(0, depth - 1)
+            if depth == 0:
+                ranges.append((start, tag_end))
+    return ranges
+
+
+def etree_tostring(element) -> str:
+    from lxml import etree
+
+    return etree.tostring(element, encoding="unicode")
+
+
+def run_slices(package: bytes, paragraph_index: int) -> list[dict]:
+    """Every `w:r` of a paragraph: its `w:rPr` element, its text, its bytes.
+
+    Parsed from the WHOLE document part, so the namespace declarations a run's
+    canonical form carries are the document's own — a wrapper's would make every
+    comparison against the registry fail for a reason that has nothing to do with
+    formatting.
+    """
+    from lxml import etree
+
+    part = member_bytes(package, "word/document.xml")
+    root = parse(part)
+    paragraph = list(root.iter(f"{{{W}}}p"))
+    if paragraph_index >= len(paragraph):
+        return []
+    runs = []
+    for run in paragraph[paragraph_index].iter(f"{{{W}}}r"):
+        rpr = run.find(f"{{{W}}}rPr")
+        text = "".join(t.text or "" for t in run.iter(f"{{{W}}}t"))
+        runs.append(
+            {
+                "rpr": rpr,
+                "text": text,
+                "bytes": etree.tostring(run, method="c14n"),
+            }
+        )
+    return runs
+
+
 def structure_counts(root) -> dict[str, int]:
     counts: dict[str, int] = {}
     for element in root.iter():
@@ -186,7 +323,13 @@ def structure_counts(root) -> dict[str, int]:
     return counts
 
 
-def check(source: str, produced: str, replaced: list[tuple[str, str]] | None = None) -> dict:
+def check(
+    source: str,
+    produced: str,
+    replaced: list[tuple[str, str]] | None = None,
+    styled: list[tuple[str, int, int, str]] | None = None,
+    styles_path: str | None = None,
+) -> dict:
     with zipfile.ZipFile(source) as z:
         before_root = parse(z.read("word/document.xml"))
     with zipfile.ZipFile(produced) as z:
@@ -196,12 +339,23 @@ def check(source: str, produced: str, replaced: list[tuple[str, str]] | None = N
     after_paras = paragraphs(after_root)
     report: dict = {
         "paragraphs": {"before": len(before_paras), "after": len(after_paras)},
-        "target": "replaced spans (--replaced)" if replaced else "text diff (no --replaced)",
+        "target": (
+            "independent format targets (--styled)"
+            if styled
+            else "replaced spans (--replaced)"
+            if replaced
+            else "text diff (no --replaced)"
+        ),
         "checks": {},
         "edited": [],
     }
     failures: list[str] = []
 
+    if styled:
+        styled_report = check_styled(source, produced, styled, styles_path)
+        report["styled"] = styled_report["detail"]
+        report["checks"].update(styled_report["checks"])
+        failures.extend(styled_report["failures"])
     report["checks"]["paragraph_count_unchanged"] = len(before_paras) == len(after_paras)
     if not report["checks"]["paragraph_count_unchanged"]:
         failures.append(
@@ -222,7 +376,10 @@ def check(source: str, produced: str, replaced: list[tuple[str, str]] | None = N
     first_run_failures: list[dict] = []
     not_applicable = 0
 
-    for index, (b, a) in enumerate(zip(before_paras, after_paras)):
+    # A format edit has no text target, so the text-diff model does not apply: the
+    # per-character checks above already decided what may change, and the
+    # paragraph/structure checks below still run.
+    for index, (b, a) in enumerate([] if styled else zip(before_paras, after_paras)):
         before_text, after_text = visible(b), visible(a)
         spans_before: list[tuple[int, int]] = []
         spans_after: list[tuple[int, int]] = []
@@ -344,11 +501,161 @@ def check(source: str, produced: str, replaced: list[tuple[str, str]] | None = N
     return report
 
 
+def check_styled(
+    source: str,
+    produced: str,
+    styled: list[tuple[str, int, int, str]],
+    styles_path: str | None,
+) -> dict:
+    """The independent format check: targets from the caller's request, not from
+    the plan.
+
+    Per character, because a character-level edit may split runs:
+
+    1. every target character carries exactly the properties of the style named;
+    2. every character outside the targets keeps the properties it had;
+    3. the visible text is unchanged;
+    4. paragraph properties and protected structure are unchanged;
+    5. a run that took part in no split is byte-identical.
+    """
+    before_package = pathlib.Path(source).read_bytes()
+    after_package = pathlib.Path(produced).read_bytes()
+    registry: dict[str, str] = {}
+    if styles_path:
+        value = json.loads(pathlib.Path(styles_path).read_text(encoding="utf-8"))
+        for style_id, entry in value.get("styles", {}).items():
+            registry[style_id] = entry.get("rPr", "")
+
+    failures: list[str] = []
+    checks: dict[str, bool] = {}
+    detail: list[dict] = []
+
+    # Paragraph indices, in document order, from the source's own paragraph ids.
+    ids = paragraph_ids(before_package)
+    index_of = {paragraph_id: index for index, paragraph_id in enumerate(ids)}
+
+    targets_by_paragraph: dict[str, list[tuple[int, int, str]]] = {}
+    for paragraph_id, start, end, style_id in styled:
+        targets_by_paragraph.setdefault(paragraph_id, []).append((start, end, style_id))
+
+    target_ok = True
+    untargeted_ok = True
+    text_ok = True
+    for paragraph_id, targets in targets_by_paragraph.items():
+        index = index_of.get(paragraph_id)
+        if index is None:
+            failures.append(f"{paragraph_id} is not in the source document")
+            target_ok = False
+            continue
+        before = character_properties(before_package, index)
+        after = character_properties(after_package, index)
+        before_text = "".join(character for character, _ in before)
+        after_text = "".join(character for character, _ in after)
+        if before_text != after_text:
+            text_ok = False
+            failures.append(
+                f"{paragraph_id}: a format edit changed the text "
+                f"({before_text!r} -> {after_text!r})"
+            )
+            continue
+        target_ranges = [(start, end) for start, end, _ in targets]
+        for start, end, style_id in targets:
+            expected = registry.get(style_id, "")
+            if not expected:
+                failures.append(f"{paragraph_id}: no properties for style {style_id}")
+                target_ok = False
+                continue
+            expected_signature = rpr_signature(expected)
+            for offset in range(start, min(end, len(after))):
+                character, rpr = after[offset]
+                conforms = bool(expected) and rpr == expected_signature
+                detail.append(
+                    {
+                        "paragraph": paragraph_id,
+                        "offset": offset,
+                        "character": character,
+                        "before": before[offset][1],
+                        "after": rpr,
+                        "target": True,
+                        "conforms": conforms,
+                    }
+                )
+                if not conforms:
+                    target_ok = False
+                    failures.append(
+                        f"{paragraph_id}[{offset}] {character!r}: {rpr!r} is not the style's "
+                        f"{style_id}"
+                    )
+        for offset, (character, rpr) in enumerate(after):
+            if any(start <= offset < end for start, end in target_ranges):
+                continue
+            if before[offset][1] != rpr:
+                untargeted_ok = False
+                failures.append(
+                    f"{paragraph_id}[{offset}] {character!r}: properties changed outside the "
+                    f"target ({before[offset][1]!r} -> {rpr!r})"
+                )
+
+    checks["target_characters_carry_the_named_style"] = target_ok
+    checks["characters_outside_the_target_unchanged"] = untargeted_ok
+    checks["visible_text_unchanged"] = text_ok
+
+    # 5. Byte-level: a run that took part in no split is unchanged.
+    unsplit_ok = True
+    for paragraph_id, targets in targets_by_paragraph.items():
+        index = index_of.get(paragraph_id)
+        if index is None:
+            continue
+        before_runs = run_slices(before_package, index)
+        after_runs = run_slices(after_package, index)
+        before_pairs = [(run["text"], run["bytes"]) for run in before_runs if run["text"]]
+        after_pairs = [(run["text"], run["bytes"]) for run in after_runs if run["text"]]
+        # A run whose text is untouched AND whose text appears exactly once on
+        # both sides did not take part in a split: its bytes must match.
+        before_by_text: dict[str, list[bytes]] = {}
+        for text, raw in before_pairs:
+            before_by_text.setdefault(text, []).append(raw)
+        for text, raw in after_pairs:
+            candidates = before_by_text.get(text, [])
+            if len(candidates) == 1 and sum(1 for t, _ in after_pairs if t == text) == 1:
+                if candidates[0] != raw:
+                    unsplit_ok = False
+                    failures.append(
+                        f"{paragraph_id}: the run {text!r} took part in no split but its bytes "
+                        "changed"
+                    )
+    checks["runs_outside_any_split_byte_identical"] = unsplit_ok
+
+    return {"checks": checks, "failures": failures, "detail": detail}
+
+
+def paragraph_ids(package: bytes) -> list[str]:
+    """The paragraph ids the engine would mint, in document order: `P{n}` for the
+    document part. Read here from the document's own structure, not from the
+    engine."""
+    part = member_bytes(package, "word/document.xml")
+    from lxml import etree
+
+    root = parse(part)
+    return [f"P{index}" for index, _ in enumerate(root.iter(f"{{{W}}}p"))]
+
+
+def paragraph_body(package: bytes, index: int) -> bytes:
+    part = member_bytes(package, "word/document.xml")
+    ranges = paragraph_element_ranges(part)
+    if index >= len(ranges):
+        return b""
+    start, end = ranges[index]
+    return part[start:end]
+
+
 def main() -> int:
     argv = sys.argv[1:]
     as_json = "--json" in argv
     argv = [a for a in argv if a != "--json"]
     replaced: list[tuple[str, str]] = []
+    styled: list[tuple[str, int, int, str]] = []
+    styles_path: str | None = None
     paths: list[str] = []
     index = 0
     while index < len(argv):
@@ -359,6 +666,18 @@ def main() -> int:
                 return 2
             old, new = argv[index].split("=", 1)
             replaced.append((old, new))
+        elif argv[index] == "--styled":
+            index += 1
+            if index >= len(argv) or "=" not in argv[index] or ":" not in argv[index]:
+                print("--styled takes PARAGRAPH:START-END=STYLE_ID", file=sys.stderr)
+                return 2
+            where, style_id = argv[index].split("=", 1)
+            paragraph_id, span = where.split(":", 1)
+            start, end = span.split("-", 1)
+            styled.append((paragraph_id, int(start), int(end), style_id))
+        elif argv[index] == "--styles":
+            index += 1
+            styles_path = argv[index] if index < len(argv) else None
         else:
             paths.append(argv[index])
         index += 1
@@ -366,13 +685,20 @@ def main() -> int:
         print(__doc__)
         return 2
 
-    report = check(paths[0], paths[1], replaced or None)
+    report = check(paths[0], paths[1], replaced or None, styled or None, styles_path)
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
         return 0 if report["ok"] else 1
 
     print(f"{paths[0]}  ->  {paths[1]}")
     print(f"  target: {report['target']}")
+    for row in report.get("styled", [])[:12]:
+        before = ",".join(name for name, _ in row["before"] if name != "(none)") or "none"
+        after = ",".join(name for name, _ in row["after"] if name != "(none)") or "none"
+        print(
+            f"    {row['paragraph']}[{row['offset']}] {row['character']!r}: "
+            f"{before} -> {after} {'ok' if row['conforms'] else 'NOT the requested style'}"
+        )
     print(f"  paragraphs: {report['paragraphs']['before']}   edited: {len(report['edited'])}")
     for name, ok in report["checks"].items():
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
