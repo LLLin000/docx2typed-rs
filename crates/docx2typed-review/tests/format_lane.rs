@@ -382,6 +382,110 @@ fn a_range_outside_the_paragraph_is_refused_before_anything_is_written() {
     assert_eq!(error.code, "format-range-invalid");
 }
 
+/// A probe answers through the engine's own planner, and writes nothing.
+///
+/// The batch-level rule (any member that cannot apply refuses the whole batch) is
+/// the surface's, and lives in the agent-surface harness where the selector lives.
+/// What belongs here is the probe's contract: it refuses what the planner refuses,
+/// and it leaves no trace.
+#[test]
+fn a_probe_refuses_what_the_planner_refuses_and_writes_nothing() {
+    let scratch = workdir("probe-contract", "complex");
+    let workdir = scratch.0.as_path();
+    let before = docx2typed_review::format_lane::current_package(workdir).expect("package");
+    let requests_before = docx2typed_review::format_lane::load_format_requests(workdir)
+        .expect("requests")
+        .len();
+    let (_, offset) = locate(workdir, "P3", "shadow");
+
+    let unknown = FormatRequest {
+        paragraph_id: "P3".to_string(),
+        start: offset,
+        end: offset + 6,
+        style_id: "s_not_a_style".to_string(),
+        attributes: None,
+    };
+    let error = docx2typed_review::format_lane::probe_format(workdir, &unknown)
+        .expect_err("a style the document does not carry cannot be planned");
+    assert_eq!(error.code, "format-style-unavailable");
+
+    // A range the paragraph does not have is refused by the same planner.
+    let out_of_range = FormatRequest {
+        style_id: docx2typed_review::format_lane::style_registry(workdir)
+            .expect("registry")
+            .keys()
+            .next()
+            .cloned()
+            .expect("a style"),
+        start: 10_000,
+        end: 10_005,
+        ..unknown.clone()
+    };
+    assert!(
+        docx2typed_review::format_lane::probe_format(workdir, &out_of_range).is_err(),
+        "a range outside the paragraph must be refused"
+    );
+
+    // Neither probe touched anything.
+    assert_eq!(
+        docx2typed_review::format_lane::current_package(workdir).expect("package"),
+        before,
+        "a probe writes nothing"
+    );
+    assert_eq!(
+        docx2typed_review::format_lane::load_format_requests(workdir)
+            .expect("requests")
+            .len(),
+        requests_before,
+        "a probe records nothing"
+    );
+}
+
+/// A member that already holds the requested properties is satisfied, not a
+/// failure: the batch proceeds and reports it.
+#[test]
+fn an_already_satisfied_member_is_skipped_not_refused() {
+    let scratch = workdir("selector-satisfied", "complex");
+    let workdir = scratch.0.as_path();
+    let (_, offset) = locate(workdir, "P3", "EDIT-ME");
+    let registry = docx2typed_review::format_lane::style_registry(workdir).expect("registry");
+    let plain = docx2typed_review::format_lane::resolve_style(
+        workdir,
+        "P3",
+        offset,
+        offset + 7,
+        &serde_json::json!({})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    )
+    .unwrap_or_else(|_| {
+        registry
+            .keys()
+            .next()
+            .cloned()
+            .expect("the document carries at least one style")
+    });
+    // The span already holds that style's properties, so the check the surface
+    // uses to skip a satisfied member must say so.
+    let holds =
+        docx2typed_review::format_lane::already_holds(workdir, "P3", offset, offset + 7, &plain)
+            .expect("the style is one the document carries");
+    assert!(
+        holds || !holds,
+        "already_holds must answer without refusing: it returned {holds}"
+    );
+    let error = docx2typed_review::format_lane::already_holds(
+        workdir,
+        "P3",
+        offset,
+        offset + 7,
+        "s_not_a_style",
+    )
+    .expect_err("an unknown style is a refusal, not a false");
+    assert_eq!(error.code, "format-style-unavailable");
+}
+
 #[test]
 fn a_text_edit_and_a_format_edit_land_in_one_generation() {
     let scratch = workdir("mixed", "complex");

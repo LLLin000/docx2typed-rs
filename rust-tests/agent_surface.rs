@@ -2438,6 +2438,64 @@ fn switching_away_and_back_keeps_both_documents_and_their_handles() {
     );
 }
 
+/// A selector batch is all-or-nothing, and it says WHICH member refuses — before
+/// anything runs.
+///
+/// The first version of this diagnosis hooked the failure after the mutation had
+/// already failed, and never fired: the re-probe enumerated while the session was
+/// still unwinding. A check that runs first cannot be defeated by the state its own
+/// failure creates.
+#[test]
+fn a_selector_batch_names_the_member_that_refuses_and_writes_nothing() {
+    let (dir, workdir) = opened("selector-member");
+    let before = std::fs::read(dir.join("source.docx")).expect("source bytes");
+
+    // The property route over a phrase whose matches have different bases: the
+    // document carries no bold variant for most of them, so the batch cannot
+    // apply in full.
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{
+                "kind": "format",
+                "selector": { "text": "中文区域内容", "match": "all" },
+                "format": { "bold": true }
+            }] }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[1]), "failure", "{:?}", replies[1]);
+    let envelope = &replies[1]["structuredContent"];
+    assert_eq!(
+        envelope["diagnostics"][0]["code"], "selector-member-rejected",
+        "a batch that cannot fully apply must say so by name: {envelope:?}"
+    );
+    let reply = data(&replies[1]);
+    assert_eq!(reply["written"], json!(false), "and must write nothing");
+    assert!(
+        reply["matched"].as_u64().unwrap_or(0) >= 1,
+        "the counts are fields, not prose: {reply:?}"
+    );
+    assert_eq!(
+        reply["rejected"].as_u64(),
+        reply["failures"].as_array().map(|rows| rows.len() as u64),
+        "`rejected` and the member list must agree: {reply:?}"
+    );
+    let member = &reply["failures"][0];
+    for key in ["index", "paragraph_id", "range", "code"] {
+        assert!(
+            !member[key].is_null(),
+            "a member report needs `{key}`, from the resolution: {member:?}"
+        );
+    }
+    assert_eq!(member["range"]["unit"], "unicode-scalars");
+    assert_eq!(
+        std::fs::read(dir.join("source.docx")).expect("source bytes"),
+        before,
+        "the source must be untouched"
+    );
+}
+
 #[test]
 fn an_opened_document_reports_whether_its_evidence_is_its_own() {
     let (dir, workdir) = opened("sidecar-set");

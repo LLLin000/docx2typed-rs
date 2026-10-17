@@ -266,6 +266,12 @@ pub fn plan_format(
 /// The member-level diagnosis needs exactly this: ask the engine about one target
 /// WITHOUT touching the workdir, so a batch that will fail can say which member
 /// fails before anything is attempted.
+///
+/// **A probe is a check, not a promise.** It answers "would this be accepted
+/// against the workdir as it stands"; the commit re-derives the plan and re-checks
+/// `base_digest` against the generation it is actually writing, and that result is
+/// the one that counts. A probe that succeeds and an execution that then refuses is
+/// not a contradiction — it is a workdir that moved in between.
 pub fn probe_format(workdir: &Path, request: &FormatRequest) -> Result<(), CollaborationError> {
     let existing = load_format_requests(workdir)?;
     let mut probe = existing;

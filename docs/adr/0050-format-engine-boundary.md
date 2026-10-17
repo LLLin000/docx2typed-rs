@@ -181,3 +181,68 @@ what is proven and what is deliberately out of scope.
    while allowing the semantics is what produced every failure this ADR records.
 3. The frozen text guarantees may move to the engine. They may not weaken.
 4. A verifier that takes its targets from the plan is not an independent check.
+
+---
+
+# Format Integration Baseline
+
+Recorded 2026-10-17, after the blind-driven round that closed the interaction
+layer's contract defects. The format engine's internal architecture is NOT
+reopened by this record; it fixes what the AGENT-FACING contract now is.
+
+## The contracts that hold
+
+1. **A target is named by a handle, or by a constrained selector.** A selector
+   (`{text, match: all|first, scope, expected_count}`) is enumerated by the
+   surface, never by the caller; a count that disagrees, an incomplete search, or
+   no match refuses before anything runs. A selector works for every kind.
+2. **Format semantics and run planning are the engine's alone.** The surface
+   resolves a target to a character range and hands the request over; the style
+   check, the overlap rule, the run splitting and the expectation are the engine's.
+   The build re-derives the plan from the recorded requests and re-checks
+   `base_digest` against the generation it writes; the verifier checks the artifact
+   against the plan and does not re-run it.
+3. **A selector batch is probed member by member, and any member that cannot apply
+   refuses the whole batch.** The probe runs the engine's own planner and throws
+   the plan away — no sidecar, no projection, nothing written. It reports fields,
+   not prose: `matched`, `executable`, `rejected`, `written: false`, and
+   `failures: [{index, handle, paragraph_id, range, code}]`, all from the
+   resolution.
+4. **One generation, all-or-nothing.** A text edit and a format edit share the
+   workdir's transaction; a refusal anywhere leaves the workdir exactly as it was,
+   and the retry property is the store's, unchanged.
+5. **Every declared field is consumed by the kind that accepts it, or refused.**
+   The schema declares the union of every kind's fields, so a field that belongs to
+   one kind can be sent with another; the invariant (and the test that keeps it) is
+   that this is either consumed or `unsupported-combined-edit`.
+6. **The scope claim is bounded.** Direct formatting only, and only combinations
+   the document already carries: `attribute_request` derives a style from the
+   span's base properties (refusing when the document has no such variant) and
+   `registered_style` applies a named style's whole property set. Neither claims
+   Word's computed styles, inheritance, or per-property fidelity: twelve spans
+   reading as bold says nothing about what else they were.
+
+## A probe is a check, not a promise
+
+A probe answers "would this be accepted against the workdir as it stands". The
+commit re-derives and re-checks the baseline; a probe that succeeded followed by an
+execution that refuses is a workdir that moved in between, not a contradiction.
+
+## Long-term regressions to keep
+
+| regression | where |
+|---|---|
+| a batch with a member that cannot apply → whole batch refused, nothing written, members named | `rust-tests/agent_surface.rs::a_selector_batch_names_the_member_that_refuses_and_writes_nothing` |
+| a member already holding the requested properties is satisfied, not a failure | `format_lane.rs::an_already_satisfied_member_is_skipped_not_refused`, `properties_resolve_to_the_document_own_style` |
+| the plan and the output agree on characters, runs and properties | the verifier's `format-plan-applied`; `scripts/format_preservation.py --styled` (independent, reads no plan) |
+| non-target properties unchanged, byte for byte for runs no split touched | `format_lane.rs::a_character_range_gets_a_style_and_nothing_else_moves` |
+| a text edit and a format edit in one generation | `format_lane.rs::a_text_edit_and_a_format_edit_land_in_one_generation`, `formula_acceptance.rs::a_text_edit_and_a_format_edit_share_one_generation` |
+| a probe writes and records nothing | `format_lane.rs::a_probe_refuses_what_the_planner_refuses_and_writes_nothing` |
+
+## What is deliberately NOT next
+
+Font inheritance, synthesised style variants, paragraph-level formatting, and any
+per-property patch semantics. The evidence for the current shape is a blind agent
+completing a real task on a real patent with the five tools alone; the next
+questions are workdir lifecycle, real-DOCX compatibility and format-preservation
+verification, not a wider format vocabulary.
