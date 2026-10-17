@@ -101,9 +101,13 @@ pub fn schema(name: &str) -> Option<Value> {
                             // A closed set, not free text: an invented kind is
                             // refused naming the allowed ones. `replace` is the
                             // default, so the common case needs no `kind` at all.
+                            // `format` names a style the document already carries
+                            // for the characters the handle covers; its own key is
+                            // `style_id`, and the ids are the ones document_find
+                            // reports for the span.
                             "kind": {
                                 "type": "string",
-                                "enum": ["replace", "insert_after", "delete"],
+                                "enum": ["replace", "insert_after", "delete", "format"],
                                 "default": "replace",
                             },
                             // Every kind addresses its target the same way: a
@@ -112,6 +116,8 @@ pub fn schema(name: &str) -> Option<Value> {
                             "handle": {"type": "string"},
                             "replace_with": {"type": ["string", "null"], "default": null},
                             "text": {"type": ["string", "null"], "default": null},
+                            // kind `format`: the style the covered characters take.
+                            "style_id": {"type": ["string", "null"], "default": null},
                             // How much of the anchor's formatting the new
                             // paragraph takes. `safe_inherit` is the default and
                             // copies only what may be copied — no revision
@@ -209,7 +215,14 @@ mod schema_forwarding_tests {
         let schema = crate::surface::schema("document_edit").expect("schema");
         let item = &schema["properties"]["edits"]["items"];
         let declared = item["properties"].as_object().expect("edit properties");
-        for key in ["kind", "handle", "replace_with", "text", "format_policy"] {
+        for key in [
+            "kind",
+            "handle",
+            "replace_with",
+            "text",
+            "format_policy",
+            "style_id",
+        ] {
             assert!(
                 declared.contains_key(key),
                 "document_edit reads `{key}` off an edit but does not declare it: {:?}",

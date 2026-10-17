@@ -1,5 +1,14 @@
 //! `document_edit` — change the document; the engine does the rest.
 //!
+//! Four kinds, one addressing scheme. `replace` (the default), `insert_after`
+//! and `delete` change the text; `format` gives the characters a handle covers
+//! the character properties of a style the document already carries, named by
+//! `style_id`. The ids are the ones `document_find` reports for the span, and the
+//! engine — not this file — decides what the request means: which characters it
+//! covers, whether it overlaps another request, and how the runs are shaped
+//! afterwards. Format edits and text edits are separate transactions, because a
+//! format edit's span is measured against the text as it stands.
+//!
 //! ONE transaction: resolve every handle, apply, sync, and publish — or write
 //! nothing at all. The caller says `{handle, replace_with}`, which is the
 //! facade's own request shape, so there is no translation to get wrong and no
@@ -78,7 +87,7 @@ fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<
             "document_edit",
             "invalid-arguments",
             "document_edit requires `edits`: an array of edits, each with a `handle` from \
-             document_find and a `kind` of replace, insert_after or delete",
+             document_find and a `kind` of replace, insert_after, delete or format",
             build_commit,
         ));
     };
@@ -197,7 +206,7 @@ fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<
                     "invalid-arguments",
                     &format!(
                         "edit #{number} has kind `{other}`; the allowed kinds are replace, \
-                         insert_after and delete"
+                         insert_after, delete and format"
                     ),
                     build_commit,
                 ))
