@@ -51,37 +51,6 @@ pub struct InventoryParagraph {
     pub visible_text: String,
 }
 
-/// Enumerate the workdir's document body via the prose inventory (mirror of
-/// `enumerate` over the template). Only body paragraphs (empty part key)
-/// are listed — container/part paragraphs are out of the editable surface.
-/// Every paragraph of every part, keyed as typed.md keys them.
-///
-/// `inventory_paragraphs` deliberately narrows to the BODY, because the draft
-/// projection is body-only. This check needs the other end of the comparison:
-/// typed.md carries header, footer and note paragraphs too, and a baseline
-/// that lacks them reads each one as an unrecorded edit. That was latent until
-/// #52 -- typed.md had no paragraphs at all, so nothing ever failed to match.
-fn inventory_paragraphs_all_parts(
-    workdir: &Path,
-) -> Result<Vec<InventoryParagraph>, CollaborationError> {
-    let package = workdir.join("_template.docx");
-    let bytes = fs::read(&package)
-        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    // The TREE, not `enumerate_package`'s `visible_text`: the latter is built
-    // from `w:t` leaves alone, so a paragraph of pure separators reads as empty
-    // while typed.md reads `[opaque:separator]`. The tree gives the reference's
-    // `visible_text` for every node kind, which is what the comparison needs.
-    let trees = docx2typed_core::token_table::paragraph_nodes(&bytes)
-        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
-    Ok(trees
-        .into_iter()
-        .map(|tree| InventoryParagraph {
-            id: tree.paragraph_id.clone(),
-            visible_text: docx2typed_core::token_table::visible_text(&tree.nodes),
-        })
-        .collect())
-}
-
 pub fn inventory_paragraphs(workdir: &Path) -> Result<Vec<InventoryParagraph>, CollaborationError> {
     let package = workdir.join("_template.docx");
     if !package.is_file() {
@@ -4453,11 +4422,24 @@ pub fn has_unrecorded_typed_edits(workdir: &Path) -> Result<bool, CollaborationE
     let typed = fs::read_to_string(workdir.join("typed.md"))
         .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
     let recorded = parse_typed_paragraphs(&typed);
-    let baseline: std::collections::BTreeMap<String, String> =
-        inventory_paragraphs_all_parts(workdir)?
-            .into_iter()
-            .map(|paragraph| (paragraph.id, paragraph.visible_text))
-            .collect();
+    // The baseline is the template rendered by THE SAME RULE that produced
+    // `typed.md`, not by `token_table::visible_text`.
+    //
+    // They disagree about one node kind, and it made untouched documents read as
+    // edited: `visible_text` hides a `moveFrom`'s children (a move's source is a
+    // deletion), while the projection shows them as an addressable revision —
+    // measured on a real patent, P193 read `[opaque:opaque]` against the draft's
+    // `[opaque:opaque][opaque:unsupported-run]`, and `save` refused a document
+    // nobody had edited. Two renderings of one rule is how that happens; this is
+    // the side that was rendering the projection's own markup.
+    let package = fs::read(workdir.join("_template.docx"))
+        .map_err(|error| CollaborationError::new("workdir-unreadable", error.to_string()))?;
+    let markup = docx2typed_core::prose::paragraph_markup_map(&package)
+        .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()))?;
+    let baseline: std::collections::BTreeMap<String, String> = markup
+        .iter()
+        .map(|(id, body)| (id.clone(), typed_body_visible_text(body)))
+        .collect();
     for (id, body) in &recorded {
         match baseline.get(id) {
             Some(baseline_body) => {
@@ -4706,7 +4688,12 @@ fn parse_typed_paragraphs(text: &str) -> std::collections::BTreeMap<String, Stri
             continue;
         } else if trimmed.starts_with("<!--@") {
             flush(&mut records, &mut current, &mut body_lines);
-        } else if current.is_some() && !trimmed.is_empty() {
+        } else if current.is_some() && !line.is_empty() {
+            // A whitespace-only line IS body content: `typed.md` writes a table
+            // cell that holds four spaces as a line of four spaces, and skipping
+            // it made the draft read empty against the template's `"    "` — the
+            // second half of the same divergence, measured on a real patent
+            // (`T11.R1.C0.P2`). Only a truly empty line is the file's own spacing.
             body_lines.push(line.to_string());
         }
     }
