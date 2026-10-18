@@ -1552,9 +1552,7 @@ fn verify_tracked_paragraph(
                     break;
                 }
                 match &identity {
-                    Some(seen)
-                        if seen.author != element.author || seen.date != element.date =>
-                    {
+                    Some(seen) if seen.author != element.author || seen.date != element.date => {
                         bad = true;
                         break;
                     }
@@ -1674,9 +1672,10 @@ fn inner_text(fragment: &str, tag: &str) -> String {
     let mut cursor = fragment;
     while let Some(inner) = cursor.find(&open) {
         let after = inner + open.len();
-        let exact = cursor.as_bytes().get(after).is_some_and(|byte| {
-            *byte == b'>' || *byte == b'/' || byte.is_ascii_whitespace()
-        });
+        let exact = cursor
+            .as_bytes()
+            .get(after)
+            .is_some_and(|byte| *byte == b'>' || *byte == b'/' || byte.is_ascii_whitespace());
         if !exact {
             cursor = &cursor[after..];
             continue;
@@ -4531,7 +4530,14 @@ mod tests {
         // must be untouched.
         let (workdir, output) = tracked_audit_setup_for(
             PRIOR_AUTHOR_TEMPLATE,
-            &tracked_audit_sidecar_in("P1", "agent-author", "2026-10-18T00:00:00Z", 1, "opens early", "OPENS EARLY"),
+            &tracked_audit_sidecar_in(
+                "P1",
+                "agent-author",
+                "2026-10-18T00:00:00Z",
+                1,
+                "opens early",
+                "OPENS EARLY",
+            ),
         );
         let edit = prior_author_edit("P1", 1, "opens early", "OPENS EARLY");
         let legal = tracked_audit_genuine_output_for(&workdir, edit);
@@ -4552,8 +4558,14 @@ mod tests {
         let output_part = opaque_audit_part(&legal, "word/document.xml");
         let template_ps = locate_paragraphs(&template_part, "document").expect("template ps");
         let output_ps = locate_paragraphs(&output_part, "document").expect("output ps");
-        let template_p0 = template_ps.iter().find(|(id, _, _)| id == "P0").expect("template P0");
-        let output_p0 = output_ps.iter().find(|(id, _, _)| id == "P0").expect("output P0");
+        let template_p0 = template_ps
+            .iter()
+            .find(|(id, _, _)| id == "P0")
+            .expect("template P0");
+        let output_p0 = output_ps
+            .iter()
+            .find(|(id, _, _)| id == "P0")
+            .expect("output P0");
         assert_eq!(
             &template_part[template_p0.1..template_p0.2],
             &output_part[output_p0.1..output_p0.2],
@@ -4614,9 +4626,8 @@ mod tests {
             tracked_audit_genuine_output_for(&workdir, prior_author_edit("P0", 2, "tail", "TAIL"));
         let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
             let open = xml.find("<w:del ").expect("prior del present");
-            let end = open
-                + xml[open..].find("</w:del>").expect("prior del closes")
-                + "</w:del>".len();
+            let end =
+                open + xml[open..].find("</w:del>").expect("prior del closes") + "</w:del>".len();
             format!("{}{}", &xml[..open], &xml[end..])
         });
         let evidence = tracked_audit_write(&workdir, &output, &tampered);
@@ -4649,11 +4660,7 @@ mod tests {
             prior_author_edit("P1", 1, "opens early", "OPENS EARLY"),
         );
         let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
-            xml.replacen(
-                "w:author=\"agent-author\"",
-                "w:author=\"intruder\"",
-                1,
-            )
+            xml.replacen("w:author=\"agent-author\"", "w:author=\"intruder\"", 1)
         });
         let evidence = tracked_audit_write(&workdir, &output, &tampered);
         let detail = evidence
@@ -4662,7 +4669,10 @@ mod tests {
             .find(|check| check.name == "edited-part-exact")
             .and_then(|check| check.detail.clone())
             .unwrap_or_default();
-        assert_eq!(evidence.verdict, "fail", "a disagreeing run must not verify");
+        assert_eq!(
+            evidence.verdict, "fail",
+            "a disagreeing run must not verify"
+        );
         assert!(
             detail.contains("runs of one deletion disagree"),
             "the disagreement message must survive scoping, got: {detail}"
@@ -4675,14 +4685,23 @@ mod tests {
         // refuse with the del/ins disagreement string.
         let (workdir, output) = tracked_audit_setup_for(
             PRIOR_AUTHOR_TEMPLATE,
-            &tracked_audit_sidecar_in("P1", "agent-author", "2026-10-18T00:00:00Z", 1, "opens early", "OPENS EARLY"),
+            &tracked_audit_sidecar_in(
+                "P1",
+                "agent-author",
+                "2026-10-18T00:00:00Z",
+                1,
+                "opens early",
+                "OPENS EARLY",
+            ),
         );
         let edit = prior_author_edit("P1", 1, "opens early", "OPENS EARLY");
         let legal = tracked_audit_genuine_output_for(&workdir, edit);
         let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
             // The insertion is the last agent-author revision: restamp the LAST
             // occurrence, not the prior or the deletion half.
-            let open = xml.rfind("w:author=\"agent-author\"").expect("agent ins present");
+            let open = xml
+                .rfind("w:author=\"agent-author\"")
+                .expect("agent ins present");
             format!(
                 "{}w:author=\"intruder\"{}",
                 &xml[..open],
@@ -4696,7 +4715,10 @@ mod tests {
             .find(|check| check.name == "edited-part-exact")
             .and_then(|check| check.detail.clone())
             .unwrap_or_default();
-        assert_eq!(evidence.verdict, "fail", "a restamped insertion must not verify");
+        assert_eq!(
+            evidence.verdict, "fail",
+            "a restamped insertion must not verify"
+        );
         assert!(
             detail.contains("deletion and the insertion disagree"),
             "the del/ins disagreement message must survive scoping, got: {detail}"
