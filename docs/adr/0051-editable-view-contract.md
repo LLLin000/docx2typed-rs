@@ -196,9 +196,14 @@ identity, count and order unchanged and is refused by `non-target-preserved`;
 identity/order checks alone are not presented as source-position proof.
 
 The historical **432-document** scan is not a result of this gate. Its original
-manifest is unavailable in the retained records, and a new inventory must not be
-silently presented as that corpus. A future classified run requires a frozen
-input manifest and matching binary/view-contract metadata. Success, accurate
-early refusal, contract failure and inconclusive infrastructure/oracle results
-must remain separate; no-match queries and unproven target-occurrence linkage
-are not successful edits or accurate-refusal evidence.
+manifest is unavailable in the retained records. The separately approved
+**217-document** inventory defines the new `real-docx-corpus-v1`; it is neither
+an equivalent replacement for the historical corpus nor a condition for this
+PR's core-correctness closure.
+
+The new run requires a frozen SHA-256 manifest and matching binary/view-contract
+metadata. Its completed outcomes are `PASS`, `EXPECTED_REJECT`,
+`NOT_APPLICABLE` and `CONTRACT_FAILURE`. Infrastructure or oracle uncertainty is
+an incomplete scan, not a successful edit or an accurate refusal. No eligible
+safe target is reported separately from a named, independently justified
+unsupported target; an unproven target-occurrence linkage cannot pass.

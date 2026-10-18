@@ -139,3 +139,47 @@ Additionally:
 - `tools/list` returns 5.
 - The four edit-looking legacy names are absent from it.
 - A fresh agent that has read only the five descriptions can complete: open a real patent → find a claim term → change it → save → confirm the built file changed — with **zero** calls outside the five and zero retries caused by a guessed convention.
+
+## 7. Evidence (PR69, HEAD 9815fa8, CI run 39098870126)
+
+Surface acceptance is the Rust `agent_surface.rs` workflow gate plus the 19
+`qualification/facade_task_suite.py --surface` consumer tasks. Core gates are
+green (Rust tests and oracle qualifications); both package jobs failed the
+surface suite 16/19 on three stale assertions, not on engine behaviour:
+
+- `unify_no_match_is_informational` and `edit_example_parameter` asserted
+  `counts.matches == 0`. `inserted_paragraph_is_editable` asserted
+  `counts.matches == 1`. The current `document_find` reply carries no
+  `counts.matches` field (`src/surface/find.rs`): the consumer-visible count
+  is `counts.occurrences` (occurrences on this page, summed over the
+  per-occurrence verdicts the caller acts on) alongside the document-wide
+  `counts.total_matches` inherited from the search, plus `editable`,
+  `not_editable`, `blocks`, paging, and `complete`. The evaluator reads a
+  missing path as `None`, hence `got None want 0/1`. The fix asserts the
+  current semantics with exact expected counts — `occurrences` and
+  `total_matches`, including the zero-match case — and adds no alias or
+  engine change.
+- The three `#[ignore]` emitters are opt-in fixture writers, not skipped
+  correctness: `rust-tests/style_id_differential.rs::emit_style_id_fixture`
+  (writes `STYLE_ID_FIXTURE`, default `C:/tmp/styleids.json`) and
+  `rust-tests/token_table_differential.rs::emit_token_table_fixture`
+  (writes `TOKEN_FIXTURE`, default `C:/tmp/tokens.json`) emit Rust-side maps
+  for manual comparison — the style-id comment names the historical
+  `scripts/check_style_ids.py` consumer, the token-table comment points at
+  the PR notes; and
+  `crates/docx2typed-store/tests/pool_objects.rs::emit_cross_read_fixture`
+  (writes `POOL_FIXTURE`, default `C:/tmp/poolxread`, honouring `STATE_DIR`
+  for a real extracted workdir) emits pool objects for manual cross-language
+  inspection. Neither historical `check_style_ids.py` nor `check_cross_read.py`
+  ships in the current tree. These emitters do not themselves assert comparison
+  results and are not counted as correctness coverage. Keeping them opt-in
+  prevents normal test runs from writing or deleting fixture destinations.
+  The baseline, reconciliation, protected-structure, format and publication
+  assertions run in the non-ignored workspace tests.
+
+Acceptance commands:
+
+```text
+cargo test --test agent_surface
+PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python qualification/facade_task_suite.py --surface
+```
