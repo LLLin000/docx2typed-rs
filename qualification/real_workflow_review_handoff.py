@@ -557,16 +557,33 @@ def run_lane(manifest: Path, outdir: Path, binpath: Path,
               f"sha {prepared_sha[:12]} revs={payload.get('revisionCount')} "
               f"comments={payload.get('commentCount')}")
         artifacts["prepared_sha256"] = prepared_sha
+        # Actual host identity: prepare is allowed to record whatever author
+        # Word reports (host resets UserName); never alias to PRIOR_AUTHOR.
+        prep_revs = payload.get("revisions") or []
+        prep_comments = payload.get("comments") or []
+        prep_rev_set = sorted(
+            (str(r.get("author")), str(r.get("type")), str(r.get("text")))
+            for r in prep_revs if isinstance(r, dict))
+        prep_comment_set = sorted(
+            (str(c.get("author")), str(c.get("text"))) for c in prep_comments
+            if isinstance(c, dict))
+        prep_comment_anchors = sorted(
+            str(c.get("anchor") or c.get("scope")) for c in prep_comments
+            if isinstance(c, dict))
         artifacts["preparation"] = {
-            "prior_author": PRIOR_AUTHOR,
+            "requested_prior_author": PRIOR_AUTHOR,
+            "actual_revision_identities": prep_rev_set,
+            "actual_comment_identities": prep_comment_set,
             "prior_old_sha256": _sha256_text(prior_old),
             "prior_new_sha256": _sha256_text(prior_new),
             "comment_anchor_sha256": _sha256_text(anchor),
             "ops": ["range-Find tracked replace (prior author)",
                     "classic comment add on known passage"],
         }
-        (stage / "prepare.word.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if not prep_rev_set:
+            raise _HarnessError("prepare produced no tracked revisions")
+        if not prep_comment_set:
+            raise _HarnessError("prepare produced no comments")
 
         workdir = stage / "prepared.docx2typed"
         envelope = _cli(binpath, ["--json", "extract", str(prepared),
@@ -644,25 +661,39 @@ def run_lane(manifest: Path, outdir: Path, binpath: Path,
             json.dumps(inspected, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         revs = inspected.get("revisions") or []
         comments = inspected.get("comments") or []
-        prior_revs = [r for r in revs if r.get("author") == PRIOR_AUTHOR]
-        agent_revs = [r for r in revs if r.get("author") == AGENT_AUTHOR]
-        prior_comment = [c for c in comments if c.get("author") == PRIOR_AUTHOR]
+        b_rev_set = sorted(
+            (str(r.get("author")), str(r.get("type")), str(r.get("text")))
+            for r in revs if isinstance(r, dict))
+        b_comment_set = sorted(
+            (str(c.get("author")), str(c.get("text"))) for c in comments
+            if isinstance(c, dict))
+        b_anchors = sorted(
+            str(c.get("anchor") or c.get("scope")) for c in comments
+            if isinstance(c, dict))
         _step("word-inspect-B", True,
               f"revs={len(revs)} comments={len(comments)}")
-        prior_semantic = any(prior_new in (r.get("text") or "")
-                             or prior_new in (r.get("context") or "")
-                             for r in prior_revs)
-        _assert("prior-revision-identity-semantic", bool(prior_revs) and prior_semantic,
-                f"prior_revs={len(prior_revs)}")
-        agent_semantic = any(agent_new in (r.get("text") or "")
-                             or agent_new in (r.get("context") or "")
-                             for r in agent_revs)
-        _assert("agent-revision-present-with-meaning", bool(agent_revs) and agent_semantic,
+        # Prior set must survive exactly (semantic multiset, prepared identity);
+        # agent adds exactly its own distinct-authored revision(s).
+        _assert("prior-revisions-preserved-exact-multiset",
+                all(item in b_rev_set for item in prep_rev_set),
+                f"prep={len(prep_rev_set)} in_B={len(b_rev_set)}")
+        agent_revs = [r for r in revs
+                      if str(r.get("author")) == AGENT_AUTHOR and isinstance(r, dict)]
+        _assert("agent-revisions-distinct-author-present",
+                bool(agent_revs)
+                and all(str(r.get("author")) not in {a for a, _, _ in prep_rev_set}
+                        for r in agent_revs)
+                and any(agent_new in (r.get("text") or "")
+                        or agent_new in (r.get("context") or "") for r in agent_revs),
                 f"agent_revs={len(agent_revs)}")
-        comment_ok = any(PRIOR_COMMENT_TEXT in (c.get("text") or "") for c in prior_comment)
-        _assert("prior-comment-anchor-usable", comment_ok,
+        _assert("agent-author-distinct-from-prepared",
+                AGENT_AUTHOR not in {a for a, _, _ in prep_rev_set}, "")
+        _assert("prior-comments-preserved-anchor",
+                all(item in b_comment_set for item in prep_comment_set)
+                and all(a in b_anchors for a in prep_comment_anchors),
                 f"comments={len(comments)}")
-        if not (prior_revs and prior_semantic and agent_revs and agent_semantic and comment_ok):
+        if not (all(item in b_rev_set for item in prep_rev_set) and agent_revs
+                and all(item in b_comment_set for item in prep_comment_set)):
             raise _ProductError("word inspect B identity mismatch")
 
         accept_path = stage / "accept_agent_only.docx"
@@ -691,80 +722,112 @@ def run_lane(manifest: Path, outdir: Path, binpath: Path,
         (stage / "reject.word.json").write_text(
             json.dumps(rejected, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-        accept_text = accepted.get("text") or ""
-        reject_text = rejected.get("text") or ""
+        # Real Word REOPEN of the actual saved copies in new Word instances:
+        # inspect text/revisions/comments from disk, never the pre-save memory
+        # snapshot. Semantic proof, not counts.
+        accept_re = _word_call("inspect", {"InputPath": str(accept_path)},
+                               stage, "reopen-accept", timeout, calls_log)
+        reject_re = _word_call("inspect", {"InputPath": str(reject_path)},
+                               stage, "reopen-reject", timeout, calls_log)
+        if not accept_re.get("ok") or not reject_re.get("ok"):
+            _raise_word("reopen accept/reject",
+                        accept_re if not accept_re.get("ok") else reject_re)
+        (stage / "reopen-accept.word.json").write_text(
+            json.dumps(accept_re, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (stage / "reopen-reject.word.json").write_text(
+            json.dumps(reject_re, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        accept_text = accept_re.get("text") or ""
+        reject_text = reject_re.get("text") or ""
         _assert("accept-copy-shows-agent-new",
                 agent_new in accept_text and agent_old not in accept_text, "")
         _assert("reject-copy-shows-agent-old",
                 agent_old in reject_text and agent_new not in reject_text, "")
-        accept_prior_left = [r for r in (accepted.get("revisions") or [])
-                             if r.get("author") == PRIOR_AUTHOR]
-        reject_prior_left = [r for r in (rejected.get("revisions") or [])
-                             if r.get("author") == PRIOR_AUTHOR]
-        _assert("prior-revision-untouched-in-both",
-                bool(accept_prior_left) and bool(reject_prior_left),
-                f"left={len(accept_prior_left)}/{len(reject_prior_left)}")
-        accept_comments_ok = any(PRIOR_COMMENT_TEXT in (c.get("text") or "")
-                                 for c in (accepted.get("comments") or []))
-        reject_comments_ok = any(PRIOR_COMMENT_TEXT in (c.get("text") or "")
-                                 for c in (rejected.get("comments") or []))
-        _assert("comments-survive-both-copies",
-                accept_comments_ok and reject_comments_ok, "")
-        # Old workdir must not silently overwrite Word-touched C: rebuild a
-        # stale-publication probe against the untouched workdir (refusal path
-        # only; no committed state is altered). Snapshot BEFORE the probe for
-        # no-write proof; host-owned C logging aside, nothing outside the work
-        # area is asserted.
-        word_c = stage / "word_operator_C.docx"
-        touched = _word_call("touch",
-                             {"InputPath": str(agent_path), "Out": str(word_c),
-                              "PriorAuthor": PRIOR_AUTHOR,
-                              "CommentText": "Operator follow-up sentence for stale check."},
-                             stage, "operator-C", timeout, calls_log)
-        if not touched.get("ok"):
-            _raise_word("operator C", touched)
-        artifacts["word_operator_C_sha256"] = _sha256_file(word_c)
-        stale_pre_tree = _tree_hashes(stage)
-        stale_pre_workdir = _tree_hashes(workdir)
-        # Re-extract C into the SAME logical workdir without the deliberate
-        # discard flag must refuse (guard intact); that refusal is the
-        # expected stale-publication outcome with content-hash no-write proof.
-        stale_env = _cli(binpath, ["--json", "extract", str(word_c),
-                                   "-o", str(workdir)], timeout, calls_log,
-                         "stale-extract-must-refuse")
-        stale_codes = _codes(stale_env)
-        stale_post_tree = _tree_hashes(stage)
-        stale_post_workdir = _tree_hashes(workdir)
-        stale_clean = (stale_post_tree == stale_pre_tree
-                       and stale_post_workdir == stale_pre_workdir
-                       and stale_env.get("outcome") != "success"
-                       and any("workdir-not-at-baseline" in code
-                               or "not-at-baseline" in code for code in stale_codes))
-        _step("stale-publication-refused", stale_clean, f"codes={stale_codes}")
-        _assert("stale-workdir-must-refuse-with-no-write", stale_clean,
-                f"codes={stale_codes}")
-        if stale_clean:
-            # Safe continuation: explicit re-extract of C into the same logical
-            # workdir with the deliberate discard flag, only after exported B
-            # is retained; records baseline epoch + template fingerprint + CLI
-            # args. The incoming file C becomes the new source of truth.
-            cont_env = _cli(binpath, ["--json", "extract", str(word_c),
-                                      "-o", str(workdir),
-                                      "--discard-committed-versions"],
-                            timeout, calls_log, "explicit-continue-C")
-            epoch_c = _read_baseline_epoch(workdir)
-            fp_c = _read_template_fingerprint(workdir)
-            artifacts["safe_continue"] = {
-                "epoch_C": epoch_c, "template_fingerprint_C": fp_c,
-                "cli": ["extract", "--discard-committed-versions"],
+        a_rev_set = sorted(
+            (str(r.get("author")), str(r.get("type")), str(r.get("text")))
+            for r in (accept_re.get("revisions") or []) if isinstance(r, dict))
+        r_rev_set = sorted(
+            (str(r.get("author")), str(r.get("type")), str(r.get("text")))
+            for r in (reject_re.get("revisions") or []) if isinstance(r, dict))
+        _assert("prior-revisions-preserved-exact-both-copies",
+                all(item in a_rev_set for item in prep_rev_set)
+                and all(item in r_rev_set for item in prep_rev_set),
+                f"prep={len(prep_rev_set)} accept={len(a_rev_set)} reject={len(r_rev_set)}")
+        a_comment_set = sorted(
+            (str(c.get("author")), str(c.get("text")))
+            for c in (accept_re.get("comments") or []) if isinstance(c, dict))
+        r_comment_set = sorted(
+            (str(c.get("author")), str(c.get("text")))
+            for c in (reject_re.get("comments") or []) if isinstance(c, dict))
+        a_anchors = sorted(
+            str(c.get("anchor") or c.get("scope"))
+            for c in (accept_re.get("comments") or []) if isinstance(c, dict))
+        r_anchors = sorted(
+            str(c.get("anchor") or c.get("scope"))
+            for c in (reject_re.get("comments") or []) if isinstance(c, dict))
+        _assert("comments-anchor-match-prepared-both-copies",
+                all(item in a_comment_set for item in prep_comment_set)
+                and all(item in r_comment_set for item in prep_comment_set)
+                and all(a in a_anchors for a in prep_comment_anchors)
+                and all(a in r_anchors for a in prep_comment_anchors),
+                f"prep_comments={len(prep_comment_set)}")
+        # Stale protection probe (distinct goal): refusal is safe-protection
+        # evidence recorded in artifacts, NOT a gate on the selective outcome.
+        stale_outcome: str | None = None
+        stale_completion = "COMPLETE"
+        try:
+            word_c = stage / "word_operator_C.docx"
+            touched = _word_call("touch",
+                                 {"InputPath": str(agent_path), "Out": str(word_c),
+                                  "PriorAuthor": PRIOR_AUTHOR,
+                                  "CommentText": "Operator follow-up sentence for stale check."},
+                                 stage, "operator-C", timeout, calls_log)
+            if not touched.get("ok"):
+                _raise_word("operator C", touched)
+            artifacts["word_operator_C_sha256"] = _sha256_file(word_c)
+            stale_pre_tree = _tree_hashes(stage)
+            stale_pre_workdir = _tree_hashes(workdir)
+            stale_env = _cli(binpath, ["--json", "extract", str(word_c),
+                                       "-o", str(workdir)], timeout, calls_log,
+                             "stale-extract-must-refuse")
+            stale_codes = _codes(stale_env)
+            stale_post_tree = _tree_hashes(stage)
+            stale_post_workdir = _tree_hashes(workdir)
+            stale_clean = (stale_post_tree == stale_pre_tree
+                           and stale_post_workdir == stale_pre_workdir
+                           and stale_env.get("outcome") != "success"
+                           and any("workdir-not-at-baseline" in code
+                                   or "not-at-baseline" in code for code in stale_codes))
+            artifacts["stale_protection"] = {
+                "refused": bool(stale_clean), "codes": stale_codes,
             }
-            _step("explicit-continue-C", cont_env.get("outcome") == "success",
-                  f"epoch={epoch_c}")
-            _assert("safe-continue-records-new-baseline",
+            _step("stale-publication-refused", stale_clean, f"codes={stale_codes}")
+            if stale_clean:
+                cont_env = _cli(binpath, ["--json", "extract", str(word_c),
+                                          "-o", str(workdir),
+                                          "--discard-committed-versions"],
+                                timeout, calls_log, "explicit-continue-C")
+                epoch_c = _read_baseline_epoch(workdir)
+                fp_c = _read_template_fingerprint(workdir)
+                artifacts["safe_continue"] = {
+                    "epoch_C": epoch_c, "template_fingerprint_C": fp_c,
+                    "cli": ["extract", "--discard-committed-versions"],
+                }
+                _step("explicit-continue-C", cont_env.get("outcome") == "success",
+                      f"epoch={epoch_c}")
+                stale_outcome = PASS if (
                     cont_env.get("outcome") == "success"
                     and (epoch_c or 0) > (epoch_a or 0)
-                    and _sha256_file(word_c) == artifacts["word_operator_C_sha256"], "")
-        if stale_clean and all(a.get("result") == "pass" for a in assertions):
+                    and _sha256_file(word_c) == artifacts["word_operator_C_sha256"]
+                ) else CONTRACT_FAILURE
+            else:
+                stale_outcome = CONTRACT_FAILURE
+        except (_HarnessError, TimeoutError, OSError) as exc:
+            _step("stale-lane-error", False, f"harness: {exc}"[:300])
+            stale_completion = "incomplete"
+            stale_outcome = None
+        artifacts["stale_case"] = {"completion_status": stale_completion,
+                                   "outcome": stale_outcome}
+        if all(a.get("result") == "pass" for a in assertions):
             outcome = PASS
         else:
             outcome = CONTRACT_FAILURE
@@ -916,7 +979,6 @@ def run_lane(manifest: Path, outdir: Path, binpath: Path,
             completion_nb = "incomplete"
             outcome_nb = None
             _step2("cross-boundary-find", False, "transport error: no refusal claim")
-            _assert2("unknown-timeout-is-incomplete", True, "")
         else:
             matches = (find_env.get("data") or {}).get("matches") or []
             occs = [o for m in matches for o in (m.get("occurrences") or [m])
