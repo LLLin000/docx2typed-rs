@@ -96,7 +96,24 @@ impl IndependentVerifier {
                 BTreeMap::new()
             }
         };
-
+        // XML gate (issue #70): strict well-formedness of every XML-bearing
+        // output member BEFORE any text/fidelity acceptance. The verifier's
+        // byte walker is lenient by design, so a duplicated attribute (e.g. a
+        // second `xml:space` from a direct edit) is invisible to the text
+        // checks yet fatal per XML 1.0 §3.1. Runs in both paths; a fail here
+        // fails the verdict via the all-pass rule below.
+        match check_output_xml_wellformed(&request.output) {
+            Ok(detail) => checks.push(VerificationCheck {
+                name: "output-xml-wellformed".to_string(),
+                status: "pass".to_string(),
+                detail: Some(detail),
+            }),
+            Err(detail) => checks.push(VerificationCheck {
+                name: "output-xml-wellformed".to_string(),
+                status: "fail".to_string(),
+                detail: Some(detail),
+            }),
+        }
         // The recorded edits (the only mutation the output may implement).
         // Read independently from the workdir sidecars.
         let islands = load_islands(&request.workdir).unwrap_or_default();
@@ -642,6 +659,39 @@ fn read_member_bytes(package: &[u8], member: &str) -> Option<Vec<u8>> {
         }
     }
     None
+}
+/// Strict XML well-formedness gate (issue #70): every XML-bearing output
+/// member must parse as XML BEFORE any text/fidelity check runs. The
+/// verifier's own byte walker is lenient by design, so a duplicated
+/// attribute (e.g. a second `xml:space` injected by a direct edit onto a
+/// `w:t` that already carries one) is invisible to the text gates yet fatal
+/// per XML 1.0 §3.1 — and silently shipping it corrupts the published
+/// output. `roxmltree` (already in the tree via core) is the strict parser:
+/// duplicate attributes, unclosed tags and bad entities all fail the parse.
+/// `Err` names the offending member deterministically.
+fn check_output_xml_wellformed(output: &Path) -> Result<String, String> {
+    let file = File::open(output).map_err(|_| "output docx unreadable".to_string())?;
+    let mut archive = ZipArchive::new(file).map_err(|_| "output docx unreadable".to_string())?;
+    let mut checked = 0usize;
+    for index in 0..archive.len() {
+        let mut member = archive
+            .by_index(index)
+            .map_err(|_| "output docx unreadable".to_string())?;
+        let name = member.name().to_string();
+        if !(name.ends_with(".xml") || name.ends_with(".rels")) {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        member
+            .read_to_end(&mut bytes)
+            .map_err(|_| format!("member {name}: unreadable"))?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| format!("member {name}: part XML is not UTF-8"))?;
+        roxmltree::Document::parse(text)
+            .map_err(|error| format!("member {name}: not well-formed XML ({error})"))?;
+        checked += 1;
+    }
+    Ok(format!("{checked} xml members well-formed"))
 }
 
 fn short(hash: &str) -> String {
@@ -2889,13 +2939,15 @@ fn needs_xml_space(text: &str) -> bool {
 }
 
 fn inject_xml_space(part: &[u8], open_end: usize) -> Option<(usize, usize, Vec<u8>)> {
-    if part[..open_end]
-        .windows(18)
-        .any(|w| w == b"xml:space=\"preserve\"")
-    {
-        return None;
-    }
     let tag_start = part[..open_end].iter().rposition(|&b| b == b'<')?;
+    for attribute in [b"xml:space=\"preserve\"", b"xml:space='preserve'"] {
+        if part[tag_start..open_end]
+            .windows(attribute.len())
+            .any(|window| window == attribute)
+        {
+            return None;
+        }
+    }
     let insert_at = part[tag_start..open_end]
         .iter()
         .rposition(|&b| b == b'>')
@@ -4073,6 +4125,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn duplicate_xml_space_in_the_edited_target_fails_the_xml_gate() {
+        // Issue #70: a direct edit onto a `w:t` that already carries
+        // `xml:space="preserve"` duplicated the attribute. The lenient byte
+        // walker still matched the text, so every fidelity gate passed on
+        // malformed XML. The XML gate must refuse it — and name the member.
+        let evidence = opaque_audit_tampered_evidence(|xml| {
+            xml.replace(
+                "<w:t>WORLD</w:t>",
+                "<w:t xml:space=\"preserve\" xml:space=\"preserve\">WORLD</w:t>",
+            )
+        });
+        assert_eq!(evidence.verdict, "fail", "malformed XML must not verify");
+        assert_eq!(
+            opaque_audit_check(&evidence, "output-xml-wellformed"),
+            "fail"
+        );
+        let detail = evidence
+            .checks
+            .iter()
+            .find(|check| check.name == "output-xml-wellformed")
+            .and_then(|check| check.detail.clone())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("word/document.xml"),
+            "gate must name the offending member, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn duplicate_attribute_in_an_untouched_member_fails_the_xml_gate() {
+        // Same malformation in a member no edit touched (`word/styles.xml`):
+        // still malformed, still refused — the gate covers the whole output,
+        // not just the recorded target.
+        let (workdir, output) = opaque_audit_setup(OPAQUE_AUDIT_TEMPLATE);
+        let template_pkg = std::fs::read(workdir.join("_template.docx")).expect("template");
+        let legal_xml = opaque_audit_legal_xml();
+        let mut out_pkg =
+            opaque_audit_repack(&template_pkg, "word/document.xml", legal_xml.as_bytes());
+        let styles = opaque_audit_part(&template_pkg, "word/styles.xml");
+        let mut tampered = String::from_utf8(styles).expect("styles utf8");
+        tampered = tampered.replace(
+            "<w:styles",
+            "<w:styles xml:space=\"preserve\" xml:space=\"preserve\"",
+        );
+        out_pkg = opaque_audit_repack(&out_pkg, "word/styles.xml", tampered.as_bytes());
+        std::fs::write(&output, &out_pkg).expect("output");
+        let evidence = opaque_audit_verify(&workdir, &output);
+        assert_eq!(evidence.verdict, "fail", "malformed XML must not verify");
+        assert_eq!(
+            opaque_audit_check(&evidence, "output-xml-wellformed"),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn valid_namespaced_xml_with_declarations_passes_the_xml_gate() {
+        // The gate is strict, not trigger-happy: the legal edited output —
+        // namespaces, preserved declarations, `xml:space` where the text
+        // needs it — verifies clean.
+        let (workdir, output) = opaque_audit_setup(OPAQUE_AUDIT_TEMPLATE);
+        let template_pkg = std::fs::read(workdir.join("_template.docx")).expect("template");
+        let legal_xml = opaque_audit_legal_xml();
+        let spaced = legal_xml.replace(
+            "<w:t>Hello </w:t>",
+            "<w:t xml:space=\"preserve\">Hello </w:t>",
+        );
+        let out_pkg = opaque_audit_repack(&template_pkg, "word/document.xml", spaced.as_bytes());
+        // A single `xml:space` is legal — but it is NOT the recorded edit, so
+        // point the sidecar at the spaced text to keep the exact gate honest:
+        // this test owns the XML gate, not the recomputation.
+        std::fs::write(
+            workdir.join("islands.json"),
+            "{\"schema\":\"docx2typed-islands-1\",\"edits\":[{\"part\":\"document\",\"paragraph_id\":\"P0\",\"leaf_index\":0,\"old\":\"Hello \",\"new\":\"Hello \",\"tracked\":false,\"author\":\"\",\"date\":\"\"},{\"part\":\"document\",\"paragraph_id\":\"P0\",\"leaf_index\":1,\"old\":\"world\",\"new\":\"WORLD\",\"tracked\":false,\"author\":\"\",\"date\":\"\"}]}",
+        )
+        .expect("islands");
+        std::fs::write(&output, &out_pkg).expect("output");
+        let evidence = opaque_audit_verify(&workdir, &output);
+        assert_eq!(
+            opaque_audit_check(&evidence, "output-xml-wellformed"),
+            "pass",
+            "valid namespaced XML must pass the gate: {:?}",
+            evidence.checks
+        );
+    }
     #[test]
     fn core_refuses_a_text_edit_inside_an_opaque_paragraph() {
         // Reachability-side proof, NOT a verifier case: a paragraph containing

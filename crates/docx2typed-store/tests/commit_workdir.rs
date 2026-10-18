@@ -99,3 +99,75 @@ fn delta_change_set_preserves_unnamed_assets() {
     assert_eq!(snap.get("keep.txt").unwrap(), b"keep-bytes");
     assert_eq!(snap.get("added.txt").unwrap(), b"new-bytes");
 }
+
+#[test]
+fn commit_does_not_touch_sibling_workdirs_sharing_a_parent() {
+    // Windows CI reported `.../.docx2typed-commit-<pid>-<n>.tmp/format.json`
+    // as `workdir-invalid`, a different test each run. The commit lifecycle
+    // itself was sound; the fault was a test tail that removed the SHARED
+    // temp parent, sweeping sibling workdirs and in-flight `.tmp` staging
+    // mid-commit. This pins the real invariant at the `commit_workdir` seam:
+    // a commit stages, swaps and cleans up INSIDE its own workdir's parent
+    // while a sibling workdir under the same parent keeps every byte.
+    let parent = std::env::temp_dir().join(format!(
+        "d2t-commit-siblings-{}-{}",
+        std::process::id(),
+        crate_seq()
+    ));
+    let _ = fs::remove_dir_all(&parent);
+    fs::create_dir_all(&parent).unwrap();
+    let left = parent.join("left");
+    let right = parent.join("right");
+    fs::create_dir_all(&left).unwrap();
+    fs::create_dir_all(&right).unwrap();
+    fs::write(left.join("keep.txt"), b"left-bytes").unwrap();
+    fs::write(right.join("keep.txt"), b"right-bytes").unwrap();
+    fs::write(left.join("format.json"), b"{\"left\":true}\n").unwrap();
+    fs::write(right.join("format.json"), b"{\"right\":true}\n").unwrap();
+
+    let change_set = ChangeSet {
+        assets: vec![Asset::Bytes("added.txt".to_string(), b"new-bytes".to_vec())],
+    };
+    WorkdirStore::new()
+        .commit_workdir(&left, &change_set)
+        .expect("commit succeeds");
+
+    assert_eq!(
+        fs::read(right.join("keep.txt")).unwrap(),
+        b"right-bytes",
+        "sibling workdir bytes survive a neighbour commit"
+    );
+    assert_eq!(
+        fs::read(right.join("format.json")).unwrap(),
+        b"{\"right\":true}\n",
+        "sibling format.json survives a neighbour commit — the Windows CI symptom"
+    );
+    assert!(
+        parent.is_dir(),
+        "the shared parent survives the commit lifecycle"
+    );
+    for entry in fs::read_dir(&parent).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.starts_with(".docx2typed-commit"),
+            "staging is removed after commit: {name}"
+        );
+        assert!(
+            !name.starts_with(".docx2typed-commit-old"),
+            "backup is removed after commit: {name}"
+        );
+    }
+    assert_eq!(
+        fs::read(left.join("added.txt")).unwrap(),
+        b"new-bytes",
+        "the committed workdir carries the applied change"
+    );
+    let _ = fs::remove_dir_all(&parent);
+}
+
+fn crate_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
