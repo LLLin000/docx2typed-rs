@@ -1,0 +1,49 @@
+{
+  "same_document_ids": true,
+  "same_manifest_sha256": "ddcd005e6ec46b52aa80d70f6d3befecf6a72060eaaecd468a36652c3b755407",
+  "same_scanner_sha256": "9f6ad2c5bd4f36e6077f3573dfed5517a04e1b7f554cc70b69e6c36a8448f0b9",
+  "changes": [
+    {
+      "document_id": "doc-1517106908a7470346b4a982fbaf1dcc5a58e0fdff82ec5defcb7b972b7d51ee",
+      "before": "CONTRACT_FAILURE",
+      "after": "PASS"
+    },
+    {
+      "document_id": "doc-62602d8f9ebd4449d29e662ece14eee36075cd6bf234012231e19c285b50a5a2",
+      "before": "CONTRACT_FAILURE",
+      "after": "PASS"
+    },
+    {
+      "document_id": "doc-77a6027a6a3f687067f0acccd90b9406c607d4b007ff2ad550611e948fe5e0a5",
+      "before": "CONTRACT_FAILURE",
+      "after": "PASS"
+    },
+    {
+      "document_id": "doc-84a10489c8dcb96cc1ca639f0aa1a34f41a36ee78e702e43c510a4891c323161",
+      "before": "CONTRACT_FAILURE",
+      "after": "PASS"
+    },
+    {
+      "document_id": "doc-a704ca45c445c09fab420aafeefe3d2f59c42df268c8a8e9e7b3c503e8661ce8",
+      "before": "CONTRACT_FAILURE",
+      "after": "PASS"
+    },
+    {
+      "document_id": "doc-b7493b22f7217a155c2163ee769ea0ab0289f8f2d546273d4b5529b520515846",
+      "before": "CONTRACT_FAILURE",
+      "after": "PASS"
+    }
+  ],
+  "before_counts": {
+    "PASS": 210,
+    "EXPECTED_REJECT": 1,
+    "NOT_APPLICABLE": 0,
+    "CONTRACT_FAILURE": 6
+  },
+  "after_counts": {
+    "PASS": 216,
+    "EXPECTED_REJECT": 1,
+    "NOT_APPLICABLE": 0,
+    "CONTRACT_FAILURE": 0
+  }
+}
