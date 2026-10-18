@@ -1,0 +1,99 @@
+{
+  "schema": "real-docx-scan-1",
+  "rules_version": "real-docx-scan-rules-4",
+  "corpus_id": "real-docx-corpus-v1",
+  "binary": {
+    "sha256": "9cb7cce1d2e7561fc5da033d4df0a35089322fb50dbfd9498bb7266ea5dd89ba",
+    "version": "docx2typed-rust 0.2.1 (7d919010e711eff00f515c554c6327edd1814851-dirty)"
+  },
+  "binding": {
+    "bin_sha256": "9cb7cce1d2e7561fc5da033d4df0a35089322fb50dbfd9498bb7266ea5dd89ba",
+    "manifest_sha256": "ddcd005e6ec46b52aa80d70f6d3befecf6a72060eaaecd468a36652c3b755407",
+    "rules_version": "real-docx-scan-rules-4",
+    "scanner_sha256": "9f6ad2c5bd4f36e6077f3573dfed5517a04e1b7f554cc70b69e6c36a8448f0b9",
+    "engine_metadata_sha256": "22b4a6057178152fbecf7e9c45dbb2011c50a4d3d1299fce1162489be934251a"
+  },
+  "documents": 217,
+  "scanned_new": 217,
+  "resumed_skips": 0,
+  "counts": {
+    "PASS": 210,
+    "EXPECTED_REJECT": 1,
+    "NOT_APPLICABLE": 0,
+    "CONTRACT_FAILURE": 6
+  },
+  "incomplete": [],
+  "feature_stratification": {
+    "tables": {
+      "with": {
+        "PASS": 23,
+        "EXPECTED_REJECT": 0,
+        "NOT_APPLICABLE": 0,
+        "CONTRACT_FAILURE": 2
+      },
+      "without": {
+        "PASS": 187,
+        "EXPECTED_REJECT": 1,
+        "NOT_APPLICABLE": 0,
+        "CONTRACT_FAILURE": 4
+      }
+    },
+    "revisions": {
+      "with": {
+        "PASS": 118,
+        "EXPECTED_REJECT": 0,
+        "NOT_APPLICABLE": 0,
+        "CONTRACT_FAILURE": 1
+      },
+      "without": {
+        "PASS": 92,
+        "EXPECTED_REJECT": 1,
+        "NOT_APPLICABLE": 0,
+        "CONTRACT_FAILURE": 5
+      }
+    },
+    "opaque_candidates": {
+      "with": {
+        "PASS": 7,
+        "EXPECTED_REJECT": 0,
+        "NOT_APPLICABLE": 0,
+        "CONTRACT_FAILURE": 3
+      },
+      "without": {
+        "PASS": 203,
+        "EXPECTED_REJECT": 1,
+        "NOT_APPLICABLE": 0,
+        "CONTRACT_FAILURE": 3
+      }
+    },
+    "sdt": {
+      "with": {
+        "PASS": 0,
+        "EXPECTED_REJECT": 0,
+        "NOT_APPLICABLE": 0,
+        "CONTRACT_FAILURE": 1
+      },
+      "without": {
+        "PASS": 210,
+        "EXPECTED_REJECT": 1,
+        "NOT_APPLICABLE": 0,
+        "CONTRACT_FAILURE": 5
+      }
+    },
+    "media": {
+      "with": {
+        "PASS": 58,
+        "EXPECTED_REJECT": 1,
+        "NOT_APPLICABLE": 0,
+        "CONTRACT_FAILURE": 4
+      },
+      "without": {
+        "PASS": 152,
+        "EXPECTED_REJECT": 0,
+        "NOT_APPLICABLE": 0,
+        "CONTRACT_FAILURE": 2
+      }
+    }
+  },
+  "results": "results.jsonl"
+}

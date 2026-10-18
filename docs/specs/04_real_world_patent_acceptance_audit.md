@@ -255,3 +255,97 @@ optimisable: it shares the session-initialisation and validation path with
 `commit_sync`. The remaining work is transaction-shaped, so a batch-edit entry
 point would help more than tuning any one function. At 6.45 s for a full real
 patent round-trip, this is not on the critical path for agent usability.
+
+## 10. Independent `real-docx-corpus-v1` compatibility baseline
+
+This is the separately approved **217 SHA-256-distinct inputs**, not the
+historical 432-document corpus (whose original manifest is unavailable). It is
+not an equivalent replacement for that corpus or an added merge condition for
+PR #69. No Rust core changes were made for this scan.
+
+### Frozen inputs and executed identity
+
+- Source bytes: **249,587,007** total; only exact-byte SHA-256 deduplication.
+  Similar document versions remain separate. The saved inventory was consumed
+  directly, without reselection or another filesystem sweep.
+- Immutable manifest SHA-256:
+  `ddcd005e6ec46b52aa80d70f6d3befecf6a72060eaaecd468a36652c3b755407`.
+- Binary SHA-256:
+  `9cb7cce1d2e7561fc5da033d4df0a35089322fb50dbfd9498bb7266ea5dd89ba`;
+  reported descriptor: `docx2typed-rust 0.2.1
+  (7d919010e711eff00f515c554c6327edd1814851-dirty)`. The dirty descriptor is
+  retained, not rewritten as a clean release claim.
+- Final scanner rules: `real-docx-scan-rules-4`; scanner SHA-256:
+  `9f6ad2c5bd4f36e6077f3573dfed5517a04e1b7f554cc70b69e6c36a8448f0b9`.
+- Anonymous frozen manifest, per-document results and feature-stratified summary:
+  [`qualification/evidence/real-docx-corpus-v1/`](../../qualification/evidence/real-docx-corpus-v1/).
+  Original paths, call arguments, text and full MCP envelopes remain private
+  under `C:/tmp/real-docx-corpus-v1/`; archive bytes are not committed.
+
+### Workflow and final results
+
+Every input first completed a fresh-workdir pristine open → save → reopen:
+**217/217** had identical uncompressed OPC member names and bytes. Eligible
+edits then used a separate fresh copy with `track:false`. Target selection
+resolved the source XML namespace and byte range independently, before find;
+the query was unique under the surface's case-insensitive search semantics.
+The expected `word/document.xml` was sealed before calling the engine.
+Passing required that exact expected XML plus unchanged non-target members,
+not merely a success response or a single diff at an unspecified occurrence.
+
+| Completed classification | Documents |
+|---|---:|
+| `PASS` | 210 |
+| `EXPECTED_REJECT` | 1 |
+| `NOT_APPLICABLE` | 0 |
+| `CONTRACT_FAILURE` | 6 |
+| Infrastructure/oracle incomplete | 0 |
+
+The expected rejection names `P0`, `opaque-paragraph-mutated`, with independently
+matched unsupported structure and a pre/post-probe no-write snapshot. It is
+not counted as an edit. No-match or an unprovable oracle is never a successful
+edit or an accurate refusal. Features overlap: inputs include 25 with tables,
+119 with revisions, 10 with opaque candidates, 1 with SDT and 63 with media;
+`opaque_candidates` is an inventory heuristic, not an engine support verdict.
+
+All six failures share the **+21-byte duplicate `xml:space="preserve"`
+attribute** after an accepted direct edit. They are recorded as failures even
+though edit/save/reopen reported success. See [issue #70](https://github.com/LLLin000/docx2typed-rs/issues/70).
+The source hashes begin `15171069`, `62602d8f`, `77a6027a`, `84a10489`,
+`a704ca45`, `b7493b22`; full hashes are in the committed rows.
+`tests/test_real_docx_contract_regressions.py` is the minimized real-binary
+reproducer: `--runxfail` fails on exact output XML. Its strict xfail records a
+known defect, **not a passing correctness check**. The suspected root cause is
+the 18-byte window compared against the 20-byte `xml:space="preserve"` literal
+in `maybe_inject_xml_space`; no speculative core rewrite was attempted.
+
+Earlier scanner rules exposed harness defects (pagination metadata placement,
+case-insensitive uniqueness, math `m:t` versus Word `w:t`, and snapshot timing).
+Those runs are superseded, not combined with the final totals. The final
+tooling checks passed **37 tests**; the separate known-defect regression
+reported **1 strict xfail**. Archive validation after scanning still returned
+217 matching inputs and the same manifest digest.
+
+### Reproduction and retention
+
+```text
+python qualification/real_docx_corpus.py verify --manifest <archive>/manifest.json
+python qualification/real_docx_scan.py --manifest <archive>/manifest.json --out <new-run> --bin <pinned-binary> --workers 4 --keep-failures
+python -m pytest tests/test_real_docx_corpus.py tests/test_real_docx_scan.py -q
+DOCX2TYPED_BIN=<pinned-binary> python -m pytest tests/test_real_docx_contract_regressions.py --runxfail -q
+```
+
+The archive stores `originals/<sha256>.docx`; manifest IDs are `doc-<sha256>`.
+`verify` rejects changed/missing inputs without relocking. Resume binds the
+manifest, binary, scanner and engine-metadata hashes plus rules version;
+incomplete rows are retried, completed rows skipped. Disk preflight enforces
+2 GiB free; workers are bounded at four. Cleanup only removes descendants of
+the scanner-owned sentinel directory. Successful scratch is removed; failure
+evidence is retained with `--keep-failures`. This is package/XML fidelity and
+engine-reopen evidence, **not a Microsoft Word rendering/no-repair test**.
+
+PR #69's package jobs now both pass after the qualification count fix, but
+run `39099908345` contains a separate Windows workspace failure in
+`store_mutation_replays_byte_exact_and_rejects_reuse` (missing staged
+`format.json`). It is not hidden by the corpus report or a rerun-to-green.
+
