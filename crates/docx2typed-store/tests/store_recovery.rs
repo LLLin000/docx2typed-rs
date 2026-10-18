@@ -564,7 +564,43 @@ fn kill_during_external_publish_rolls_back_verified_backup() {
     let root = scratch("extrollback");
     let store = init_store(&root);
     let output = root.join("out.docx");
-    fs::write(&output, b"prior output").unwrap();
+    // Baseline publish FIRST: without it the target is unknown-existing and
+    // the precondition must refuse (see external_file_version.rs) — the
+    // kill test needs an owned target to roll back to.
+    {
+        let pin = store.pin().unwrap();
+        let out = output.clone();
+        let out2 = output.clone();
+        store
+            .mutate(StoreMutateRequest {
+                workdir: store.root.clone(),
+                operation: "build".to_string(),
+                operation_id: op(),
+                canonical: "baseline".to_string(),
+                input_sha256: pin.manifest_sha256.clone().unwrap_or_default(),
+                expected_generation: pin.generation,
+                generation: false,
+                save_boundary: false,
+                ledger_anchor: Some(out.clone()),
+                ledger_directory: false,
+                evidence_path: Some(PathBuf::from(format!("{}.evidence.json", output.display()))),
+                kind: "build".to_string(),
+                lock_timeout_ms: 0,
+                run: Box::new(move |_target: &Path, tx: &mut Transaction| {
+                    let staged = tx.staging("out.docx");
+                    fs::write(&staged, b"prior output").map_err(StoreError::Io)?;
+                    tx.stage_external(&out2, &staged, "replace")?;
+                    Ok(RunOutcome {
+                        outcome: "success".to_string(),
+                        data: json!({ "output": out2.to_string_lossy().into_owned() }),
+                        kind: "build".to_string(),
+                        payload: json!({ "checks": [] }),
+                        diagnostics: vec![],
+                    })
+                }),
+            })
+            .expect("baseline publish");
+    }
     let operation_id = op();
     let output_for_run = output.clone();
     let output_for_run2 = output.clone();
@@ -618,7 +654,40 @@ fn kill_after_external_publish_recovers_forward() {
     let root = scratch("extforward");
     let store = init_store(&root);
     let output = root.join("out.docx");
-    fs::write(&output, b"prior output").unwrap();
+    {
+        let pin = store.pin().unwrap();
+        let out = output.clone();
+        let out2 = output.clone();
+        store
+            .mutate(StoreMutateRequest {
+                workdir: store.root.clone(),
+                operation: "build".to_string(),
+                operation_id: op(),
+                canonical: "baseline".to_string(),
+                input_sha256: pin.manifest_sha256.clone().unwrap_or_default(),
+                expected_generation: pin.generation,
+                generation: false,
+                save_boundary: false,
+                ledger_anchor: Some(out.clone()),
+                ledger_directory: false,
+                evidence_path: Some(PathBuf::from(format!("{}.evidence.json", output.display()))),
+                kind: "build".to_string(),
+                lock_timeout_ms: 0,
+                run: Box::new(move |_target: &Path, tx: &mut Transaction| {
+                    let staged = tx.staging("out.docx");
+                    fs::write(&staged, b"prior output").map_err(StoreError::Io)?;
+                    tx.stage_external(&out2, &staged, "replace")?;
+                    Ok(RunOutcome {
+                        outcome: "success".to_string(),
+                        data: json!({ "output": out2.to_string_lossy().into_owned() }),
+                        kind: "build".to_string(),
+                        payload: json!({ "checks": [] }),
+                        diagnostics: vec![],
+                    })
+                }),
+            })
+            .expect("baseline publish");
+    }
     let operation_id = op();
     let output_for_run = output.clone();
     let output_for_run2 = output.clone();
@@ -662,6 +731,168 @@ fn kill_after_external_publish_recovers_forward() {
     assert_eq!(fs::read(&output).unwrap(), b"new output");
     assert!(PathBuf::from(format!("{}.operation-ledger.json", output.display())).is_file());
     assert!(PathBuf::from(format!("{}.evidence.json", output.display())).is_file());
+}
+
+/// Kill AFTER the external publish, then Word saves C over the published
+/// bytes before recovery runs: recovery must quarantine (needs-recovery),
+/// NEVER roll C back to the journal's bytes. C stays exact, sidecars
+/// untouched.
+#[test]
+fn kill_after_external_publish_then_word_c_recovers_quarantine_leaving_c() {
+    let _suite = suite_lock();
+    clear_faults();
+    let root = scratch("extforward-wordc");
+    let store = init_store(&root);
+    let output = root.join("out.docx");
+    let sidecar = PathBuf::from(format!("{}.evidence.json", output.to_string_lossy()));
+    {
+        let pin = store.pin().unwrap();
+        let out = output.clone();
+        let out2 = output.clone();
+        store
+            .mutate(StoreMutateRequest {
+                workdir: store.root.clone(),
+                operation: "build".to_string(),
+                operation_id: op(),
+                canonical: "baseline".to_string(),
+                input_sha256: pin.manifest_sha256.clone().unwrap_or_default(),
+                expected_generation: pin.generation,
+                generation: false,
+                save_boundary: false,
+                ledger_anchor: Some(out.clone()),
+                ledger_directory: false,
+                evidence_path: Some(sidecar.clone()),
+                kind: "build".to_string(),
+                lock_timeout_ms: 0,
+                run: Box::new(move |_target: &Path, tx: &mut Transaction| {
+                    let staged = tx.staging("out.docx");
+                    fs::write(&staged, b"prior output").map_err(StoreError::Io)?;
+                    tx.stage_external(&out2, &staged, "replace")?;
+                    Ok(RunOutcome {
+                        outcome: "success".to_string(),
+                        data: json!({ "output": out2.to_string_lossy().into_owned() }),
+                        kind: "build".to_string(),
+                        payload: json!({ "checks": [] }),
+                        diagnostics: vec![],
+                    })
+                }),
+            })
+            .expect("baseline publish");
+    }
+    let operation_id = op();
+    let output_for_run = output.clone();
+    let output_for_run2 = output.clone();
+    kill_at("journal-write-external-published"); // publish already landed
+    let pin = store.pin().unwrap();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        store.mutate(StoreMutateRequest {
+            workdir: store.root.clone(),
+            operation: "build".to_string(),
+            operation_id: operation_id.clone(),
+            canonical: "c".to_string(),
+            input_sha256: pin.manifest_sha256.clone().unwrap_or_default(),
+            expected_generation: pin.generation,
+            generation: false,
+            save_boundary: false,
+            ledger_anchor: Some(output_for_run.clone()),
+            ledger_directory: false,
+            evidence_path: Some(sidecar.clone()),
+            kind: "build".to_string(),
+            lock_timeout_ms: 0,
+            run: Box::new(move |_target: &Path, tx: &mut Transaction| {
+                let staged = tx.staging("out.docx");
+                fs::write(&staged, b"new output").map_err(StoreError::Io)?;
+                tx.stage_external(&output_for_run2, &staged, "replace")?;
+                Ok(RunOutcome {
+                    outcome: "success".to_string(),
+                    data: json!({ "output": output_for_run2.to_string_lossy().into_owned() }),
+                    kind: "build".to_string(),
+                    payload: json!({ "checks": [] }),
+                    diagnostics: vec![],
+                })
+            }),
+        })
+    }));
+    assert_kill(result);
+    clear_faults();
+    // Word saves C over the just-published bytes BEFORE recovery runs.
+    fs::write(&output, b"C-word-edit-after-publish").unwrap();
+    let sidecar_c = fs::read(&sidecar).expect("sidecar still present");
+    let recovered = Store::open(&root).unwrap().recover(true).unwrap();
+    assert!(
+        !recovered.needs_recovery.is_empty(),
+        "external C over a prepared-but-unclosed publish must quarantine, not roll forward/back: {:?}",
+        recovered.needs_recovery
+    );
+    // C exact, sidecar untouched — recovery never overwrites the external file.
+    // (The sidecar on disk is the killed run's own evidence — operation B,
+    // not the baseline's — and recovery must not touch it either way.)
+    assert_eq!(fs::read(&output).unwrap(), b"C-word-edit-after-publish");
+    assert_eq!(fs::read(&sidecar).unwrap(), sidecar_c);
+}
+
+/// Kill BEFORE the external publish (prepared journal only), then Word
+/// creates C at the target before recovery runs: recovery must NOT delete
+/// C and must NOT complete the publish — quarantine, target left exact.
+#[test]
+fn kill_before_external_publish_then_c_appears_recovers_quarantine_keeping_c() {
+    let _suite = suite_lock();
+    clear_faults();
+    let root = scratch("extprepared-wordc");
+    let store = init_store(&root);
+    let output = root.join("out.docx");
+    let operation_id = op();
+    let output_for_run = output.clone();
+    let output_for_run2 = output.clone();
+    // Crash after the prepared record, before any external publish. The
+    // fire hook on the publish cut fires first — kill there.
+    kill_at("external-publish-out.docx");
+    let pin = store.pin().unwrap();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        store.mutate(StoreMutateRequest {
+            workdir: store.root.clone(),
+            operation: "build".to_string(),
+            operation_id: operation_id.clone(),
+            canonical: "c".to_string(),
+            input_sha256: pin.manifest_sha256.clone().unwrap_or_default(),
+            expected_generation: pin.generation,
+            generation: false,
+            save_boundary: false,
+            ledger_anchor: Some(output_for_run.clone()),
+            ledger_directory: false,
+            evidence_path: Some(PathBuf::from(format!("{}.evidence.json", output.display()))),
+            kind: "build".to_string(),
+            lock_timeout_ms: 0,
+            run: Box::new(move |_target: &Path, tx: &mut Transaction| {
+                let staged = tx.staging("out.docx");
+                fs::write(&staged, b"new output").map_err(StoreError::Io)?;
+                tx.stage_external(&output_for_run2, &staged, "replace")?;
+                Ok(RunOutcome {
+                    outcome: "success".to_string(),
+                    data: json!({ "output": output_for_run2.to_string_lossy().into_owned() }),
+                    kind: "build".to_string(),
+                    payload: json!({ "checks": [] }),
+                    diagnostics: vec![],
+                })
+            }),
+        })
+    }));
+    assert_kill(result);
+    clear_faults();
+    assert!(!output.exists(), "nothing published before the kill");
+    // Word creates C at the target BEFORE recovery runs.
+    fs::write(&output, b"C-appeared-before-recovery").unwrap();
+    let recovered = Store::open(&root).unwrap().recover(true).unwrap();
+    assert!(
+        !recovered.needs_recovery.is_empty(),
+        "C appearing before recovery of a prepared publish must quarantine, not delete C: {:?}",
+        recovered.needs_recovery
+    );
+    assert_eq!(
+        fs::read(&output).unwrap(),
+        b"C-appeared-before-recovery",
+        "recovery must not delete external C"
+    );
 }
 
 /// ENOSPC releases the 1 MiB reserve and locks the workdir read-only until

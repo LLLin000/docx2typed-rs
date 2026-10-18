@@ -1317,20 +1317,39 @@ fn sequence_fuzz() {
 fn a_save_publishes_only_what_it_verified() {
     let (dir, workdir) = opened("save-publish");
     let target = handle(&workdir, "中文区域内容");
-    let out = dir.join("published.docx");
-    std::fs::write(&out, b"a file that was here first").expect("placeholder");
-
+    // Baseline publish first: an unknown-existing placeholder is NOT this
+    // workdir's publication and must refuse (external-file-changed). The
+    // test's intent — save publishes exactly what it verified — is preserved:
+    // establish ownership with a first save, then verify the second.
+    let first = dir.join("published.docx");
     let replies = mcp(&[
         ("document_open", json!({ "source": workdir })),
         (
             "document_edit",
             json!({ "edits": [{ "handle": target, "replace_with": "中文区块区域内容" }] }),
         ),
+        (
+            "document_save",
+            json!({ "output": first.to_string_lossy() }),
+        ),
+    ]);
+    assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
+    // Second save over a NEW path again (each output path is owned by its own
+    // first publish): the intent — the publish lands exactly the verified
+    // package — now asserted on the second output.
+    let target = handle(&workdir, "中文区块区域内容");
+    let out = dir.join("published2.docx");
+    let replies = mcp(&[
+        ("document_open", json!({ "source": workdir })),
+        (
+            "document_edit",
+            json!({ "edits": [{ "handle": target, "replace_with": "中文区块区域内容B" }] }),
+        ),
         ("document_save", json!({ "output": out.to_string_lossy() })),
     ]);
     assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
     assert!(
-        built_text(&out).contains("中文区块区域内容"),
+        built_text(&out).contains("中文区块区域内容B"),
         "the publish replaced the old file with the built package"
     );
     // The build happens out of the way: nothing of it is left beside the file,
@@ -1352,7 +1371,8 @@ fn a_save_publishes_only_what_it_verified() {
         "a staged build was left behind: {staged:?}"
     );
     assert!(
-        out.with_file_name("published.docx.evidence.json").is_file(),
+        out.with_file_name("published2.docx.evidence.json")
+            .is_file(),
         "the build's evidence did not follow the document to its published name"
     );
 
@@ -1735,9 +1755,11 @@ fn an_interrupted_publication_is_reported_and_the_old_document_survives() {
     assert_eq!(outcome(&replies[2]), "success", "{:?}", replies[2]);
     let published = std::fs::read(&out).expect("published");
 
-    // A second edit, and then a publication that cannot finish: the document is
-    // held, so the last rename of the publication fails while the evidence has
-    // already been moved into place.
+    // A second edit, and then a publication that cannot even start: the
+    // document is held without delete sharing, so the fail-closed guard
+    // refuses BEFORE any write — old document survives, zero staged
+    // leftovers, sidecars still describe the surviving version (consistent,
+    // not mixed: nothing was published, so there is no half-state).
     let second = handle(&workdir, "中文区块区域内容");
     let replies = mcp(&[
         ("document_open", json!({ "source": workdir })),
@@ -1758,7 +1780,7 @@ fn an_interrupted_publication_is_reported_and_the_old_document_survives() {
     assert_eq!(
         std::fs::read(&out).expect("still there"),
         published,
-        "an interrupted publication replaced the document it could not finish replacing"
+        "a refused publication replaced the document it never published"
     );
     let mut staged: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&*dir).expect("scratch") {
@@ -1773,21 +1795,23 @@ fn an_interrupted_publication_is_reported_and_the_old_document_survives() {
     }
     assert!(
         staged.is_empty(),
-        "a staged build was left behind: {staged:?}"
+        "a refused publish left a staged build behind: {staged:?}"
     );
 
-    // And the half-state is *detectable*: the evidence beside the surviving
-    // document describes the build that did not land.
+    // No half-state exists to detect: the guard refused before ANY sidecar
+    // moved, so the evidence beside the surviving document still describes
+    // exactly it.
     let replies = mcp(&[("document_open", json!({ "source": out.to_string_lossy() }))]);
     assert_eq!(outcome(&replies[0]), "success", "{:?}", replies[0]);
     assert_eq!(
         data(&replies[0])["sidecars"]["state"],
-        "mixed",
-        "the interrupted publication left a set that claims to be one version: {:?}",
+        "consistent",
+        "a refused publish must leave one version, not a mixed set: {:?}",
         data(&replies[0])["sidecars"]
     );
 
-    // Which is a state the next save clears: it rewrites both halves.
+    // Which is a state the next save advances normally: it publishes the
+    // pending edit over the surviving version.
     let replies = mcp(&[
         (
             "document_open",
