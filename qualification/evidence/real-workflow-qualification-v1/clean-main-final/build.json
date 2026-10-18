@@ -1,0 +1,56 @@
+{
+  "schema": "real-workflow-clean-integration-build-1",
+  "git_commit": "32587ef925988100f41d4d27974ea675cdc0510c",
+  "git_ref": "main",
+  "working_tree_clean_before_build": true,
+  "binary": {
+    "sha256": "d2d5ddc73862a89cf526ffe1e5857c8b23c48bb0730bd47a972b118e6314d14c",
+    "version": "docx2typed-rust 0.2.1 (32587ef925988100f41d4d27974ea675cdc0510c)"
+  },
+  "checks": {
+    "cargo test --workspace": {
+      "passed": 407,
+      "ignored": 3,
+      "failed": 0
+    },
+    "cargo clippy --workspace --all-targets -- -D warnings": "pass",
+    "cargo fmt --all -- --check": "pass"
+  },
+  "qualification_report_checks": {
+    "command": "python -X utf8 -m pytest tests/test_real_workflow_qualification.py -q",
+    "passed": 3,
+    "failed": 0
+  },
+  "runner_sha256": {
+    "real_workflow_word_handoff.py": "379400e2ad875cb335bdcdbc691fcca34f8bc7e5f96ade0cc5099f8476f3c807",
+    "real_workflow_word_handoff.ps1": "eaf7c9d498c5de22b780e6ba6d5ef532bac038412d378bdac5129e63438060dc",
+    "real_workflow_review_handoff.py": "c864c2ef25794ce5e71fbf8153583fe207f16d0adc6115a76691d4804a206ba2",
+    "real_workflow_review_handoff.ps1": "e8ec58ab9675431f9a61156c2d6351928fd80c15bd74e2f01396c95b242677ab",
+    "real_workflow_qualification.py": "0f3e867ff98875bbd8e05baaa3a440c39e0bb6f94df2cf77cf59832f461c742b",
+    "real_docx_scan.py": "9f6ad2c5bd4f36e6077f3573dfed5517a04e1b7f554cc70b69e6c36a8448f0b9"
+  },
+  "manifest_sha256": "ddcd005e6ec46b52aa80d70f6d3befecf6a72060eaaecd468a36652c3b755407",
+  "acceptance": {
+    "workflow_counts": {
+      "CONTRACT_FAILURE": 0,
+      "EXPECTED_REJECT": 2,
+      "PASS": 2,
+      "UNSUPPORTED_WORKFLOW": 0
+    },
+    "historical_inputs": 14,
+    "historical_failures": 0,
+    "corpus_counts": {
+      "PASS": 216,
+      "EXPECTED_REJECT": 1,
+      "NOT_APPLICABLE": 0,
+      "CONTRACT_FAILURE": 0
+    },
+    "corpus_classifications_unchanged": 217
+  },
+  "evidence_sha256": {
+    "corpus-results.jsonl": "29ff48ac0d35f82b070fea37c42148aa51dd18ae94d309a5d46ca5967e19edb7",
+    "corpus-summary.json": "c25289e61c29cca8ae391797c345c0f6ac04b920fe1fefea9bd6b24cfedb5adf",
+    "historical14.json": "61513b1ce4eb4c454b968e343df72aee70f7ac8a9be7e645d680edaae2f18295",
+    "workflow-summary.json": "ad44a9705c375d51484eef1e02834b7b058a806e329616ca5ca7b0d28d4e3dec"
+  }
+}

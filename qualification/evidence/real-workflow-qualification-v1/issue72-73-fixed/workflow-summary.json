@@ -1,0 +1,390 @@
+{
+  "schema": "real-workflow-qualification-1",
+  "qualification_id": "real-workflow-qualification-v1",
+  "scope": [
+    "word-handoff",
+    "review-handoff"
+  ],
+  "excluded": [
+    "Zotero"
+  ],
+  "hosts": [
+    {
+      "name": "Microsoft Word",
+      "version": "16.0",
+      "build": "16.0.20430",
+      "os": "Windows 11",
+      "execution_mode": "word-com-automated-operator",
+      "human_ui_review": "not-run"
+    },
+    {
+      "application": "Microsoft Word",
+      "version": "16.0",
+      "build": "16.0.20430",
+      "os": "Microsoft Windows NT 10.0.26200.0",
+      "execution_mode": "word-com-automated-operator",
+      "human_ui_review": "not-run"
+    }
+  ],
+  "counts": {
+    "CONTRACT_FAILURE": 0,
+    "EXPECTED_REJECT": 2,
+    "PASS": 2,
+    "UNSUPPORTED_WORKFLOW": 0
+  },
+  "unexecuted": 0,
+  "cases": [
+    {
+      "workflow": "word-handoff",
+      "case_id": "word-handoff-success",
+      "input_sha256": "059d686a069007e574cf82b63e3c1c5e8a4ec3d3215c2557612acbb29bd28f7c",
+      "completion_status": "complete",
+      "outcome": "PASS",
+      "binary": {
+        "sha256": "feaee847fbd6f0bff6b5b14cee07f4ec5e45f8506d4c696f39b518ba49b0e349",
+        "version": "docx2typed-rust 0.2.1 (31f2a57823006cb8769336b04f6bdf627457b764-dirty)"
+      },
+      "manifest_sha256": "ddcd005e6ec46b52aa80d70f6d3befecf6a72060eaaecd468a36652c3b755407",
+      "private_report_sha256": "3443be00a8ed2c87b35a06608c800ecc7655019725545ddcd3b3a766495c7af5",
+      "steps": [
+        {
+          "name": "pin-stage-A",
+          "result": "ok"
+        },
+        {
+          "name": "extract-baseline-A",
+          "result": "ok"
+        },
+        {
+          "name": "agent-edit-A",
+          "result": "ok"
+        },
+        {
+          "name": "word-operator-edit",
+          "result": "ok"
+        },
+        {
+          "name": "reextract-baseline-C",
+          "result": "ok"
+        },
+        {
+          "name": "agent-edit-A2",
+          "result": "ok"
+        },
+        {
+          "name": "verdict",
+          "result": "ok"
+        }
+      ],
+      "assertions": [
+        {
+          "id": "agent-A-applied",
+          "pass": true
+        },
+        {
+          "id": "word-edit-visible",
+          "pass": true
+        },
+        {
+          "id": "word-edit-tracked-deletion",
+          "pass": true
+        },
+        {
+          "id": "agent-A-survives-word",
+          "pass": true
+        },
+        {
+          "id": "word-revisions-expected-delta",
+          "pass": true
+        },
+        {
+          "id": "word-preserves-comments",
+          "pass": true
+        },
+        {
+          "id": "word-preserves-sections",
+          "pass": true
+        },
+        {
+          "id": "word-preserves-relationships",
+          "pass": true
+        },
+        {
+          "id": "baseline-advanced",
+          "pass": true
+        },
+        {
+          "id": "template-follows-C",
+          "pass": true
+        },
+        {
+          "id": "word-sees-all-three",
+          "pass": true
+        },
+        {
+          "id": "word-sees-absents-gone",
+          "pass": true
+        },
+        {
+          "id": "final-holds-all-three",
+          "pass": true
+        },
+        {
+          "id": "witness-format-preserved",
+          "pass": true
+        },
+        {
+          "id": "final-preserves-sections",
+          "pass": true
+        },
+        {
+          "id": "final-preserves-comments",
+          "pass": true
+        },
+        {
+          "id": "final-preserves-revisions",
+          "pass": true
+        },
+        {
+          "id": "final-preserves-relationships",
+          "pass": true
+        }
+      ],
+      "artifacts": {
+        "baseline_epoch_A": 1,
+        "template_sha256_A": "059d686a069007e574cf82b63e3c1c5e8a4ec3d3215c2557612acbb29bd28f7c",
+        "source_sha256_A": "059d686a069007e574cf82b63e3c1c5e8a4ec3d3215c2557612acbb29bd28f7c",
+        "B_sha256": "221348b2e878824b43bed39a9e3ceb6b7d2ca451adb14edb1f0748524aacd847",
+        "C_sha256": "2ce943c249c51cccbe32c4e03b5ff0e7e50b3ead238cb0ba6b902eefd9271a09",
+        "baseline_epoch_C": 2,
+        "template_sha256_C": "2ce943c249c51cccbe32c4e03b5ff0e7e50b3ead238cb0ba6b902eefd9271a09",
+        "source_sha256_C": "2ce943c249c51cccbe32c4e03b5ff0e7e50b3ead238cb0ba6b902eefd9271a09",
+        "final_sha256": "ff14ab2ca35377dc8926299dc40e0aa55342aaae6c3a7dd3d58eade08f13c313"
+      },
+      "limitations": [
+        "execution_mode word-com-automated-operator; human_ui_review not-run",
+        "DisplayAlerts=0/OpenAndRepair=false are automation flags, not no-repair proof",
+        "Word COM automated operator is not human UI acceptance",
+        "comparisons are semantic/style/reference/protected-structure, never raw XML byte equality",
+        "no three-way merge performed at any step"
+      ]
+    },
+    {
+      "workflow": "word-handoff",
+      "case_id": "word-handoff-stale-refusal",
+      "input_sha256": "059d686a069007e574cf82b63e3c1c5e8a4ec3d3215c2557612acbb29bd28f7c",
+      "completion_status": "complete",
+      "outcome": "EXPECTED_REJECT",
+      "binary": {
+        "sha256": "feaee847fbd6f0bff6b5b14cee07f4ec5e45f8506d4c696f39b518ba49b0e349",
+        "version": "docx2typed-rust 0.2.1 (31f2a57823006cb8769336b04f6bdf627457b764-dirty)"
+      },
+      "manifest_sha256": "ddcd005e6ec46b52aa80d70f6d3befecf6a72060eaaecd468a36652c3b755407",
+      "private_report_sha256": "3443be00a8ed2c87b35a06608c800ecc7655019725545ddcd3b3a766495c7af5",
+      "steps": [
+        {
+          "name": "extract-baseline-A",
+          "result": "ok"
+        },
+        {
+          "name": "agent-edit-A",
+          "result": "ok"
+        },
+        {
+          "name": "word-operator-edit",
+          "result": "ok"
+        },
+        {
+          "name": "stale-save-attempt",
+          "result": "refused"
+        },
+        {
+          "name": "verdict",
+          "result": "ok"
+        }
+      ],
+      "assertions": [
+        {
+          "id": "stale-overwrite-refused",
+          "pass": true
+        },
+        {
+          "id": "C-unwritten",
+          "pass": true
+        },
+        {
+          "id": "workdir-unwritten",
+          "pass": true
+        }
+      ],
+      "artifacts": {
+        "B_sha256": "221348b2e878824b43bed39a9e3ceb6b7d2ca451adb14edb1f0748524aacd847",
+        "C_sha256_before_stale_attempt": "73bfb1f4420165b00c930c8191040ab3f1defb4866bd0d4f464569357e7852d9",
+        "C_sha256_after_stale_attempt": "73bfb1f4420165b00c930c8191040ab3f1defb4866bd0d4f464569357e7852d9"
+      },
+      "limitations": [
+        "execution_mode word-com-automated-operator; human_ui_review not-run",
+        "DisplayAlerts=0/OpenAndRepair=false are automation flags, not no-repair proof",
+        "no-write proof covers the staged source file and the workdir tree; host-owned logging outside the workdir is excluded"
+      ]
+    },
+    {
+      "workflow": "review-handoff",
+      "case_id": "review-handoff-selective",
+      "input_sha256": "62602d8f9ebd4449d29e662ece14eee36075cd6bf234012231e19c285b50a5a2",
+      "completion_status": "complete",
+      "outcome": "PASS",
+      "binary": {
+        "sha256": "feaee847fbd6f0bff6b5b14cee07f4ec5e45f8506d4c696f39b518ba49b0e349",
+        "version": "docx2typed-rust 0.2.1 (31f2a57823006cb8769336b04f6bdf627457b764-dirty)"
+      },
+      "manifest_sha256": "ddcd005e6ec46b52aa80d70f6d3befecf6a72060eaaecd468a36652c3b755407",
+      "private_report_sha256": "7bcf5e3a584e85baec965e5b3bbdcfff523cba418b98a26be31e62a757acd069",
+      "steps": [
+        {
+          "name": "stage-original-copy",
+          "result": true
+        },
+        {
+          "name": "word-prepare-prior-revision-comment",
+          "result": true
+        },
+        {
+          "name": "extract-baseline-A",
+          "result": true
+        },
+        {
+          "name": "agent-find",
+          "result": true
+        },
+        {
+          "name": "agent-edit-save-B",
+          "result": true
+        },
+        {
+          "name": "word-inspect-B",
+          "result": true
+        },
+        {
+          "name": "word-selective-accept-reject",
+          "result": true
+        },
+        {
+          "name": "stale-publication-refused",
+          "result": true
+        },
+        {
+          "name": "explicit-continue-C",
+          "result": true
+        },
+        {
+          "name": "reopen-verify",
+          "result": true
+        }
+      ],
+      "assertions": [
+        {
+          "id": "prior-revisions-preserved-exact-multiset",
+          "pass": true
+        },
+        {
+          "id": "agent-revisions-distinct-author-present",
+          "pass": true
+        },
+        {
+          "id": "agent-author-distinct-from-prepared",
+          "pass": true
+        },
+        {
+          "id": "prior-comments-preserved-anchor",
+          "pass": true
+        },
+        {
+          "id": "selective-touched-agent-only",
+          "pass": true
+        },
+        {
+          "id": "accept-copy-shows-agent-new",
+          "pass": true
+        },
+        {
+          "id": "reject-copy-shows-agent-old",
+          "pass": true
+        },
+        {
+          "id": "prior-revisions-preserved-exact-both-copies",
+          "pass": true
+        },
+        {
+          "id": "comments-anchor-match-prepared-both-copies",
+          "pass": true
+        }
+      ],
+      "artifacts": {
+        "input_sha256": "62602d8f9ebd4449d29e662ece14eee36075cd6bf234012231e19c285b50a5a2",
+        "prepared_sha256": "11b9a8732cc6c4b9b0aa4759643e9ba6904ccf61de7fcba75614c104d9506e89",
+        "baseline_epoch_A": 1,
+        "agent_output_sha256": "ee1b280dc51a9bf2551a36a7eb065aff081f37358138e88877dcadcbf2e31878",
+        "agent_old_sha256": "cbc7ea5333c252549dc905d127b74ee9d4b23eddd735c23dc53cebbb056647f8",
+        "agent_new_sha256": "50f7e0ea788b26fe08a03af5f8f2b3744d9ce68928ba7533964b74ecc9292041",
+        "accept_sha256": "082030479b266522e2a6561928fcb3bfde2ae5fd24ed2cacb22edc9565dc80bc",
+        "reject_sha256": "a6c327483fdeb818179f5bdb712d9b7cddef643e2bc82551d38c8f72d02d4ba6",
+        "word_operator_C_sha256": "a811a430fefec2d03fb2a3ab29351c7782e5f2c36b77dd0f7cff58c0745d204a"
+      },
+      "limitations": [
+        "execution_mode word-com-automated-operator: real Word executed the actions; no human UI observation or visual-layout acceptance.",
+        "DisplayAlerts silencing / OpenAndRepair=false do not prove absence of a repair prompt; no-repair is not claimed.",
+        "Classic comments only: comment anchor/author/text verified via Word COM; modern threaded replies, @mentions and resolve states are unexercised and unsupported here.",
+        "Host normalization is semantic (text/authors/types/anchors), never raw Word XML byte equality."
+      ]
+    },
+    {
+      "workflow": "review-handoff",
+      "case_id": "review-handoff-cross-boundary",
+      "input_sha256": "62602d8f9ebd4449d29e662ece14eee36075cd6bf234012231e19c285b50a5a2",
+      "completion_status": "complete",
+      "outcome": "EXPECTED_REJECT",
+      "binary": {
+        "sha256": "feaee847fbd6f0bff6b5b14cee07f4ec5e45f8506d4c696f39b518ba49b0e349",
+        "version": "docx2typed-rust 0.2.1 (31f2a57823006cb8769336b04f6bdf627457b764-dirty)"
+      },
+      "manifest_sha256": "ddcd005e6ec46b52aa80d70f6d3befecf6a72060eaaecd468a36652c3b755407",
+      "private_report_sha256": "7bcf5e3a584e85baec965e5b3bbdcfff523cba418b98a26be31e62a757acd069",
+      "steps": [
+        {
+          "name": "boundary-setup",
+          "result": true
+        },
+        {
+          "name": "crossing-fixture",
+          "result": true
+        },
+        {
+          "name": "cross-boundary-find-refusal",
+          "result": true
+        }
+      ],
+      "assertions": [
+        {
+          "id": "named-refusal-at-find",
+          "pass": true
+        },
+        {
+          "id": "no-write-proof",
+          "pass": true
+        }
+      ],
+      "artifacts": {
+        "input_sha256": "62602d8f9ebd4449d29e662ece14eee36075cd6bf234012231e19c285b50a5a2",
+        "crossing_query_sha256": "ce2fcde06ec700fb79f910a1a8cc387b3dcc8284ba7ac0b11edb93b9db05013f",
+        "crossing_context_sha256": "5ccaa11fd38da87dac476ca11c4a72ba9143a4aa17977ed34d3f2a67e200f9b5"
+      },
+      "limitations": [
+        "execution_mode word-com-automated-operator: real Word executed the actions; no human UI observation or visual-layout acceptance.",
+        "DisplayAlerts silencing / OpenAndRepair=false do not prove absence of a repair prompt; no-repair is not claimed.",
+        "Classic comments only: comment anchor/author/text verified via Word COM; modern threaded replies, @mentions and resolve states are unexercised and unsupported here.",
+        "Host normalization is semantic (text/authors/types/anchors), never raw Word XML byte equality."
+      ]
+    }
+  ]
+}

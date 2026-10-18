@@ -2,8 +2,8 @@
     "schema":  "docx2typed-rust-store-gate-1",
     "issue":  57,
     "verdict":  "pass",
-    "checked_at":  "2026-08-15T02:17:00.8007279+08:00",
-    "binary":  "C:\\Users\\Lin\\dev\\docx2typed-rs\\target\\release\\docx2typed.exe",
+    "checked_at":  "2026-10-18T20:23:26.5293077+08:00",
+    "binary":  "C:\\Users\\Lin\\dev\\rs-wt-ws\\target\\release\\docx2typed.exe",
     "probe_matrix":  {
                          "qualified":  true,
                          "python_checks":  {
@@ -412,7 +412,7 @@
                        "pass":  true
                    },
                    {
-                       "name":  "focused rust store tests pass (18 fault/durability/probe cases)",
+                       "name":  "focused rust store fault/durability/probe tests pass",
                        "pass":  true
                    }
                ]
