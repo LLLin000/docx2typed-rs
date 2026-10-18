@@ -118,3 +118,7 @@ path = "rust-tests/sync_guard.rs"
 name = "verify_protected"
 path = "rust-tests/verify_protected.rs"
 
+[[test]]
+name = "external_file_version"
+path = "rust-tests/external_file_version.rs"
+

@@ -96,7 +96,254 @@ pub const INGRESS_FILES: [&str; 2] = ["typed.md", "edit.md"];
 /// root-only by design), and a blanket sweep would delete them.
 pub const OPTIONAL_ROOT_SIDECARS: [&str; 2] = ["islands.json", "structure.json"];
 
-/// Lock outcomes are stable diagnostic codes (public contract).
+pub const EXTERNAL_FILE_CHANGED: &str = "external-file-changed";
+pub const EXTERNAL_TARGET_SCHEMA: &str = "docx2typed-external-target-1";
+pub const EXTERNAL_TARGETS_FILE: &str = "external-targets.json";
+
+/// One persisted external-output expectation: which canonical target the
+/// workdir's last successful publication left, and which bytes it left there.
+///
+/// Keyed by canonical absolute target path, versioned by baseline epoch so a
+/// re-extract (epoch advance) re-baselines every path without deleting the
+/// registry: an old-epoch entry is not an expectation, it is history. Unknown
+/// means "never published here": no silent adoption — an existing unknown
+/// target refuses, an absent unknown target is created and recorded.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalExpectation {
+    pub expected_sha256: Option<String>,
+    pub epoch: u64,
+    pub observed_absent: bool,
+}
+
+/// Read the persisted per-workdir external-target registry. Missing or
+/// corrupt file is no expectation, never a refusal of its own.
+pub fn read_external_targets(root: &Path) -> BTreeMap<String, ExternalExpectation> {
+    let mut out = BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(root.join(EXTERNAL_TARGETS_FILE)) else {
+        return out;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return out;
+    };
+    if value.get("schema").and_then(Value::as_str) != Some(EXTERNAL_TARGET_SCHEMA) {
+        return out;
+    };
+    let Some(targets) = value.get("targets").and_then(Value::as_object) else {
+        return out;
+    };
+    for (path, entry) in targets {
+        let epoch = entry.get("epoch").and_then(Value::as_u64).unwrap_or(0);
+        let expected_sha256 = entry
+            .get("expected_sha256")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let observed_absent = entry
+            .get("observed_absent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        out.insert(
+            path.clone(),
+            ExternalExpectation {
+                expected_sha256,
+                epoch,
+                observed_absent,
+            },
+        );
+    }
+    out
+}
+
+/// The workdir's baseline generation: the epoch key every expectation is
+/// versioned by. Missing baseline reads as epoch 0, which matches no recorded
+/// entry and therefore refuses nothing new.
+fn baseline_epoch_of(root: &Path) -> u64 {
+    docx2typed_core::read_baseline_epoch(root).unwrap_or(0)
+}
+
+/// Persist the registry (canonical JSON + trailing newline). Best effort is
+/// not enough: an expectation that was checked but not recorded is a guard
+/// that forgets. Failure is an error, never a silent skip.
+fn write_external_targets(
+    root: &Path,
+    targets: &BTreeMap<String, ExternalExpectation>,
+) -> Result<(), StoreError> {
+    let mut map = serde_json::Map::new();
+    for (path, entry) in targets {
+        map.insert(
+            path.clone(),
+            json!({
+                "expected_sha256": entry.expected_sha256,
+                "epoch": entry.epoch,
+                "observed_absent": entry.observed_absent,
+            }),
+        );
+    }
+    let value = json!({ "schema": EXTERNAL_TARGET_SCHEMA, "targets": map });
+    let path = root.join(EXTERNAL_TARGETS_FILE);
+    let mut bytes = canonical_json(&value).into_bytes();
+    bytes.push(b'\n');
+    write_durable(&path, &bytes, None, None, None)
+}
+
+/// Canonical source path the workdir was extracted from: `format.json`'s
+/// `source_path` resolved against the workdir parent, or the workdir
+/// directory itself when the record is missing. The filename alone is NOT
+/// the binding: extracts that share a stem (`A.docx` next to `A.docx2typed`
+/// vs beside `wd/`) must not alias.
+fn canonical_source_of(root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root.join("format.json")).ok()?;
+    let format: Value = serde_json::from_str(&text).ok()?;
+    let rel = format.get("source_path").and_then(Value::as_str)?;
+    // `source_path` is relative to the workdir (os.path.relpath at extract)
+    // or absolute (cross-drive fallback). Resolve both against the workdir.
+    let candidate = root.join(rel);
+    Some(resolve_path(&candidate))
+}
+
+/// Current bytes the source baseline holds: the extracted `_template.docx`
+/// fingerprint is the baseline's content identity — it is byte-identical to
+/// the source at extract time (extract stores the source package verbatim).
+fn baseline_source_sha256(root: &Path) -> Option<String> {
+    file_sha256(&root.join("_template.docx")).ok()
+}
+
+/// Check one external target against the persisted expectation before any
+/// mutation or publication. Returns the expectation to record when the caller
+/// observes the target absent before building.
+///
+/// Binding order (registry WINS — a confirmed B beats a reverted A):
+/// 1. current-epoch registry entry is authoritative and enforced first,
+///    even when the target also matches the source baseline. A confirmed
+///    publication is never bypassed by an older baseline.
+/// 2. with NO current-epoch entry (unknown path, old epoch, missing/corrupt
+///    registry): the workdir's canonical source still holding the baseline
+///    bytes is allowed — explicit re-extract of C established this epoch.
+///    Anything else existing refuses (fail closed); an absent target may be
+///    created. The registry is a concurrency guard, not a tamper-proof
+///    seal: a hand-edited registry is a trust-boundary violation outside
+///    this guard's scope.
+pub fn check_external_target(
+    root: &Path,
+    target: &Path,
+    epoch: u64,
+    targets: &BTreeMap<String, ExternalExpectation>,
+) -> Result<Option<ExternalExpectation>, StoreError> {
+    let key = resolve_path(target).to_string_lossy().into_owned();
+    // Registry FIRST: a current-epoch entry is authoritative, even when the
+    // target also matches the source baseline. Once this workdir published B
+    // over the source, an external revert to A must refuse against expected B
+    // — the confirmed version wins, the older baseline never bypasses it.
+    if let Some(entry) = targets.get(&key) {
+        if entry.epoch == epoch {
+            if let Some(expected) = entry.expected_sha256.as_deref() {
+                match file_sha256(target) {
+                    Ok(actual) if actual == expected => return Ok(None),
+                    Ok(actual) => {
+                        return Err(StoreError::store(
+                            EXTERNAL_FILE_CHANGED,
+                            format!(
+                                "external output changed outside the engine: {key} now hashes to \
+                                 {actual}, expected {expected} from this workdir's last publication; \
+                                 re-extract the current file with explicit discard to make it the new \
+                                 baseline (--discard-committed-versions), or save to a new path"
+                            ),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(StoreError::store(
+                            EXTERNAL_FILE_CHANGED,
+                            format!(
+                                "external output disappeared outside the engine: {key} held this \
+                                 workdir's last publication and is now unreadable; re-extract the \
+                                 current file with explicit discard or save to a new path"
+                            ),
+                        ));
+                    }
+                }
+            } else if entry.observed_absent {
+                if target.exists() {
+                    return Err(StoreError::store(
+                        EXTERNAL_FILE_CHANGED,
+                        format!(
+                            "external output appeared outside the engine: {key} was absent when \
+                             last observed and now exists; re-extract the current file with \
+                             explicit discard or save to a new path"
+                        ),
+                    ));
+                }
+                return Ok(None);
+            } else {
+                return Ok(None);
+            }
+        }
+        // Old-epoch entry: history, not an expectation — fall through to the
+        // baseline fallback and the unknown-path rule below.
+    }
+    // Baseline fallback, ONLY with no current-epoch entry: the canonical
+    // source holding the baseline bytes is writable (explicit re-extract of
+    // C established this epoch). Anything else existing refuses; an absent
+    // target may be created.
+    if let Some(source) = canonical_source_of(root) {
+        if resolve_path(&source).to_string_lossy().into_owned() == key {
+            if let Some(baseline) = baseline_source_sha256(root) {
+                if file_sha256(target).ok().as_deref() == Some(baseline.as_str()) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    // No current-epoch entry: unknown path, old-epoch history, or
+    // missing/corrupt registry. Baseline source holding baseline bytes is
+    // writable; anything else existing refuses; absent may be created.
+    if target.exists() {
+        return Err(StoreError::store(
+            EXTERNAL_FILE_CHANGED,
+            format!(
+                "external output is not this workdir's publication: {key} already exists \
+                 and was never published here; re-extract the current file with explicit \
+                 discard to make it the new baseline, or save to a new path"
+            ),
+        ));
+    }
+    Ok(Some(ExternalExpectation {
+        expected_sha256: None,
+        epoch,
+        observed_absent: true,
+    }))
+}
+
+/// Record one successful external publication: the canonical target now holds
+/// `sha256`, published at `epoch`. Only called on the success path.
+fn record_external_success(
+    root: &Path,
+    target: &Path,
+    sha256: &str,
+    epoch: u64,
+) -> Result<(), StoreError> {
+    let mut targets = read_external_targets(root);
+    let key = resolve_path(target).to_string_lossy().into_owned();
+    targets.insert(
+        key,
+        ExternalExpectation {
+            expected_sha256: Some(sha256.to_string()),
+            epoch,
+            observed_absent: false,
+        },
+    );
+    write_external_targets(root, &targets)?;
+    Ok(())
+}
+
+/// Persist the registry after a caller-built update. The store's own success
+/// path uses `record_external_success`; the agent surface (non-journaled
+/// sidecar publication) records through this so both writers share one
+/// canonical serialization.
+pub fn write_external_targets_public(
+    root: &Path,
+    targets: &BTreeMap<String, ExternalExpectation>,
+) -> Result<(), StoreError> {
+    write_external_targets(root, targets)
+}
 pub const WRITER_BUSY: &str = "writer-busy";
 pub const WRITER_TIMEOUT: &str = "writer-timeout";
 pub const GENERATION_CONFLICT: &str = "generation-conflict";
@@ -235,7 +482,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// WHICH file. That turned an intermittent CI-only failure into an afternoon of
 /// guessing: the message identified neither the file nor the operation, and the
 /// path was known at every call site that produced it.
-pub(crate) fn at(path: &Path, error: io::Error) -> StoreError {
+pub fn at(path: &Path, error: io::Error) -> StoreError {
     StoreError::Io(io::Error::new(
         error.kind(),
         format!("{}: {error}", path.display()),
@@ -1975,11 +2222,82 @@ impl Store {
         );
     }
 
+    /// Journal-first registry check for recovery: the journal's own
+    /// `expected_before` is authoritative; the registry is consulted only
+    /// when the journal claims a hash expectation. A never-published path
+    /// (journal says absent, registry has no entry — because absent markers
+    /// are never persisted before success) rolls back on appearance and
+    /// forward-completes only if still absent: no registry-absence entry is
+    /// ever required.
+    ///
+    /// Idempotent-forward exception: when the journal's own staged bytes
+    /// already match the CURRENT registry expectation at this epoch (the
+    /// publication's own success advanced the registry, then the process
+    /// died before the journal closed), the target holding those same bytes
+    /// is this transaction's provable success — forward, not quarantine.
+    /// This is NOT a rollback-restore path: nothing is copied back, the
+    /// target is left exactly as found. A genuine external C never satisfies
+    /// this: C differs from both journal and registry. Journal-vs-registry
+    /// mismatch is still quarantine/rollback, and rollback restores only the
+    /// journal's own verified backup — never the registry's bytes.
+    fn expected_registry_state(
+        entry: Option<&ExternalExpectation>,
+        external: &Value,
+        epoch: u64,
+    ) -> Option<bool> {
+        let expected_before = external.get("expected_before")?;
+        let was_present = expected_before.get("present").and_then(Value::as_bool)?;
+        let journal_bytes = external.get("sha256").and_then(Value::as_str)?;
+        match entry {
+            Some(entry) if entry.epoch == epoch => {
+                if let Some(expected) = entry.expected_sha256.as_deref() {
+                    if journal_bytes == expected {
+                        // Idempotent forward: registry already holds THIS
+                        // journal's bytes (success advanced it, crash came
+                        // after). Staging-time view is irrelevant — the
+                        // target holding the published bytes IS the proof.
+                        return Some(true);
+                    }
+                    // Registry holds other confirmed bytes (genuine C over an
+                    // expected B, or a newer publication): the journal must
+                    // agree AND the staging-time view must have matched it.
+                    if !was_present {
+                        return Some(false);
+                    }
+                    let was_hash = expected_before.get("sha256").and_then(Value::as_str)?;
+                    Some(was_hash == expected)
+                } else if entry.observed_absent {
+                    Some(!was_present)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                // No current-epoch entry: the journal decides. Absent-at-stage
+                // (never-published path) needs no absent-marker entry — the
+                // journal's own record is sufficient.
+                if !was_present {
+                    Some(true)
+                } else {
+                    // Present-at-stage with no registry entry is unprovable
+                    // either way: not a decision this function makes.
+                    None
+                }
+            }
+        }
+    }
     /// Deterministic forward/back/ambiguous decision for a prepared (not yet
     /// external-published) external-only transaction: verify hashes, never
     /// mtimes. A target matching the recorded output hash landed (forward);
     /// a target with a verified backup and no matching hash is rolled back;
     /// anything else is ambiguous (quarantine).
+    ///
+    /// The persisted external-target registry is the tiebreaker the journal
+    /// alone cannot give: journals without a precondition record predate this
+    /// guard and fail closed (never overwrite an unknown existing target),
+    /// while journals WITH the record obey it — a target matching the
+    /// published bytes rolls forward idempotently; anything else is stale C
+    /// and refuses.
     fn external_decision(&self, records: &[Value], result: &mut RecoverySummary) -> String {
         let prepared = records
             .iter()
@@ -1990,6 +2308,76 @@ impl Store {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let epoch_now = baseline_epoch_of(&self.root);
+        let registry_now = read_external_targets(&self.root);
+        // Journals that predate the precondition carry no expected_before per
+        // external: failing closed here means an unknown existing target is
+        // never adopted by recovery guessing. Any external lacking the record
+        // forces ambiguity, never a forward guess.
+        let mut legacy_journal = false;
+        if let Some(externals) = prepared.get("externals").and_then(Value::as_array) {
+            for external in externals {
+                if external.get("expected_before").is_none() {
+                    legacy_journal = true;
+                    break;
+                }
+            }
+        }
+        if legacy_journal {
+            if let Some(externals) = prepared.get("externals").and_then(Value::as_array) {
+                for external in externals {
+                    let target =
+                        PathBuf::from(external.get("target").and_then(Value::as_str).unwrap_or(""));
+                    let key = resolve_path(&target).to_string_lossy().into_owned();
+                    let known = registry_now
+                        .get(&key)
+                        .is_some_and(|entry| entry.epoch == epoch_now);
+                    let landed = target.is_file()
+                        && file_sha256(&target).ok().as_deref()
+                            == external.get("sha256").and_then(Value::as_str);
+                    // The only safe legacy forward: the target already holds
+                    // this journal's own bytes AND the registry expects those
+                    // same bytes at this epoch (idempotent recovery). Anything
+                    // else — unknown path, stale C, missing file — is
+                    // ambiguity, never an overwrite.
+                    if landed {
+                        if let Some(entry) = registry_now.get(&key) {
+                            let registry_holds_published = entry.epoch == epoch_now
+                                && entry.expected_sha256.as_deref()
+                                    == external.get("sha256").and_then(Value::as_str);
+                            if !registry_holds_published {
+                                let _ = known;
+                                self.quarantine(
+                                    &target,
+                                    &operation_id,
+                                    result,
+                                    "legacy journal cannot prove this target",
+                                );
+                                return "ambiguous".to_string();
+                            }
+                        } else {
+                            self.quarantine(
+                                &target,
+                                &operation_id,
+                                result,
+                                "legacy journal cannot prove this target",
+                            );
+                            return "ambiguous".to_string();
+                        }
+                    } else {
+                        self.quarantine(
+                            &target,
+                            &operation_id,
+                            result,
+                            "legacy journal cannot prove this target",
+                        );
+                        return "ambiguous".to_string();
+                    }
+                }
+                return "forward".to_string();
+            }
+            return "ambiguous".to_string();
+        }
         let mut decision: Option<&str> = None;
         let mut ambiguous = false;
         if let Some(externals) = prepared.get("externals").and_then(Value::as_array) {
@@ -2000,6 +2388,28 @@ impl Store {
                     .get("mode")
                     .and_then(Value::as_str)
                     .unwrap_or("replace");
+                // Journal-first: the journal's expected_before decides; the
+                // registry is consulted only through expected_registry_state,
+                // which requires NO absent-marker entry for never-published
+                // paths. A present-at-stage target with no current-epoch
+                // entry is unprovable — quarantine, never adopt.
+                let key = resolve_path(&target).to_string_lossy().into_owned();
+                let current_entry = registry_now
+                    .get(&key)
+                    .filter(|entry| entry.epoch == epoch_now);
+                let journal_ok =
+                    Self::expected_registry_state(current_entry, external, epoch_now) == Some(true);
+                if !journal_ok {
+                    self.quarantine(
+                        &target,
+                        &operation_id,
+                        result,
+                        "external target changed outside the engine during the build; \
+                         target left untouched, needs explicit recovery",
+                    );
+                    ambiguous = true;
+                    continue;
+                }
                 let landed = target.is_file()
                     && file_sha256(&target).ok().as_deref()
                         == external.get("sha256").and_then(Value::as_str);
@@ -2020,8 +2430,41 @@ impl Store {
                     // replaces).
                     self.quarantine(&target, &operation_id, result, "unmatched external output");
                     ambiguous = true;
-                } else if decision != Some("forward") {
-                    decision = Some("back");
+                } else if !landed {
+                    // The target is neither the journal's bytes nor its
+                    // staging-time state: someone wrote here after staging.
+                    // Quarantine — never roll a verified backup over a
+                    // genuine external C, never treat it as "back".
+                    let expected_before = external.get("expected_before");
+                    let staging_state_matches = match (
+                        expected_before.and_then(|v| v.get("present").and_then(Value::as_bool)),
+                        expected_before.and_then(|v| v.get("sha256").and_then(Value::as_str)),
+                    ) {
+                        (Some(false), _) => !target.exists(),
+                        (Some(true), Some(was)) => {
+                            matches!(file_sha256(&target), Ok(now) if now == was)
+                        }
+                        _ => false,
+                    };
+                    if staging_state_matches || backup_ok {
+                        // Untouched since staging (or verifiable backup
+                        // present AND target still at staging state): the
+                        // existing back path is safe — it restores the
+                        // verified backup or no-ops. Genuine C never reaches
+                        // here: C differs from the staging-time state.
+                        if decision != Some("forward") {
+                            decision = Some("back");
+                        }
+                    } else {
+                        self.quarantine(
+                            &target,
+                            &operation_id,
+                            result,
+                            "external output changed outside the engine after staging; \
+                             target left untouched, needs explicit recovery",
+                        );
+                        ambiguous = true;
+                    }
                 }
             }
         }
@@ -2266,6 +2709,45 @@ impl Store {
             );
             return;
         }
+        // Recovery lands the same expectation a live success would: every
+        // journaled external whose on-disk bytes match the journal's own
+        // bytes advances the registry to those bytes at the current epoch.
+        // Anything else is left for the next precondition to refuse.
+        let epoch_now = baseline_epoch_of(&self.root);
+        if let Some(externals) = prepared.get("externals").and_then(Value::as_array) {
+            let mut targets = read_external_targets(&self.root);
+            let mut changed = false;
+            for external in externals {
+                let target =
+                    PathBuf::from(external.get("target").and_then(Value::as_str).unwrap_or(""));
+                let Some(published) = external.get("sha256").and_then(Value::as_str) else {
+                    continue;
+                };
+                if file_sha256(&target).ok().as_deref() != Some(published) {
+                    continue;
+                }
+                let key = resolve_path(&target).to_string_lossy().into_owned();
+                targets.insert(
+                    key,
+                    ExternalExpectation {
+                        expected_sha256: Some(published.to_string()),
+                        epoch: epoch_now,
+                        observed_absent: false,
+                    },
+                );
+                changed = true;
+            }
+            if changed {
+                if write_external_targets(&self.root, &targets).is_err() {
+                    self.ambiguous(&operation_id, result, "external registry repair failed");
+                    return;
+                }
+                result.recovered.push(json!({
+                    "operation_id": operation_id,
+                    "action": "externals-registry-repaired",
+                }));
+            }
+        }
         let _ = fs::remove_dir_all(tx_dir);
         result.recovered.push(json!({
             "operation_id": operation_id,
@@ -2430,41 +2912,22 @@ impl Store {
 
     fn quarantine(
         &self,
-        target: &Path,
+        _target: &Path,
         operation_id: &str,
         result: &mut RecoverySummary,
         reason: &str,
     ) {
-        let name = target
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "output".to_string());
-        let destination = self.quarantine_dir.join(format!(
-            "{operation_id}-{}-{name}",
-            &new_operation_id()[..8]
-        ));
-        if fs::create_dir_all(&self.quarantine_dir).is_err() {
-            result.needs_recovery.push(json!({
-                "operation_id": operation_id,
-                "reason": "quarantine move failed",
-            }));
-            return;
-        }
-        match fs::rename(target, &destination) {
-            Err(error) => {
-                result.needs_recovery.push(json!({
-                    "operation_id": operation_id,
-                    "reason": format!("quarantine move failed: {error}"),
-                }));
-            }
-            Ok(()) => {
-                result.needs_recovery.push(json!({
-                    "operation_id": operation_id,
-                    "reason": reason,
-                    "quarantined": destination.to_string_lossy().into_owned(),
-                }));
-            }
-        }
+        // Record ambiguity WITHOUT touching the external target: the journal
+        // is preserved for inspection and the target is left exactly as
+        // found. Moving the CURRENT target file away is data loss when the
+        // target is a genuine external C (Word's bytes vanishing from their
+        // path). Only staged/backup artifacts the engine itself created may
+        // ever be cleaned up.
+        let _ = &self.quarantine_dir;
+        result.needs_recovery.push(json!({
+            "operation_id": operation_id,
+            "reason": reason,
+        }));
     }
 
     /// Delete abandoned temp generations and staging not referenced by the
@@ -2641,6 +3104,18 @@ impl Store {
             ));
         }
         let generation_id = new_operation_id();
+        // Production entry check on KNOWN ledger anchors BEFORE run/journal:
+        // unknown C refuses here — no staging, no snapshot, no journal dir,
+        // no registry write (the observed-absent pending marker travels in
+        // the journal's expected_before, not in the persisted registry).
+        // (The Writer-lane lockfile is opened by acquire_lane before this;
+        // it is the harness's own lane, not a mutation.)
+        // (`run` stages externals, so the staged-target check below covers
+        // everything else; `publish_externals` re-checks immediately before
+        // publication. All three run under the same Writer lane.)
+        let epoch_at_entry = baseline_epoch_of(&self.root);
+        let registry_at_entry = read_external_targets(&self.root);
+        self.check_production_entry(&self.root, &request, epoch_at_entry, &registry_at_entry)?;
         let (tx_dir, intent) = self.begin_journal(
             &request.operation_id,
             &request.canonical,
@@ -2695,6 +3170,25 @@ impl Store {
                 vec![evidence],
             );
             let externals = transaction.externals();
+            // External-output precondition BEFORE any workdir mutation: every
+            // staged target is checked against the persisted registry (keyed
+            // by canonical target path, versioned by baseline epoch) before
+            // the journal records anything durable. A refusal here aborts
+            // before the pointer moves, the generation materializes, or any
+            // external is published: source and workdir unchanged.
+            //
+            // Pending observed-absent markers travel ONLY in the journal's
+            // expected_before (per-external) and in memory — never in the
+            // persisted registry before success. Writing the registry early
+            // would itself be a workdir write on a path that may still
+            // refuse at publication time.
+            let epoch_now = baseline_epoch_of(&self.root);
+            let registry_now = read_external_targets(&self.root);
+            for external in &externals {
+                let target =
+                    PathBuf::from(external.get("target").and_then(Value::as_str).unwrap_or(""));
+                check_external_target(&self.root, &target, epoch_now, &registry_now)?;
+            }
             let manifest_sha = if request.generation {
                 let manifest = generation_manifest(
                     &gen_dir,
@@ -2854,6 +3348,90 @@ impl Store {
         write_ledger_record(operation_id, canonical, envelope, anchor, directory)
     }
 
+    /// An open read handle on the live target held across hash + publication.
+    ///
+    /// Windows: opened with FILE_SHARE_READ|FILE_SHARE_DELETE — writes are
+    /// denied, so Word cannot save over the target while held (its save fails
+    /// instead of racing the rename); our own rename/delete still works because
+    /// delete sharing is allowed. The handle does NOT stop an external rename
+    /// (rename-onto-target by another process): that residual is documented,
+    /// not claimed away. Other platforms: a plain read handle — same shape,
+    /// no lock claimed, consistency comes from the Writer lane + re-check.
+    #[cfg(windows)]
+    fn hold_no_write(&self, target: &Path) -> Result<fs::File, StoreError> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(target)
+            .map_err(|e| at(target, e))
+    }
+
+    #[cfg(not(windows))]
+    fn hold_no_write(&self, target: &Path) -> Result<fs::File, StoreError> {
+        std::fs::File::open(target).map_err(|e| at(target, e))
+    }
+
+    /// Atomic replace of staged onto target. Windows: MoveFileEx semantics via
+    /// rename are atomic-replace only when the destination handle allows it —
+    /// the caller holds `_guard` with delete sharing exactly so this rename can
+    /// proceed while external writers are denied. Same-directory staging keeps
+    /// the rename on one volume.
+    fn coordinated_replace(&self, staged: &Path, target: &Path) -> Result<(), StoreError> {
+        // One atomic rename, no retries, no sleeps. A retry would mask a
+        // concurrent writer racing the publish; a failure is returned loudly.
+        fs::rename(staged, target).map_err(|error| at(target, error))?;
+        Ok(())
+    }
+
+    /// External-output precondition BEFORE any workdir mutation: KNOWN ledger
+    /// anchors (ledger_anchor file anchors + evidence sidecar siblings) are
+    /// checked before run/journal, so unknown-existing C refuses without
+    /// staging, snapshotting, journaling, or registry writes. Returns unit:
+    /// the pending observed-absent marker is NOT persisted — it travels in
+    /// the journal's expected_before and is enforced at publication time.
+    fn check_production_entry(
+        &self,
+        root: &Path,
+        request: &StoreMutateRequest,
+        epoch: u64,
+        targets: &BTreeMap<String, ExternalExpectation>,
+    ) -> Result<(), StoreError> {
+        // Known external anchors: ledger_anchor for external-only builds, and
+        // evidence_path sidecars live beside the artifact. Journal/ledger anchor
+        // is the production-known target — unknown C's anchor is known because
+        // the caller named `output`.
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(anchor) = request.ledger_anchor.as_deref() {
+            // directory anchors hold the ledger inside; only file anchors are
+            // external targets (file.docx.operation-ledger.json beside output).
+            if !request.ledger_directory {
+                candidates.push(anchor.to_path_buf());
+            }
+        }
+        if let Some(evidence) = request.evidence_path.as_deref() {
+            // Evidence sidecar target itself is not the guard, but its sibling
+            // artifact (strip trailing .evidence.json / .verify.evidence.json /
+            // .operation-ledger.json) is the known output the caller named.
+            let name = evidence.to_string_lossy().into_owned();
+            for suffix in [
+                ".evidence.json",
+                ".verify.evidence.json",
+                ".operation-ledger.json",
+            ] {
+                if let Some(stripped) = name.strip_suffix(suffix) {
+                    candidates.push(PathBuf::from(stripped));
+                }
+            }
+        }
+        for target in candidates {
+            check_external_target(root, &target, epoch, targets)?;
+        }
+        Ok(())
+    }
+
     fn publish_externals(
         &self,
         tx_dir: &Path,
@@ -2873,15 +3451,117 @@ impl Store {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "output".to_string());
+            // Authoritative gate: re-check the target immediately before
+            // publication, under the same Writer lane. The target must still
+            // be what staging-time saw (bytes or absence): a late external
+            // modify between staging and publishing refuses here, after the
+            // staged build is discarded, before the target is touched.
+            let expected_before = external
+                .get("expected_before")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let still_expected = match (
+                expected_before.get("present").and_then(Value::as_bool),
+                expected_before.get("sha256").and_then(Value::as_str),
+            ) {
+                (Some(true), Some(was)) => matches!(file_sha256(&target), Ok(now) if now == was),
+                (Some(false), _) => !target.exists(),
+                _ => true,
+            };
+            if !still_expected {
+                let _ = fs::remove_file(&staged);
+                return Err(StoreError::store(
+                    EXTERNAL_FILE_CHANGED,
+                    format!(
+                        "external output changed outside the engine just before publication: {} \
+                         no longer matches what staging observed; the staged build was discarded \
+                         and nothing was published — re-extract the current file with explicit \
+                         discard or save to a new path",
+                        target.display()
+                    ),
+                ));
+            }
             fire(
                 Some(&format!("external-publish-{target_name}")),
                 Some(&staged),
             )?;
-            let mode = external
-                .get("mode")
-                .and_then(Value::as_str)
-                .unwrap_or("replace");
-            if mode == "replace" && target.exists() {
+            // Dispatch on what staging OBSERVED (expected_before.present), never
+            // on the caller's mode string: `replace` historically means
+            // replace-or-create, so a new target staged under mode=replace with
+            // expected_before.absent must CREATE (hard-link no-clobber), not
+            // backup+rename a file that does not exist.
+            let staged_absent = matches!(
+                expected_before.get("present").and_then(Value::as_bool),
+                Some(false)
+            );
+            if staged_absent {
+                // Atomic no-clobber create — the LINK decides, never an
+                // exists-branch: an external creator racing the absent window
+                // wins, link fails, refusal without touching the target.
+                // Still absent + link error => real IO failure (no overwrite
+                // either way — the target never changed).
+                match fs::hard_link(&staged, &target) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&staged);
+                        fsync_dir(target.parent().unwrap_or_else(|| Path::new(".")));
+                    }
+                    Err(error) => {
+                        let _ = fs::remove_file(&staged);
+                        if target.exists() {
+                            return Err(StoreError::store(
+                                EXTERNAL_FILE_CHANGED,
+                                format!(
+                                    "external output appeared outside the engine just before \
+                                     publication: {} now exists; the staged build was discarded \
+                                     and nothing was published ({error})",
+                                    target.display()
+                                ),
+                            ));
+                        }
+                        return Err(StoreError::store(
+                            "workdir-unreadable",
+                            format!("new output could not be published: {error}"),
+                        ));
+                    }
+                }
+            } else {
+                // Guard FIRST, hash UNDER it: the handle is acquired before the
+                // final hash re-check, so the check runs while external writes
+                // are denied (Windows) instead of before the guard window
+                // opens. `?` propagates: a guard we cannot hold on an existing
+                // target is a refusal, never an unguarded write.
+                let _guard = self.hold_no_write(&target).inspect_err(|_| {
+                    let _ = fs::remove_file(&staged);
+                })?;
+                let staged_hash = expected_before.get("sha256").and_then(Value::as_str);
+                let now_hash = match file_sha256(&target) {
+                    Ok(now) => now,
+                    Err(error) => {
+                        let _ = fs::remove_file(&staged);
+                        return Err(StoreError::store(
+                            EXTERNAL_FILE_CHANGED,
+                            format!(
+                                "external output disappeared outside the engine during the build: \
+                                 {} is now unreadable ({error}); the staged build was discarded \
+                                 and nothing was published",
+                                target.display()
+                            ),
+                        ));
+                    }
+                };
+                if staged_hash.is_some_and(|was| was != now_hash) {
+                    let _ = fs::remove_file(&staged);
+                    return Err(StoreError::store(
+                        EXTERNAL_FILE_CHANGED,
+                        format!(
+                            "external output changed outside the engine during the build: {} \
+                             now hashes to {now_hash}; the verified staged build was discarded \
+                             and nothing was published — re-extract the current file with explicit \
+                             discard or save to a new path",
+                            target.display()
+                        ),
+                    ));
+                }
                 fire(Some("external-backup"), None)?;
                 let backup = self
                     .staging_dir
@@ -2894,9 +3574,14 @@ impl Store {
                 fsync_file(&backup)?;
                 external["backup"] = Value::String(backup.to_string_lossy().into_owned());
                 external["backup_sha256"] = Value::String(file_sha256(&backup)?);
+                self.coordinated_replace(&staged, &target)?;
+                fsync_dir(target.parent().unwrap_or_else(|| Path::new(".")));
             }
-            fs::rename(&staged, &target)?;
-            fsync_dir(target.parent().unwrap_or_else(|| Path::new(".")));
+            // Only the bytes just published advance the expectation: on the
+            // success path the registry follows B, never the overwritten C.
+            let published_sha = external.get("sha256").and_then(Value::as_str).unwrap_or("");
+            let epoch_now = baseline_epoch_of(&self.root);
+            record_external_success(&self.root, &target, published_sha, epoch_now)?;
         }
         let published = journal_record(
             "external-published",
@@ -2968,6 +3653,7 @@ impl Store {
             .and_then(Value::as_str)
             .unwrap_or("genesis")
             .to_string();
+
         let error_code = match error {
             StoreError::Store { code, .. } => code.clone(),
             StoreError::Io(io_error) => format!("{:?}", io_error.kind()),
@@ -3041,6 +3727,12 @@ impl Transaction {
     /// Register one external output for journaled publication. `mode` is
     /// `"create"` (target must not exist) or `"replace"` (prior output is
     /// backed up). `staged` must already be flushed.
+    ///
+    /// The expectation captured here is what `publish_externals` re-checks
+    /// immediately before publication: the target's bytes then must still be
+    /// these bytes (or still absent for a new path), or the publication
+    /// refuses. A late external modify between staging and publishing is
+    /// therefore a refusal, not an overwrite.
     pub fn stage_external(
         &mut self,
         target: &Path,
@@ -3048,11 +3740,16 @@ impl Transaction {
         mode: &str,
     ) -> Result<(), StoreError> {
         let sha256 = file_sha256(staged)?;
+        let expected = match file_sha256(target) {
+            Ok(hash) => json!({ "present": true, "sha256": hash }),
+            Err(_) => json!({ "present": false }),
+        };
         self.externals.push(json!({
             "target": resolve_path(target).to_string_lossy().into_owned(),
             "staged": resolve_path(staged).to_string_lossy().into_owned(),
             "mode": mode,
             "sha256": sha256,
+            "expected_before": expected,
         }));
         Ok(())
     }

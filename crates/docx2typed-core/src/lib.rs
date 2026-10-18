@@ -528,6 +528,12 @@ fn stale_baseline_assets(outdir: &Path) -> Vec<Asset> {
         // it behind makes every paragraph of the incoming document read as an
         // unrecorded user edit.
         "baseline.view",
+        // External-output expectations are expressed against the old epoch,
+        // so a baseline replacement clears them with the rest: the next
+        // publication re-baselines every path it writes. Keyed by epoch, so
+        // a stale file left behind would only be history — but history that
+        // survives a reset is a file the inventory never declared.
+        "external-targets.json",
         // The format engine's plan and requests are expressed against the old
         // template too, so a baseline replacement clears them with the rest.
         "format_plan.json",
