@@ -53,6 +53,14 @@ pub struct IslandEdit {
     pub leaf_index: usize,
     /// Decoded text to find (must be a substring of the leaf's text).
     pub old: String,
+    /// Char offset of `old` inside the paragraph's visible text, when the edit
+    /// came from a handle. One island carries every replacement that lands in
+    /// its leaf, and the merged text can occur twice in that leaf, so the
+    /// applier must locate the span by this offset instead of searching for the
+    /// text. Measured on a real patent: an 81-replacement batch committed
+    /// cleanly only once the offset addressed the span.
+    #[serde(default)]
+    pub char_start: Option<usize>,
     /// Replacement text (XML-escaped on write).
     pub new: String,
     /// Generate a tracked OOXML delete+insert pair instead of a direct swap.
@@ -77,6 +85,13 @@ pub struct ProseLeaf {
     /// true when the leaf sits on the editable surface (no opaque node in
     /// its paragraph, run not opaque, not a deletion revision).
     pub editable: bool,
+    /// true when the leaf's text reaches the projection the caller reads, and
+    /// false when the projection drops it as a revision gap: a `w:delText`, or
+    /// any run inside a `w:del` / `w:moveFrom`. Callers' offsets are measured in
+    /// that projection, so a hidden leaf contributes no width to them —
+    /// counting it here is what made an anchored `char_start` land in the wrong
+    /// leaf and left every span after a tracked deletion uneditable.
+    pub projected: bool,
     /// Byte range of the leaf's text content within the part XML.
     pub text_start: usize,
     pub text_end: usize,
@@ -439,6 +454,21 @@ pub fn match_leaf_span(
     from_leaf: usize,
     old: &str,
 ) -> Result<Option<LeafSpanMatch>, CoreError> {
+    match_leaf_span_at(inventory, part, paragraph_id, from_leaf, old, None)
+}
+
+/// [`match_leaf_span`], with the span's paragraph-level char offset when the
+/// caller has one. An anchored call cannot be ambiguous: exactly one start can
+/// carry the offset, so the search verifies that start instead of scanning for
+/// the text and refusing when it occurs twice.
+pub fn match_leaf_span_at(
+    inventory: &ProseInventory,
+    part: &str,
+    paragraph_id: &str,
+    from_leaf: usize,
+    old: &str,
+    char_start: Option<usize>,
+) -> Result<Option<LeafSpanMatch>, CoreError> {
     if old.is_empty() {
         return Ok(None);
     }
@@ -460,9 +490,38 @@ pub fn match_leaf_span(
         .position(|leaf| leaf.leaf_index >= from_leaf)
         .unwrap_or(leaves.len());
 
+    // Paragraph-level offset of each leaf's first char, in the projection the
+    // caller's offsets are measured in — not in the leaves, where a revision gap
+    // still has width. A `char_start` read against leaf widths landed after the
+    // tracked deletion instead of on it, so the anchored start was rejected and
+    // every span past a `w:del` came back `cross-leaf-edit`.
+    let mut projected_prefix: Vec<usize> = Vec::with_capacity(leaves.len());
+    let mut running_projected = 0usize;
+    for leaf in &leaves {
+        projected_prefix.push(running_projected);
+        if leaf.projected {
+            running_projected += leaf.text.chars().count();
+        }
+    }
+
     let mut found: Option<LeafSpanMatch> = None;
     for start in start_at..leaves.len() {
         let first_chars = leaves[start].text.chars().count();
+        // The anchored span starts inside this leaf, or this start is not its
+        // business. The question is asked in the caller's space and answered with
+        // an index into this leaf's own text — the accumulation below starts
+        // there, so the two are the same thing.
+        let anchored_head = match char_start {
+            Some(want)
+                if leaves[start].projected
+                    && want >= projected_prefix[start]
+                    && want < projected_prefix[start] + first_chars =>
+            {
+                Some(want - projected_prefix[start])
+            }
+            Some(_) => continue,
+            None => None,
+        };
         let mut accumulated = String::new();
         let mut before_last = 0usize;
         for end in start..leaves.len() {
@@ -470,8 +529,15 @@ pub fn match_leaf_span(
                 before_last += leaves[end - 1].text.chars().count();
             }
             accumulated.push_str(&leaves[end].text);
-            let Some(byte_pos) = accumulated.find(old) else {
-                continue;
+            let byte_pos = match anchored_head {
+                Some(head) => match accumulated.char_indices().nth(head) {
+                    Some((byte_pos, _)) if accumulated[byte_pos..].starts_with(old) => byte_pos,
+                    _ => continue,
+                },
+                None => match accumulated.find(old) {
+                    Some(byte_pos) => byte_pos,
+                    None => continue,
+                },
             };
             let head = accumulated[..byte_pos].chars().count();
             let covered = old.chars().count();
@@ -1063,6 +1129,7 @@ fn extract_paragraph(
         rpr_bytes: &mut Vec<u8>,
         paragraph_id: &str,
         part_key: &str,
+        in_gap: bool,
     ) {
         let mut opaque = false;
         let mut rpr_range: (usize, usize) = (0, 0);
@@ -1089,6 +1156,10 @@ fn extract_paragraph(
                     paragraph_id: paragraph_id.to_string(),
                     leaf_index: *leaf_index,
                     editable: true, // locked later for delText / opaque paragraphs
+                    // The projection renders a `w:del` subtree as a zero-width
+                    // revision gap and keeps nothing of its text, so a leaf
+                    // inside one is not part of the offsets the caller reads.
+                    projected: !in_gap && name != "delText",
                     text_start,
                     text_end,
                     open_end: child_node.open_end,
@@ -1135,19 +1206,22 @@ fn extract_paragraph(
         rpr_bytes: &mut Vec<u8>,
         paragraph_id: &str,
         part_key: &str,
+        in_gap: bool,
     ) {
         for &child in &node.children {
             let child_node = &nodes[child];
             let name = child_node.name.as_str();
             match name {
                 "pPr" => {}
-                "proofErr" => opaques.push(OpaqueBlock {
-                    part_key: part_key.to_string(),
-                    paragraph_id: paragraph_id.to_string(),
-                    tag: child_node.raw_name.clone(),
-                    start: child_node.open_start,
-                    end: child_node.end,
-                }),
+                // `proofErr` marks a proofing range (spelling/grammar): zero
+                // length, no text, no run — Word writes it into paragraphs
+                // routinely. Counting it as a locked interior locked the WHOLE
+                // paragraph (`editable = opaques.is_empty()`), so a real patent
+                // reported 12 of 20 matches uneditable for a spell-check marker,
+                // and the blind agent's answer was to leave the tool and edit the
+                // XML by hand. An island edit rewrites runs only, so the marker
+                // survives byte-for-byte without being named here.
+                "proofErr" => {}
                 "r" => process_run(
                     child_node,
                     nodes,
@@ -1158,6 +1232,7 @@ fn extract_paragraph(
                     rpr_bytes,
                     paragraph_id,
                     part_key,
+                    in_gap,
                 ),
                 "hyperlink" | "ins" | "del" | "moveFrom" | "moveTo" => process_container(
                     child_node,
@@ -1169,6 +1244,9 @@ fn extract_paragraph(
                     rpr_bytes,
                     paragraph_id,
                     part_key,
+                    // `del` and `moveFrom` are the deletion side of a tracked
+                    // change: the projection keeps a gap where their text was.
+                    in_gap || name == "del" || name == "moveFrom",
                 ),
                 "bookmarkStart" | "bookmarkEnd" | "commentRangeStart" | "commentRangeEnd" => {}
                 _ => opaques.push(OpaqueBlock {
@@ -1192,6 +1270,7 @@ fn extract_paragraph(
         &mut rpr_bytes,
         paragraph_id,
         part_key,
+        false,
     );
     // Paragraph-level edibility (Python `not contains_opaque`): any opaque
     // node in the paragraph locks every leaf.
@@ -1386,9 +1465,32 @@ pub fn resolve_leaf(
             ))
         })?;
     if !leaf.editable {
+        // Name what is locked and give the way out. The refusal alone told the
+        // agent nothing it could act on, so its answer on a real patent was to
+        // leave the tool and edit the XML by hand — which loses the byte
+        // fidelity, the revision records and the verification the tool exists
+        // for. The sibling `cross-leaf-edit` refusal already names its route;
+        // this one now does too.
+        let locked: Vec<&str> = inventory
+            .opaques
+            .iter()
+            .filter(|block| block.paragraph_id == paragraph_id)
+            .map(|block| block.tag.as_str())
+            .collect();
+        let what = if locked.is_empty() {
+            "a non-editable surface (deletion revision or an unmodelled run)".to_string()
+        } else {
+            format!(
+                "{} — this is where a field, an equation or a drawing lives",
+                locked.join(", ")
+            )
+        };
         return Err(CoreError::Domain(format!(
-            "opaque-paragraph-mutated: {paragraph_id}: leaf {leaf_index} is inside \
-             locked structure (opaque field/math/drawing interior or non-editable surface)"
+            "opaque-paragraph-mutated: {paragraph_id}: leaf {leaf_index} sits inside {what}. \
+             The tool never rewrites a locked interior. Replace the whole paragraph instead: \
+             document_edit with kind=delete for {paragraph_id}, then kind=insert_after carrying \
+             the text you want — that route needs no run match and preserves everything outside \
+             the paragraph byte-for-byte."
         )));
     }
     Ok(leaf)
@@ -1400,18 +1502,22 @@ pub fn resolve_leaf(
 ///
 /// The edit may cross text runs — Word splits a paragraph's text into one run
 /// per formatting change, so text a human typed in Word usually does — and this
-/// resolves it with `match_leaf_span`, the same resolver `apply_edits` uses, so
-/// validation and application cannot disagree about which runs an edit covers.
+/// resolves it with the same resolver `apply_edits` uses, including the edit's
+/// own offset, so validation and application cannot disagree about which runs an
+/// edit covers. They did disagree: one island carries every replacement in its
+/// leaf, its merged text can occur twice in that leaf, and a text-only search
+/// here refused an 81-replacement batch the applier could place.
 pub fn validate_edit(template: &Path, edit: &IslandEdit) -> Result<(), CoreError> {
     let part = edit.part.clone();
     let part_bytes = read_part(template, &part)?;
     let inventory = enumerate_package(template)?;
-    let Some(span) = match_leaf_span(
+    let Some(span) = match_leaf_span_at(
         &inventory,
         &part,
         &edit.paragraph_id,
         edit.leaf_index,
         &edit.old,
+        edit.char_start,
     )?
     else {
         return Err(CoreError::Domain(format!(
@@ -1485,12 +1591,13 @@ pub fn apply_edits(template: &Path, edits: &[IslandEdit]) -> Result<Vec<u8>, Cor
             // change, so an edit a human made in Word usually crosses runs. The
             // match is re-derived here from the recorded anchor and `old`, which
             // is also what proves the sidecar and the template still agree.
-            let span = match_leaf_span(
+            let span = match_leaf_span_at(
                 &inventory,
                 part,
                 &edit.paragraph_id,
                 edit.leaf_index,
                 &edit.old,
+                edit.char_start,
             )?;
             let Some(span) = span else {
                 return Err(CoreError::Domain(format!(
@@ -1790,22 +1897,25 @@ fn needs_xml_space(text: &str) -> bool {
 /// or None when the attribute is already present (or the tag cannot be
 /// located).
 fn maybe_inject_xml_space(part_bytes: &[u8], open_end: usize) -> Option<(usize, usize, Vec<u8>)> {
-    let has_preserve = part_bytes[..open_end]
-        .windows(18)
-        .any(|window| window == b"xml:space=\"preserve\"");
-    if has_preserve {
-        return None;
-    }
-    // Find the tag start: scan back to the last '<'.
+    // Only this text element owns the attribute; a preceding run may carry it.
     let tag_start = part_bytes[..open_end]
         .iter()
         .rposition(|&byte| byte == b'<')?;
+    let tag = &part_bytes[tag_start..open_end];
+    for attribute in [b"xml:space=\"preserve\"", b"xml:space='preserve'"] {
+        if tag
+            .windows(attribute.len())
+            .any(|window| window == attribute)
+        {
+            return None;
+        }
+    }
     let insert_at = part_bytes[tag_start..open_end]
         .iter()
         .rposition(|&byte| byte == b'>')
         .map(|position| tag_start + position)
         .unwrap_or(open_end);
-    let mut out = Vec::with_capacity(open_end - tag_start + 19);
+    let mut out = Vec::with_capacity(open_end - tag_start + b" xml:space=\"preserve\"".len());
     out.extend_from_slice(&part_bytes[tag_start..insert_at]);
     out.extend_from_slice(b" xml:space=\"preserve\"");
     out.extend_from_slice(&part_bytes[insert_at..open_end]);
@@ -2535,7 +2645,46 @@ pub fn serialize_typed(
 /// through `typed_paragraph_block`, so a body produced here is spelled exactly
 /// as one produced for a full projection — two ways of asking for the same
 /// paragraph cannot give two answers.
+/// Every paragraph's markup, keyed by the id the BUILD produced for it.
+///
+/// The document part's ids come from the build (identity); every other part's are
+/// the ones a scan mints, because a structure edit never touches them. The counts
+/// have to agree: a mismatch means the id order and the paragraphs it describes
+/// are not the same document, and a projection written from it would be a lie
+/// about the file — so it is a refusal, not a fallback.
+pub fn paragraph_markup_map_with_ids(
+    package: &[u8],
+    document_ids: &[String],
+) -> Result<BTreeMap<String, String>, CoreError> {
+    let mut ids = document_ids.iter();
+    paragraph_markup_map_by(package, &mut |part_key, scanned| {
+        // The body's typed part key is the EMPTY string (`typed_part_key`); only
+        // the document part is renumbered by a structure edit, so only it takes
+        // the build's ids. Comparing against "document" here matched nothing, and
+        // the map quietly kept the scanned — positional — ids.
+        if part_key.is_empty() {
+            ids.next().cloned().ok_or_else(|| {
+                CoreError::Domain(
+                    "invalid-structure: the build produced more paragraphs than ids for them"
+                        .to_string(),
+                )
+            })
+        } else {
+            Ok(scanned.to_string())
+        }
+    })
+}
+
 pub fn paragraph_markup_map(package: &[u8]) -> Result<BTreeMap<String, String>, CoreError> {
+    paragraph_markup_map_by(package, &mut |_, scanned| Ok(scanned.to_string()))
+}
+
+/// The shared walk: each prepared paragraph's body, under the id `naming` gives
+/// it.
+fn paragraph_markup_map_by(
+    package: &[u8],
+    naming: &mut dyn FnMut(&str, &str) -> Result<String, CoreError>,
+) -> Result<BTreeMap<String, String>, CoreError> {
     let trees = crate::token_table::paragraph_nodes(package)?;
     let catalog = StyleCatalog::build(package)?;
     let (prepared, _promoted) = prepare_paragraphs(&trees, &catalog);
@@ -2551,7 +2700,9 @@ pub fn paragraph_markup_map(package: &[u8]) -> Result<BTreeMap<String, String>, 
             },
             _ => String::new(),
         };
-        out.insert(entry.tree.paragraph_id.clone(), body);
+        let part_key = crate::token_table::typed_part_key(&entry.tree.part);
+        let id = naming(&part_key, &entry.tree.paragraph_id)?;
+        out.insert(id, body);
     }
     Ok(out)
 }
@@ -2715,39 +2866,6 @@ pub fn format_paragraphs(
     out
 }
 
-/// Read the restyle sidecar of a workdir (missing file = no edits).
-pub fn load_rpr_edits(root: &Path) -> Result<Vec<RprEdit>, CoreError> {
-    let path = root.join(RPR_EDITS_FILE);
-    if !path.is_file() {
-        return Ok(Vec::new());
-    }
-    let bytes = std::fs::read(&path).map_err(CoreError::io)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|error| CoreError::Domain(format!("invalid rpr_edits.json: {error}")))?;
-    if value.get("schema").and_then(|v| v.as_str()) != Some(RPR_EDITS_SCHEMA) {
-        return Err(CoreError::Domain(format!(
-            "incompatible rpr_edits.json schema: {}",
-            value
-                .get("schema")
-                .and_then(|v| v.as_str())
-                .unwrap_or("missing")
-        )));
-    }
-    let edits = value
-        .get("edits")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            CoreError::Domain("invalid rpr_edits.json: missing edits array".to_string())
-        })?;
-    let mut out = Vec::with_capacity(edits.len());
-    for edit in edits {
-        let parsed: RprEdit = serde_json::from_value(edit.clone())
-            .map_err(|error| CoreError::Domain(format!("invalid rpr_edits.json edit: {error}")))?;
-        out.push(parsed);
-    }
-    Ok(out)
-}
-
 /// Plan one `format_span`: resolve the addressed text to the runs it covers,
 /// derive the style, and return the record to append.
 ///
@@ -2850,23 +2968,6 @@ pub fn plan_format_span(
     })
 }
 
-/// Append a restyle to the workdir's sidecar (idempotent per paragraph+span:
-/// a repeat of the same record does not duplicate).
-pub fn record_format_span(root: &Path, edit: RprEdit) -> Result<usize, CoreError> {
-    let mut edits = load_rpr_edits(root)?;
-    let duplicate = edits.iter().any(|existing| {
-        existing.part == edit.part
-            && existing.paragraph_id == edit.paragraph_id
-            && existing.text_start == edit.text_start
-            && existing.text_end == edit.text_end
-    });
-    if !duplicate {
-        edits.push(edit);
-    }
-    save_rpr_edits(root, &edits)?;
-    Ok(edits.len())
-}
-
 /// `style_id -> w:rPr` for a workdir, the same map the build applies.
 pub fn load_style_rprs_for(root: &Path) -> Result<BTreeMap<String, String>, CoreError> {
     let path = root.join("styles.json");
@@ -2885,125 +2986,6 @@ pub fn load_style_rprs_for(root: &Path) -> Result<BTreeMap<String, String>, Core
         }
     }
     Ok(out)
-}
-
-/// Persist the restyle sidecar. An empty record REMOVES the file, matching the
-/// structure sidecar, so "no formatting changes" has one representation.
-pub fn save_rpr_edits(root: &Path, edits: &[RprEdit]) -> Result<(), CoreError> {
-    let path = root.join(RPR_EDITS_FILE);
-    if edits.is_empty() {
-        if path.is_file() {
-            std::fs::remove_file(&path).map_err(CoreError::io)?;
-        }
-        return Ok(());
-    }
-    let value = serde_json::json!({
-        "schema": RPR_EDITS_SCHEMA,
-        "edits": edits,
-    });
-    let mut json = serde_json::to_string_pretty(&value).expect("rpr edits serialize");
-    json.push('\n');
-    std::fs::write(&path, json).map_err(CoreError::io)
-}
-
-/// Apply recorded restyles to a package, in place.
-///
-/// Mirrors `apply_edits`' shape: read the canonical inventory once, resolve
-/// each edit to the leaves its span covers, collect byte spans, then splice
-/// them right-to-left so earlier offsets stay valid.
-///
-/// A run with no `w:rPr` gets one inserted at the run's open tag -- the
-/// reference always writes the derived properties, even onto a run that
-/// carried none.
-///
-/// Returns the new package and the paragraph ids it could NOT apply. The
-/// caller MUST report those: a restyle whose paragraph a later structure edit
-/// removed is stale, and dropping it silently is the defect class #26 named.
-pub fn apply_rpr_edits(
-    package: &[u8],
-    edits: &[RprEdit],
-    styles: &BTreeMap<String, String>,
-) -> Result<(Vec<u8>, Vec<String>), CoreError> {
-    if edits.is_empty() {
-        return Ok((package.to_vec(), Vec::new()));
-    }
-    let mut by_part: BTreeMap<String, Vec<&RprEdit>> = BTreeMap::new();
-    for edit in edits {
-        by_part.entry(edit.part.clone()).or_default().push(edit);
-    }
-    let mut stale: Vec<String> = Vec::new();
-    let mut current = package.to_vec();
-    for (part, part_edits) in &by_part {
-        let inventory = enumerate_package_bytes(&current)?;
-        let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-        for edit in part_edits {
-            let Some(style_rpr) = styles.get(&edit.style_id) else {
-                return Err(CoreError::Domain(format!(
-                    "format-style-unavailable: rpr_edits.json names {} which styles.json does not hold",
-                    edit.style_id
-                )));
-            };
-            // The paragraph's visible text, exactly the surface the read side
-            // publishes, so a span copied from it resolves here too.
-            let paragraph_leaves: Vec<&ProseLeaf> = inventory
-                .leaves
-                .iter()
-                .filter(|leaf| leaf.part_key == *part && leaf.paragraph_id == edit.paragraph_id)
-                .collect();
-            let paragraph_text: String = paragraph_leaves
-                .iter()
-                .filter(|leaf| leaf.text_start != leaf.text_end)
-                .map(|leaf| leaf.text.clone())
-                .collect();
-            let length = paragraph_text.chars().count();
-            if edit.text_end > length || edit.text_start >= edit.text_end {
-                stale.push(edit.paragraph_id.clone());
-                continue;
-            }
-            let mut cursor = 0usize;
-            let mut targets: Vec<&ProseLeaf> = Vec::new();
-            for leaf in &paragraph_leaves {
-                if leaf.text_start == leaf.text_end {
-                    continue;
-                }
-                let leaf_length = leaf.text.chars().count();
-                let (leaf_start, leaf_end) = (cursor, cursor + leaf_length);
-                cursor = leaf_end;
-                if leaf_start < edit.text_end && leaf_end > edit.text_start {
-                    targets.push(leaf);
-                }
-            }
-            if targets.is_empty() {
-                stale.push(edit.paragraph_id.clone());
-                continue;
-            }
-            for leaf in targets {
-                let (start, end) = if leaf.rpr_start == leaf.rpr_end {
-                    // No rPr on the run: insert one immediately after the
-                    // run's open tag, where an rPr belongs.
-                    (leaf.run_open_end, leaf.run_open_end)
-                } else {
-                    (leaf.rpr_start, leaf.rpr_end)
-                };
-                spans.push((start, end, style_rpr.as_bytes().to_vec()));
-            }
-        }
-        if spans.is_empty() {
-            continue;
-        }
-        let part_bytes = read_part_bytes(&current, &part_path(part))?;
-        spans.sort_by_key(|(start, _, _)| *start);
-        let mut new_part = part_bytes.clone();
-        for (start, end, replacement) in spans.into_iter().rev() {
-            if end > new_part.len() || start > end {
-                stale.push(part.clone());
-                continue;
-            }
-            new_part.splice(start..end, replacement);
-        }
-        current = patch_zip_member(&current, &part_path(part), &new_part)?;
-    }
-    Ok((current, stale))
 }
 
 /// Read the island-edit sidecar of a workdir (missing file = no edits).
@@ -3099,6 +3081,22 @@ const EPHEMERAL_P_ATTRS: [&str; 7] = [
 
 /// One synthesised paragraph: rendered from the `inherit` baseline
 /// paragraph and spliced before `insert_before` (None = append).
+/// How much of the inherit paragraph's formatting a new paragraph takes.
+///
+/// `safe_inherit` is the default and the only one an agent normally needs: the
+/// allowlist in `safe_property_block` copies the formatting and leaves every
+/// revision record, section break and unknown property behind. `none` exists for
+/// the case where even that is unwanted — the paragraph is written with no
+/// inherited properties at all, which is what Word does for a paragraph typed
+/// into an empty document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatPolicy {
+    #[default]
+    SafeInherit,
+    None,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NewParagraph {
     /// Part key ("document"); container parts are out of scope.
@@ -3114,6 +3112,10 @@ pub struct NewParagraph {
     /// Baseline id the new paragraph is spliced before; None = append.
     #[serde(default)]
     pub insert_before: Option<String>,
+    /// How much formatting to take from `inherit`. Defaults to `safe_inherit`,
+    /// so a sidecar written before this field existed keeps its old behaviour.
+    #[serde(default)]
+    pub format_policy: FormatPolicy,
 }
 
 /// One removed baseline paragraph: not rendered, so its `w:p` disappears.
@@ -3279,15 +3281,28 @@ pub fn validate_structure(template: &Path, edits: &StructureEdits) -> Result<(),
         if !paragraph.inherit.starts_with('P') {
             return Err(container_paragraph_error(&paragraph.inherit));
         }
-        if let Some(reason) = structure_reason(&part, &inventory, &paragraph.inherit, start, end) {
-            return Err(CoreError::Domain(format!(
-                "invalid-structure: new paragraph cannot inherit protected structure: {} \
-                 (inherits {}: {reason})",
-                paragraph.paragraph_id, paragraph.inherit
-            )));
-        }
+        // The anchor's own structure is no longer a reason to refuse: Safe
+        // Paragraph Synthesis copies only the properties that may be copied
+        // (`safe_property_block`), so a field, a bookmark or the section break
+        // stays where it is and never reaches the new paragraph. What is still
+        // checked is that the anchor EXISTS and is a body paragraph — above —
+        // and the renderer refuses any property it does not recognise rather
+        // than dropping it.
+        let _ = (start, end);
         if let Some(anchor) = &paragraph.insert_before {
-            if range_of(anchor).is_none() {
+            // The anchor may be a paragraph this structure is about to insert:
+            // two paragraphs sent "after the same one" chain, because the second
+            // is recorded before the first — that is where the draft put it. It
+            // has no range in the template yet, and demanding one refused the
+            // workdir at build time, permanently: every later save failed with
+            // `unknown insert_before paragraph`, and nothing on the caller's side
+            // could undo it. A real sequence found this by inserting twice.
+            let in_template = range_of(anchor).is_some();
+            let in_structure = edits
+                .new_paragraphs
+                .iter()
+                .any(|other| other.paragraph_id == *anchor);
+            if !in_template && !in_structure {
                 return Err(CoreError::Domain(format!(
                     "invalid-structure: unknown insert_before paragraph: {anchor}"
                 )));
@@ -3350,6 +3365,184 @@ fn body_append_offset(xml: &[u8]) -> Result<usize, CoreError> {
 /// Render one synthesised `w:p`: the inherit paragraph's opening tag with
 /// ephemeral attributes stripped, its `pPr` verbatim, and one run carrying
 /// the inherit paragraph's run properties (`typed_docx.py`
+/// The `w:pPr` children a synthesised paragraph may inherit.
+///
+/// An ALLOWLIST, not a blacklist. A child this build does not recognise is
+/// REFUSED rather than dropped: silently losing a property produces a paragraph
+/// that looks right and is not, and the caller never learns which one it lost.
+/// Measured on a real patent: `insert_after` refused fourteen times because the
+/// anchor carried tracked revisions, while the revisions themselves were never
+/// the problem — only the paragraph mark's own revision was.
+const SAFE_PPR_CHILDREN: [&str; 27] = [
+    "pStyle",
+    "keepNext",
+    "keepLines",
+    "pageBreakBefore",
+    "widowControl",
+    "numPr",
+    "suppressLineNumbers",
+    "shd",
+    "tabs",
+    "suppressAutoHyphens",
+    "kinsoku",
+    "wordWrap",
+    "overflowPunct",
+    "topLinePunct",
+    "autoSpaceDE",
+    "autoSpaceDN",
+    "bidi",
+    "adjustRightInd",
+    "snapToGrid",
+    "spacing",
+    "ind",
+    "contextualSpacing",
+    "mirrorIndents",
+    "jc",
+    "textAlignment",
+    "outlineLvl",
+    "rPr",
+];
+
+/// `w:pPr` children that are never inherited, each for its own reason.
+///
+/// `sectPr` would give the new paragraph a SECOND section break — the layout of
+/// the document changes. `pPrChange` / `rPrChange` are revision records: copying
+/// one makes the new paragraph claim a change a human made to a DIFFERENT
+/// paragraph. `framePr` positions a text frame, `divId` / `cnfStyle` belong to
+/// HTML-flavoured producers — none of them is formatting a new paragraph should
+/// silently wear.
+const REFUSED_PPR_CHILDREN: [&str; 5] = ["sectPr", "pPrChange", "rPrChange", "divId", "cnfStyle"];
+
+/// The `w:rPr` children a synthesised paragraph or run may inherit.
+const SAFE_RPR_CHILDREN: [&str; 36] = [
+    "rStyle",
+    "rFonts",
+    "b",
+    "bCs",
+    "i",
+    "iCs",
+    "caps",
+    "smallCaps",
+    "strike",
+    "dstrike",
+    "outline",
+    "shadow",
+    "emboss",
+    "imprint",
+    "noProof",
+    "snapToGrid",
+    "vanish",
+    "webHidden",
+    "color",
+    "spacing",
+    "w",
+    "kern",
+    "position",
+    "sz",
+    "szCs",
+    "highlight",
+    "u",
+    "effect",
+    "bdr",
+    "shd",
+    "fitText",
+    "vertAlign",
+    "rtl",
+    "cs",
+    "em",
+    "lang",
+];
+
+/// `w:rPr` children that are never inherited: the same revision records, plus
+/// the revision wrappers that turn a run into a tracked change.
+const REFUSED_RPR_CHILDREN: [&str; 7] = [
+    "rPrChange",
+    "ins",
+    "del",
+    "moveFrom",
+    "moveTo",
+    "eastAsianLayout",
+    "specVanish",
+];
+
+/// One property block (`w:pPr` or `w:rPr`) taken through the allowlist.
+///
+/// `xml` is the whole part; `node` indexes into `nodes`. The open tag is kept
+/// verbatim, refused children are dropped on purpose, and an unknown child is a
+/// refusal — never a silent omission.
+fn safe_property_block(
+    xml: &[u8],
+    nodes: &[ElementNode],
+    node: &ElementNode,
+    allow: &[&str],
+    refuse: &[&str],
+    what: &str,
+) -> Result<Vec<u8>, CoreError> {
+    let mut out = xml[node.open_start..node.open_end].to_vec();
+    for &child in &node.children {
+        let child_node = &nodes[child];
+        let name = child_node.name.as_str();
+        if refuse.contains(&name) {
+            continue;
+        }
+        if name == "rPr" {
+            // The paragraph mark's own run properties. Formatting belongs to the
+            // new paragraph; a revision wrapper on that mark does not — copying
+            // one makes the new paragraph claim a change made to another one.
+            let inner_nodes = build_tree(&scan_tags(&xml[child_node.open_start..child_node.end]))?;
+            if let Some(inner_root) = inner_nodes.first() {
+                let filtered = safe_property_block(
+                    &xml[child_node.open_start..child_node.end],
+                    &inner_nodes,
+                    inner_root,
+                    allow,
+                    refuse,
+                    what,
+                )?;
+                out.extend_from_slice(&filtered);
+            }
+            continue;
+        }
+        if name == "numPr" {
+            // A numbering reference is formatting, but it points at a
+            // definition elsewhere: keep the reference, drop any revision
+            // wrapper inside it, and refuse the rest rather than guess.
+            let mut inner = xml[child_node.open_start..child_node.open_end].to_vec();
+            for &grandchild in &child_node.children {
+                let g = &nodes[grandchild];
+                match g.name.as_str() {
+                    "ilvl" | "numId" => inner.extend_from_slice(&xml[g.open_start..g.end]),
+                    "ins" | "del" | "moveFrom" | "moveTo" | "numPrChange" => {}
+                    other => {
+                        return Err(CoreError::Domain(format!(
+                            "invalid-structure: {what} carries `numPr/{other}`, which this build \
+                             does not know how to inherit safely; nothing was written"
+                        )))
+                    }
+                }
+            }
+            if child_node.self_closing {
+                continue;
+            }
+            inner.extend_from_slice(&xml[child_node.close_start..child_node.end]);
+            out.extend_from_slice(&inner);
+            continue;
+        }
+        if !allow.contains(&name) {
+            return Err(CoreError::Domain(format!(
+                "invalid-structure: {what} carries `{name}`, which this build does not know how \
+                 to inherit safely; nothing was written. Inherit from a paragraph whose \
+                 properties are plain, or report this as a gap rather than working around it"
+            )));
+        }
+        out.extend_from_slice(&xml[child_node.open_start..child_node.end]);
+    }
+    if !node.self_closing {
+        out.extend_from_slice(&xml[node.close_start..node.end]);
+    }
+    Ok(out)
+}
+
 /// `_render_paragraph` + `_new_paragraph_opening`).
 fn render_new_paragraph(
     part: &[u8],
@@ -3379,23 +3572,58 @@ fn render_new_paragraph(
         // `<w:p .../>` cannot be reopened: drop the `/` to keep the tag open.
         opening.pop();
     }
-    let ppr = root
+    // Safe Paragraph Synthesis: the anchor supplies POSITION and FORMAT, and
+    // only the format that may be copied is copied. A paragraph carrying tracked
+    // revisions is a perfectly good anchor — its revisions are simply not part
+    // of the format — which is why the decision here is per-property rather than
+    // per-paragraph.
+    let what = format!("paragraph {}'s properties", paragraph.inherit);
+    let inherit_properties = paragraph.format_policy == FormatPolicy::SafeInherit;
+    let ppr = match root
         .children
         .iter()
         .find(|&&child| nodes[child].name == "pPr")
-        .map(|&child| &inherit[nodes[child].open_start..nodes[child].end])
-        .unwrap_or_default();
-    let rpr = inventory
+        .filter(|_| inherit_properties)
+    {
+        Some(&child) => safe_property_block(
+            inherit,
+            &nodes,
+            &nodes[child],
+            &SAFE_PPR_CHILDREN,
+            &REFUSED_PPR_CHILDREN,
+            &what,
+        )?,
+        None => Vec::new(),
+    };
+    let rpr = match inventory
         .leaves
         .iter()
         .find(|leaf| leaf.paragraph_id == paragraph.inherit && leaf.leaf_index == 0)
-        .map(|leaf| leaf.rpr.as_str())
-        .unwrap_or("");
+        .map(|leaf| leaf.rpr.clone())
+        .filter(|_| inherit_properties)
+        .filter(|rpr| !rpr.is_empty())
+    {
+        Some(rpr) => {
+            let nodes = build_tree(&scan_tags(rpr.as_bytes()))?;
+            match nodes.first() {
+                Some(node) => safe_property_block(
+                    rpr.as_bytes(),
+                    &nodes,
+                    node,
+                    &SAFE_RPR_CHILDREN,
+                    &REFUSED_RPR_CHILDREN,
+                    &what,
+                )?,
+                None => Vec::new(),
+            }
+        }
+        None => Vec::new(),
+    };
     let mut out = strip_ephemeral_p_attrs(&opening);
-    out.extend_from_slice(ppr);
+    out.extend_from_slice(&ppr);
     if !paragraph.body.is_empty() {
         out.extend_from_slice(b"<w:r>");
-        out.extend_from_slice(rpr.as_bytes());
+        out.extend_from_slice(&rpr);
         let space = if needs_xml_space(&paragraph.body) {
             " xml:space=\"preserve\""
         } else {
@@ -3494,11 +3722,18 @@ fn strip_ephemeral_p_attrs(opening: &[u8]) -> Vec<u8> {
 /// Splice the structural edits into one document part: deleted paragraphs
 /// are dropped, synthesised paragraphs land before the next surviving
 /// baseline paragraph (or at the append offset).
+/// The spliced part, and the ids of the paragraphs it carries IN DOCUMENT ORDER.
+///
+/// The ids are the document's own identity: the template's keep what extraction
+/// gave them, a synthesised one carries the id the structure recorded. Handing
+/// them out here is what keeps every consumer from re-deriving them by POSITION —
+/// which is wrong the moment one paragraph is inserted, because everything after
+/// it is renumbered.
 fn splice_structure(
     part: &[u8],
     inventory: &ProseInventory,
     edits: &StructureEdits,
-) -> Result<Vec<u8>, CoreError> {
+) -> Result<(Vec<u8>, Vec<String>), CoreError> {
     let located = scan_document(part)?;
     let index_of: BTreeMap<&str, usize> = located
         .iter()
@@ -3511,52 +3746,108 @@ fn splice_structure(
         .map(|paragraph| paragraph.paragraph_id.as_str())
         .collect();
     let append_at = body_append_offset(part)?;
-    let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    let mut spans: Vec<(usize, usize, Vec<u8>, Option<String>)> = Vec::new();
     for paragraph in &edits.deleted_paragraphs {
         let index = index_of[paragraph.paragraph_id.as_str()];
         let (_, start, end) = &located[index];
-        spans.push((*start, *end, Vec::new()));
+        spans.push((*start, *end, Vec::new(), None));
     }
-    for paragraph in &edits.new_paragraphs {
+    // Where each synthesised paragraph goes. An anchor may be a paragraph of the
+    // template, a paragraph that a delete is removing (fall forward to the next
+    // survivor), or a paragraph this structure is about to insert — two
+    // paragraphs sent "after the same one" chain, and the chain has to resolve to
+    // the place the anchor itself will be. A chain that leads back to itself is a
+    // refusal: resolving it is a hang, not an answer.
+    let anchor_offset = |anchor: &str| -> Result<usize, CoreError> {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut current = anchor.to_string();
+        loop {
+            if !seen.insert(current.clone()) {
+                return Err(CoreError::Domain(format!(
+                    "invalid-structure: insert_before paragraphs form a cycle at {current}"
+                )));
+            }
+            if let Some(mut index) = index_of.get(current.as_str()).copied() {
+                loop {
+                    let (id, start, _) = &located[index];
+                    if !deleted.contains(id.as_str()) {
+                        return Ok(*start);
+                    }
+                    index += 1;
+                    if index >= located.len() {
+                        return Ok(append_at);
+                    }
+                }
+            }
+            match edits
+                .new_paragraphs
+                .iter()
+                .find(|paragraph| paragraph.paragraph_id == current)
+            {
+                Some(pending) => match &pending.insert_before {
+                    Some(next) => current = next.clone(),
+                    None => return Ok(append_at),
+                },
+                None => {
+                    return Err(CoreError::Domain(format!(
+                        "invalid-structure: unknown insert_before paragraph: {current}"
+                    )))
+                }
+            }
+        }
+    };
+    for paragraph in edits.new_paragraphs.iter().rev() {
+        // Reversed: a stable sort keeps this order for paragraphs that land at
+        // the same offset, and there the LATER one comes first — it was sent
+        // "after the same paragraph" and the draft already showed the earlier
+        // one there.
         let at = match &paragraph.insert_before {
             None => append_at,
-            Some(anchor) => {
-                // The anchor may itself have been deleted since the insert
-                // was committed: fall forward to the next surviving one.
-                let mut target = None;
-                let mut index = index_of.get(anchor.as_str()).copied();
-                while let Some(current) = index {
-                    let (id, start, _) = &located[current];
-                    if !deleted.contains(id.as_str()) {
-                        target = Some(*start);
-                        break;
-                    }
-                    index = Some(current + 1);
-                }
-                target.unwrap_or(append_at)
-            }
+            Some(anchor) => anchor_offset(anchor)?,
         };
         spans.push((
             at,
             at,
             render_new_paragraph(part, inventory, &located, paragraph)?,
+            Some(paragraph.paragraph_id.clone()),
         ));
     }
-    spans.sort_by_key(|(start, end, _)| (*start, *end));
+    spans.sort_by_key(|(start, end, _, _)| (*start, *end));
+    let survivors: Vec<(usize, &str)> = located
+        .iter()
+        .filter(|(id, _, _)| !deleted.contains(id.as_str()))
+        .map(|(id, start, _)| (*start, id.as_str()))
+        .collect();
+    let mut ids: Vec<String> = Vec::with_capacity(survivors.len() + spans.len());
+    let mut next_survivor = 0usize;
     let mut out = Vec::with_capacity(part.len());
     let mut cursor = 0usize;
-    for (start, end, replacement) in spans {
+    for (start, end, replacement, pending) in spans {
         if start < cursor || end < start {
             return Err(CoreError::Domain(
                 "invalid-structure: overlapping paragraph splices".to_string(),
             ));
         }
+        // Everything the insertion lands past comes first; a paragraph starting
+        // exactly at this offset comes after it, which is what "insert before
+        // this paragraph" means.
+        while next_survivor < survivors.len() && survivors[next_survivor].0 < start {
+            ids.push(survivors[next_survivor].1.to_string());
+            next_survivor += 1;
+        }
+        if let Some(id) = pending {
+            ids.push(id);
+        }
         out.extend_from_slice(&part[cursor..start]);
         out.extend_from_slice(&replacement);
         cursor = end;
     }
+    while next_survivor < survivors.len() {
+        ids.push(survivors[next_survivor].1.to_string());
+        next_survivor += 1;
+    }
     out.extend_from_slice(&part[cursor..]);
-    Ok(out)
+    Ok((out, ids))
 }
 
 /// The full edited build: island leaf surgery first, then the structural
@@ -3566,24 +3857,45 @@ pub fn apply_build(
     template: &Path,
     islands: &[IslandEdit],
     structure: &StructureEdits,
-    rpr_edits: &[RprEdit],
-    styles: &BTreeMap<String, String>,
-) -> Result<(Vec<u8>, Vec<String>), CoreError> {
+) -> Result<BuildOutput, CoreError> {
     let package = apply_edits(template, islands)?;
     // Structural synthesis first: it decides which paragraphs exist, and a
     // restyle addresses paragraphs. Then the property lane over the result.
-    let package = if structure.is_empty() {
-        package
+    let (package, document_ids) = if structure.is_empty() {
+        (package, Vec::new())
     } else {
         validate_structure(template, structure)?;
         let part = read_part_bytes(&package, &part_path("document"))?;
         let inventory = enumerate_package_bytes(&package)?;
-        let new_part = splice_structure(&part, &inventory, structure)?;
-        patch_zip_member(&package, &part_path("document"), &new_part)?
+        let (new_part, ids) = splice_structure(&part, &inventory, structure)?;
+        (
+            patch_zip_member(&package, &part_path("document"), &new_part)?,
+            ids,
+        )
     };
-    // A restyle whose paragraph a structure edit removed is reported, never
-    // dropped silently and never resurrected (#26's class).
-    apply_rpr_edits(&package, rpr_edits, styles)
+    // Formatting is not this function's business: the format engine's plan is
+    // applied by the caller, after the paragraph set is settled (ADR 0050). The
+    // old replay lane's helpers still exist below, uncalled by anything — the
+    // deletion of that code is a separate cleanup, not a cutover.
+    Ok(BuildOutput {
+        package,
+        stale_restyles: Vec::new(),
+        document_ids,
+    })
+}
+
+/// What one build produced.
+#[derive(Clone, Debug)]
+pub struct BuildOutput {
+    /// The built package.
+    pub package: Vec<u8>,
+    /// Restyles whose paragraph a structure edit removed.
+    pub stale_restyles: Vec<String>,
+    /// The document part's paragraph ids IN DOCUMENT ORDER, by identity. Empty
+    /// when the build carried no structural edit, in which case the paragraph
+    /// ids are the ones a scan of the package mints and every consumer can use
+    /// those.
+    pub document_ids: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4526,12 +4838,181 @@ mod tests {
             .join(name)
     }
 
+    /// A handle names an exact span, so the applier must resolve THAT span. With
+    /// the search alone the pick is silent: a needle that occurs twice inside one
+    /// leaf resolves to the FIRST occurrence, whichever the caller meant. On a
+    /// real patent that is what drove a blind agent off the tool and into the XML
+    /// (9 of 13 uneditable matches); the anchored call resolves the occurrence
+    /// the handle named.
+    #[test]
+    fn an_anchored_span_resolves_the_occurrence_the_handle_named() {
+        let inventory = enumerate_package(&fixture("complex.docx")).expect("enumerate");
+        let leaf = inventory
+            .leaves
+            .iter()
+            .find(|leaf| {
+                leaf.text
+                    .chars()
+                    .next()
+                    .is_some_and(|first| leaf.text.matches(first).count() >= 2)
+            })
+            .expect("a leaf repeating its own first character");
+        let needle: String = leaf.text.chars().next().map(String::from).unwrap();
+        let first_at = leaf.text.find(&needle).unwrap();
+        let second_at =
+            leaf.text[first_at + needle.len()..].find(&needle).unwrap() + first_at + needle.len();
+        // Paragraph-level offset of the SECOND occurrence: every char of the
+        // paragraph's earlier leaves, then the position inside this one.
+        let mut prefix = 0usize;
+        for other in &inventory.leaves {
+            if other.part_key == leaf.part_key && other.paragraph_id == leaf.paragraph_id {
+                if other.leaf_index == leaf.leaf_index {
+                    break;
+                }
+                prefix += other.text.chars().count();
+            }
+        }
+        let inside = leaf.text[..second_at].chars().count();
+        let before = |span: &LeafSpanMatch| span.prefix.chars().count();
+
+        let unanchored = match_leaf_span(
+            &inventory,
+            &leaf.part_key,
+            &leaf.paragraph_id,
+            leaf.leaf_index,
+            &needle,
+        )
+        .expect("search")
+        .expect("found");
+        assert_eq!(
+            before(&unanchored),
+            leaf.text[..first_at].chars().count(),
+            "without an anchor the search silently picks the first occurrence"
+        );
+
+        let anchored = match_leaf_span_at(
+            &inventory,
+            &leaf.part_key,
+            &leaf.paragraph_id,
+            0,
+            &needle,
+            Some(prefix + inside),
+        )
+        .expect("anchored search")
+        .expect("the anchored span resolves");
+        assert_eq!(
+            before(&anchored),
+            inside,
+            "the anchored span starts at the offset the handle named"
+        );
+        assert_eq!(anchored.first_leaf, leaf.leaf_index);
+    }
+
+    /// A caller's offset is measured in the PROJECTION, where a tracked deletion
+    /// is a zero-width gap. Read against the runs instead — where the deleted
+    /// characters still have width — the anchor lands late, the anchored start is
+    /// skipped, and the span is refused `cross-leaf-edit`. On a real patent that
+    /// is every span after the first `w:del` in a paragraph: `P26`'s tail could
+    /// not be edited at all, while its earlier commas could.
+    #[test]
+    fn an_anchor_after_a_tracked_deletion_addresses_the_projection() {
+        let xml = b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+                    <w:body><w:p><w:r><w:t>AB</w:t></w:r>\
+                    <w:del w:id=\"1\" w:author=\"jinxq\"><w:r><w:delText>XY</w:delText></w:r></w:del>\
+                    <w:r><w:t>CD</w:t></w:r></w:p></w:body></w:document>";
+        let mut parts: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        parts.insert("document".to_string(), xml.to_vec());
+        let inventory = enumerate_parts(&parts).expect("enumerate");
+
+        let paragraph: Vec<&ProseLeaf> = inventory
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.paragraph_id == "P0")
+            .collect();
+        assert_eq!(
+            paragraph
+                .iter()
+                .map(|leaf| (leaf.text.as_str(), leaf.projected))
+                .collect::<Vec<_>>(),
+            vec![("AB", true), ("XY", false), ("CD", true)],
+            "the deleted run keeps its leaf and loses its place in the projection"
+        );
+
+        // The projection is `ABCD`, so `CD` starts at 2 there and at 4 among the
+        // runs. Only the caller's space may address a span.
+        let anchored = match_leaf_span_at(&inventory, "document", "P0", 0, "CD", Some(2))
+            .expect("anchored search")
+            .expect("the anchored span resolves");
+        assert_eq!(anchored.first_leaf, 2);
+        assert_eq!(
+            match_leaf_span_at(&inventory, "document", "P0", 0, "CD", Some(4)).expect("search"),
+            None,
+            "an offset counted over the runs is a different address, not a second chance"
+        );
+        assert_eq!(
+            match_leaf_span(&inventory, "document", "P0", 0, "CD")
+                .expect("search")
+                .expect("found")
+                .first_leaf,
+            2,
+            "the text itself was always reachable; only the anchor's space was wrong"
+        );
+    }
+
     fn ids(inventory: &ProseInventory) -> Vec<String> {
         inventory
             .paragraphs
             .iter()
             .map(|paragraph| paragraph.paragraph_id.clone())
             .collect()
+    }
+
+    /// The ids a build hands out are the document's IDENTITY, in document order —
+    /// not the ones a scan of the result would mint by position. Measured: an
+    /// inserted paragraph renumbered everything after it, and the projection then
+    /// keyed P2's markup under the inserted paragraph's id.
+    #[test]
+    fn a_built_document_reports_paragraph_ids_by_identity() {
+        let template = fixture("styled.docx");
+        let mut structure = StructureEdits::default();
+        structure.new_paragraphs.push(NewParagraph {
+            part: "document".to_string(),
+            paragraph_id: "P5".to_string(),
+            inherit: "P1".to_string(),
+            body: "插段一".to_string(),
+            insert_before: Some("P2".to_string()),
+            format_policy: FormatPolicy::SafeInherit,
+        });
+        let build =
+            apply_build(&template, &[], &structure).expect("build with one inserted paragraph");
+        assert_eq!(
+            build.document_ids,
+            vec![
+                "P0".to_string(),
+                "P1".to_string(),
+                "P5".to_string(),
+                "P2".to_string(),
+                "P3".to_string(),
+                "P4".to_string(),
+            ],
+            "the inserted paragraph has to be named where it lands, not where a scan puts it"
+        );
+
+        // And the markup map keys them the same way: P2 carries its own body.
+        let markup = paragraph_markup_map_with_ids(&build.package, &build.document_ids)
+            .expect("markup by identity");
+        assert!(
+            markup
+                .get("P2")
+                .is_some_and(|body| body.contains("智能") || body.contains("第一")),
+            "P2's markup is not P2's: {:?}",
+            markup.get("P2")
+        );
+        assert_eq!(
+            markup.len(),
+            build.document_ids.len(),
+            "the map and the id list describe different documents"
+        );
     }
 
     #[test]
@@ -4558,6 +5039,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let edits = StructureEdits {
             new_paragraphs: vec![NewParagraph {
+                format_policy: FormatPolicy::default(),
                 part: "document".to_string(),
                 paragraph_id: "N1".to_string(),
                 inherit: "P0".to_string(),
@@ -4582,6 +5064,7 @@ mod tests {
         let template = fixture("plain.docx");
         let edits = StructureEdits {
             new_paragraphs: vec![NewParagraph {
+                format_policy: FormatPolicy::default(),
                 part: "document".to_string(),
                 paragraph_id: "N1".to_string(),
                 inherit: "P0".to_string(),
@@ -4594,8 +5077,8 @@ mod tests {
             }],
         };
         validate_structure(&template, &edits).expect("valid structure edits");
-        let (bytes, stale) =
-            apply_build(&template, &[], &edits, &[], &BTreeMap::new()).expect("apply structure");
+        let build = apply_build(&template, &[], &edits).expect("apply structure");
+        let (bytes, stale) = (build.package, build.stale_restyles);
         assert!(stale.is_empty(), "no restyles were recorded: {stale:?}");
         let package = std::io::Cursor::new(bytes);
         let mut archive = zip::ZipArchive::new(package).expect("zip");
@@ -4769,8 +5252,10 @@ mod tests {
     #[test]
     fn editable_surface_flags_match_python() {
         let inventory = enumerate_package(&fixture("complex.docx")).expect("enumerate");
-        // P4 (drawing), P10 (proofErr), P12 (fldSimple), P15 (math) are
-        // locked; plain prose paragraphs are editable.
+        // P4 (drawing), P12 (fldSimple), P15 (math) are locked; plain prose
+        // paragraphs are editable. P10 is a deliberate divergence from the
+        // Python reference: it carries only a `proofErr` marker, and this build
+        // keeps such a paragraph editable.
         let locked: Vec<&str> = inventory
             .paragraphs
             .iter()
@@ -4781,9 +5266,15 @@ mod tests {
             locked.contains(&"P4"),
             "drawing paragraph locked: {locked:?}"
         );
+        // `proofErr` marks a proofing range — zero length, no text, no run — and
+        // Word writes it into paragraphs routinely. Counting it as a locked
+        // interior locked the WHOLE paragraph, so on a real patent 12 of 20
+        // matches reported uneditable for a spell-check marker and the agent's
+        // answer was to leave the tool and edit the XML by hand. An island edit
+        // rewrites runs only, so the marker survives without being named.
         assert!(
-            locked.contains(&"P10"),
-            "proofErr paragraph locked: {locked:?}"
+            !locked.contains(&"P10"),
+            "proofErr paragraph stays editable: {locked:?}"
         );
         assert!(
             locked.contains(&"P12"),
@@ -4845,6 +5336,7 @@ mod tests {
     fn island_edit_patches_only_the_leaf_bytes() {
         let template = fixture("table.docx");
         let edit = IslandEdit {
+            char_start: None,
             part: "document".to_string(),
             paragraph_id: "T0.R1.C1.P0".to_string(),
             leaf_index: 0,
@@ -4888,10 +5380,25 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_preservation_belongs_to_the_current_text_element() {
+        for tag in [
+            b"<w:t xml:space=\"preserve\">".as_slice(),
+            b"<w:t xml:space='preserve'>",
+        ] {
+            assert!(maybe_inject_xml_space(tag, tag.len()).is_none());
+        }
+        let xml = b"<w:t xml:space=\"preserve\"> old </w:t><w:t>";
+        let (_, _, tag) =
+            maybe_inject_xml_space(xml, xml.len()).expect("current text needs attribute");
+        assert_eq!(tag, b"<w:t xml:space=\"preserve\">");
+    }
+
+    #[test]
     fn island_edit_rejects_locked_leaf() {
         let template = fixture("complex.docx");
         // P12 is the fldSimple paragraph: locked.
         let edit = IslandEdit {
+            char_start: None,
             part: "document".to_string(),
             paragraph_id: "P12".to_string(),
             leaf_index: 0,
@@ -4909,6 +5416,7 @@ mod tests {
     fn island_edit_rejects_missing_old() {
         let template = fixture("plain.docx");
         let edit = IslandEdit {
+            char_start: None,
             part: "document".to_string(),
             paragraph_id: "P0".to_string(),
             leaf_index: 0,
@@ -4927,6 +5435,7 @@ mod tests {
         let template = fixture("plain.docx");
         // P5 text is "重复句子内容 重复句子内容。" — old occurs twice.
         let edit = IslandEdit {
+            char_start: None,
             part: "document".to_string(),
             paragraph_id: "P5".to_string(),
             leaf_index: 0,
@@ -5300,196 +5809,4 @@ mod tests {
     // -----------------------------------------------------------------------
     // format_span: the rPr restyle lane
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn a_restyle_replaces_the_runs_properties_in_place() {
-        let package = std::fs::read(fixture("styled.docx")).expect("fixture");
-        let inventory = enumerate_package_bytes(&package).expect("inventory");
-        let leaf = inventory
-            .leaves
-            .iter()
-            .find(|leaf| !leaf.rpr.is_empty() && leaf.editable)
-            .expect("an editable run with properties");
-        let style_id = "s_test_style".to_string();
-        let new_rpr = r#"<w:rPr><w:b/></w:rPr>"#.to_string();
-        let mut styles = BTreeMap::new();
-        styles.insert(style_id.clone(), new_rpr.clone());
-
-        let text_len = leaf.text.chars().count();
-        let edit = RprEdit {
-            part: leaf.part_key.clone(),
-            paragraph_id: leaf.paragraph_id.clone(),
-            text_start: 0,
-            text_end: text_len.max(1),
-            attributes: json!({ "bold": true }),
-            style_id: style_id.clone(),
-        };
-        let (out, stale) = apply_rpr_edits(&package, &[edit], &styles).expect("apply restyle");
-        assert!(stale.is_empty(), "nothing stale: {stale:?}");
-
-        // The target run now carries the new properties...
-        let after = enumerate_package_bytes(&out).expect("inventory after");
-        let restyled = after
-            .leaves
-            .iter()
-            .find(|candidate| {
-                candidate.paragraph_id == leaf.paragraph_id
-                    && candidate.leaf_index == leaf.leaf_index
-            })
-            .expect("the run survived");
-        assert_eq!(restyled.rpr, new_rpr, "the run's properties were rewritten");
-        // ...and nothing else in the document changed.
-        assert_eq!(
-            after.paragraphs.len(),
-            inventory.paragraphs.len(),
-            "a restyle adds no paragraphs"
-        );
-    }
-
-    #[test]
-    fn a_run_without_properties_gets_them_inserted() {
-        // The reference always writes the derived rPr, even onto a run that
-        // carried none, so the writer must insert rather than skip.
-        let package = std::fs::read(fixture("complex.docx")).expect("fixture");
-        let inventory = enumerate_package_bytes(&package).expect("inventory");
-        // complex.docx has 75 runs and 21 carrying rPr, so a bare editable run
-        // is guaranteed. Asserted rather than skipped: a test that can
-        // silently no-op is not a test.
-        let bare = inventory
-            .leaves
-            .iter()
-            .find(|leaf| leaf.rpr.is_empty() && leaf.editable && !leaf.text.is_empty())
-            .expect("complex.docx must have a bare editable run");
-        let mut styles = BTreeMap::new();
-        styles.insert("s_x".to_string(), "<w:rPr><w:i/></w:rPr>".to_string());
-        let edit = RprEdit {
-            part: bare.part_key.clone(),
-            paragraph_id: bare.paragraph_id.clone(),
-            text_start: 0,
-            text_end: bare.text.chars().count().max(1),
-            attributes: json!({ "italic": true }),
-            style_id: "s_x".to_string(),
-        };
-        let (out, stale) = apply_rpr_edits(&package, &[edit], &styles).expect("apply");
-        assert!(stale.is_empty());
-        let after = enumerate_package_bytes(&out).expect("inventory after");
-        let restyled = after
-            .leaves
-            .iter()
-            .find(|candidate| {
-                candidate.paragraph_id == bare.paragraph_id
-                    && candidate.leaf_index == bare.leaf_index
-            })
-            .expect("the run survived");
-        assert_eq!(restyled.rpr, "<w:rPr><w:i/></w:rPr>", "an rPr was inserted");
-    }
-
-    #[test]
-    fn a_span_covering_several_runs_restyles_each_of_them() {
-        let package = std::fs::read(fixture("norm.docx")).expect("fixture");
-        let inventory = enumerate_package_bytes(&package).expect("inventory");
-        // A paragraph with more than one editable leaf.
-        let paragraph_id = inventory
-            .leaves
-            .iter()
-            .filter(|leaf| leaf.editable && !leaf.text.is_empty())
-            .fold(BTreeMap::<String, usize>::new(), |mut acc, leaf| {
-                *acc.entry(leaf.paragraph_id.clone()).or_default() += 1;
-                acc
-            })
-            .into_iter()
-            .find(|(_, count)| *count > 1)
-            .map(|(id, _)| id);
-        let Some(paragraph_id) = paragraph_id else {
-            return;
-        };
-        let leaves: Vec<&ProseLeaf> = inventory
-            .leaves
-            .iter()
-            .filter(|leaf| leaf.paragraph_id == paragraph_id && leaf.editable)
-            .collect();
-        let total: usize = leaves.iter().map(|leaf| leaf.text.chars().count()).sum();
-
-        let mut styles = BTreeMap::new();
-        styles.insert("s_multi".to_string(), "<w:rPr><w:u/></w:rPr>".to_string());
-        let edit = RprEdit {
-            part: leaves[0].part_key.clone(),
-            paragraph_id: paragraph_id.clone(),
-            text_start: 0,
-            text_end: total,
-            attributes: json!({ "underline": true }),
-            style_id: "s_multi".to_string(),
-        };
-        let (out, stale) = apply_rpr_edits(&package, &[edit], &styles).expect("apply");
-        assert!(stale.is_empty());
-        let after = enumerate_package_bytes(&out).expect("inventory after");
-        let restyled: Vec<&ProseLeaf> = after
-            .leaves
-            .iter()
-            .filter(|leaf| leaf.paragraph_id == paragraph_id && leaf.editable)
-            .collect();
-        assert!(
-            restyled
-                .iter()
-                .all(|leaf| leaf.rpr == "<w:rPr><w:u/></w:rPr>"),
-            "every covered run was restyled, not just the first: {:?}",
-            restyled
-                .iter()
-                .map(|leaf| leaf.rpr.clone())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn a_restyle_whose_paragraph_is_gone_is_reported_stale() {
-        // #26's class: never silent, and never resurrected.
-        let package = std::fs::read(fixture("norm.docx")).expect("fixture");
-        let mut styles = BTreeMap::new();
-        styles.insert("s_y".to_string(), "<w:rPr><w:b/></w:rPr>".to_string());
-        let edit = RprEdit {
-            part: "document".to_string(),
-            paragraph_id: "P_does_not_exist".to_string(),
-            text_start: 0,
-            text_end: 3,
-            attributes: json!({ "bold": true }),
-            style_id: "s_y".to_string(),
-        };
-        let (out, stale) = apply_rpr_edits(&package, &[edit], &styles).expect("apply");
-        assert_eq!(stale, vec!["P_does_not_exist".to_string()]);
-        assert_eq!(out, package, "a stale restyle changes nothing");
-    }
-
-    #[test]
-    fn the_sidecar_round_trips_and_an_empty_one_is_removed() {
-        let dir = std::env::temp_dir().join(format!(
-            "docx2typed-rpr-edits-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch");
-        assert!(load_rpr_edits(&dir)
-            .expect("missing file is no edits")
-            .is_empty());
-
-        let edits = vec![RprEdit {
-            part: "document".to_string(),
-            paragraph_id: "P1".to_string(),
-            text_start: 2,
-            text_end: 5,
-            attributes: json!({ "vertAlign": "superscript" }),
-            style_id: "s_z".to_string(),
-        }];
-        save_rpr_edits(&dir, &edits).expect("save");
-        assert_eq!(load_rpr_edits(&dir).expect("load"), edits);
-
-        save_rpr_edits(&dir, &[]).expect("clear");
-        assert!(
-            !dir.join(RPR_EDITS_FILE).is_file(),
-            "an empty record removes the file, so 'no formatting changes' has one representation"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

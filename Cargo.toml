@@ -11,6 +11,7 @@ license = "MIT"
 [workspace]
 members = [
     "crates/docx2typed-protocol",
+    "crates/docx2typed-format",
     "crates/docx2typed-core",
     "crates/docx2typed-store",
     "crates/docx2typed-verify",
@@ -21,6 +22,7 @@ resolver = "2"
 
 [dependencies]
 docx2typed-app = { version = "0.2.1", path = "crates/docx2typed-app" }
+docx2typed-format = { version = "0.2.1", path = "crates/docx2typed-format" }
 docx2typed-core = { version = "0.2.1", path = "crates/docx2typed-core" }
 docx2typed-protocol = { version = "0.2.1", path = "crates/docx2typed-protocol" }
 docx2typed-review = { version = "0.2.1", path = "crates/docx2typed-review" }

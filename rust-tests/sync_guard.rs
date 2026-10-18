@@ -395,6 +395,434 @@ fn an_allowed_reset_leaves_a_workdir_that_builds() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `baseline.view` survives the normal lifecycle and refusals untouched.
+///
+/// B is written once at the first projection init and never rewritten (ADR
+/// 0051, principle 2): edits, commits, reopen cycles, a refused batch and an
+/// inconsistent state all leave the frozen baseline byte-identical. A fresh
+/// extract over a clean workdir in a NEW directory initializes a new B for
+/// the incoming document.
+#[test]
+fn baseline_view_survives_edits_and_refusals_while_fresh_extract_initializes() {
+    use sha2::{Digest, Sha256};
+    let dir = scratch("baseline-freeze");
+    let source = dir.join("source.docx");
+    std::fs::copy(fixture("styled"), &source).expect("copy fixture");
+    let workdir = dir.join("wd");
+    assert_eq!(extract(&source, &workdir)["outcome"], "success");
+    let sha = |path: &std::path::Path| {
+        format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(path).expect("read file"))
+        )
+    };
+    let mut session = vec![json!({
+        "name": "workdir_open",
+        "arguments": { "workdir": workdir.to_str().expect("utf8"), "track": true, "author": "freeze" },
+    })];
+    // Extract alone writes no projection: the first read initializes B.
+    let first_read = call("document_read", json!({}), &session);
+    assert_eq!(
+        first_read["outcome"], "success",
+        "the first read initializes the projection: {first_read}"
+    );
+    assert!(
+        workdir.join("baseline.view").is_file(),
+        "the first read wrote the frozen baseline"
+    );
+    // First projection init writes B; capture it before any edit.
+    let frozen = std::fs::read(workdir.join("baseline.view")).expect("baseline.view written once");
+    let frozen_sha = sha(&workdir.join("baseline.view"));
+    let state_text =
+        std::fs::read_to_string(workdir.join("edit.state.json")).expect("state written at init");
+    let state_value: serde_json::Value = serde_json::from_str(&state_text).expect("state json");
+    assert_eq!(
+        state_value
+            .get("editable_view_contract")
+            .and_then(serde_json::Value::as_str),
+        Some("editable-view-1"),
+        "every projection init pins the editable-view contract beside the binding"
+    );
+    let patch = call(
+        "document_patch",
+        json!({
+            "operation_id": "op_freeze_patch",
+            "hunks": [{ "paragraph_id": "P4", "old": "智能响应材料与 ABC", "new": "智能响应材料与 XYZ" }],
+        }),
+        &session,
+    );
+    assert_eq!(patch["outcome"], "success", "the draft: {patch}");
+    assert_eq!(
+        sha(&workdir.join("baseline.view")),
+        frozen_sha,
+        "B unchanged by an edit"
+    );
+    session.push(json!({
+        "name": "document_patch",
+        "arguments": {
+            "operation_id": "op_freeze_patch",
+            "hunks": [{ "paragraph_id": "P4", "old": "智能响应材料与 ABC", "new": "智能响应材料与 XYZ" }],
+        },
+    }));
+    assert_eq!(
+        call(
+            "commit_sync",
+            json!({ "operation_id": "op_freeze_commit" }),
+            &session
+        )["outcome"],
+        "success"
+    );
+    assert_eq!(
+        sha(&workdir.join("baseline.view")),
+        frozen_sha,
+        "B unchanged by a commit"
+    );
+    // A real save after the commit: B stays frozen through publication.
+    let out = dir.join("saved.docx");
+    let saved = call(
+        "build_docx",
+        json!({ "operation_id": "op_freeze_save", "output": out.to_str().expect("utf8") }),
+        &session,
+    );
+    assert_eq!(saved["outcome"], "success", "the save: {saved}");
+    assert!(out.is_file(), "the saved output landed");
+    assert_eq!(
+        sha(&workdir.join("baseline.view")),
+        frozen_sha,
+        "B unchanged by a save"
+    );
+    // Reopen the same workdir; B bytes are identical.
+    let reopened = call(
+        "workdir_open",
+        json!({ "workdir": workdir.to_str().expect("utf8") }),
+        &session,
+    );
+    assert_eq!(reopened["outcome"], "success", "reopen: {reopened}");
+    assert_eq!(
+        std::fs::read(workdir.join("baseline.view")).expect("B"),
+        frozen,
+        "B bytes unchanged on reopen"
+    );
+    // A refused batch changes nothing, including B.
+    let refused = call(
+        "document_patch",
+        json!({
+            "operation_id": "op_freeze_bad",
+            "hunks": [{ "paragraph_id": "P4", "old": "no-such-text", "new": "x" }],
+        }),
+        &session,
+    );
+    assert_eq!(
+        refused["outcome"], "failure",
+        "a bad hunk is refused: {refused}"
+    );
+    assert_eq!(
+        std::fs::read(workdir.join("baseline.view")).expect("B"),
+        frozen,
+        "B unchanged by a refusal"
+    );
+    // An inconsistent state (stale content vs the pinned binding) is refused
+    // by classify_edit_state before any write, so B is untouched as well.
+    std::fs::write(workdir.join("edit.md"), "tampered\n").expect("tamper the draft");
+    let stale = call(
+        "commit_sync",
+        json!({ "operation_id": "op_freeze_stale" }),
+        &session,
+    );
+    assert_eq!(
+        stale["outcome"], "failure",
+        "an inconsistent draft is refused: {stale}"
+    );
+    assert_eq!(
+        std::fs::read(workdir.join("baseline.view")).expect("B"),
+        frozen,
+        "B unchanged by an inconsistent state"
+    );
+    // Extract the SAVED docx (carrying the committed edit) into a NEW workdir:
+    // the fresh lifecycle initializes a new B reflecting the edited text.
+    let fresh = dir.join("fresh");
+    assert_eq!(extract(&out, &fresh)["outcome"], "success");
+    let fresh_read = call(
+        "document_read",
+        json!({}),
+        &[json!({
+            "name": "workdir_open",
+            "arguments": { "workdir": fresh.to_str().expect("utf8") },
+        })],
+    );
+    assert_eq!(
+        fresh_read["outcome"], "success",
+        "the fresh workdir initializes its own projection: {fresh_read}"
+    );
+    let fresh_b = std::fs::read(fresh.join("baseline.view")).expect("fresh B written at init");
+    let fresh_text = std::fs::read_to_string(fresh.join("baseline.view")).expect("fresh B text");
+    assert_ne!(
+        fresh_b, frozen,
+        "a fresh extract initializes a new baseline for the saved document"
+    );
+    assert!(
+        fresh_text.contains("智能响应材料与 XYZ"),
+        "the new baseline carries the edited text"
+    );
+}
+
+/// Existing B + missing edit.state is refused before mutation, never rebuilt.
+///
+/// `baseline.view` carries no version marker, so a state file lost to a crash
+/// or a hand edit cannot be distinguished from a stale-format baseline — the
+/// only honest repair is a fresh extract. `edit.state.json`'s
+/// schema/sync/segmentation guards cannot help here because they only run
+/// when the state file exists, which is exactly what is missing.
+#[test]
+fn projection_with_baseline_but_no_state_refuses_without_overwriting() {
+    let dir = scratch("baseline-orphan");
+    let source = dir.join("source.docx");
+    std::fs::copy(fixture("styled"), &source).expect("copy fixture");
+    let workdir = dir.join("wd");
+    assert_eq!(extract(&source, &workdir)["outcome"], "success");
+    let session = vec![json!({
+        "name": "workdir_open",
+        "arguments": { "workdir": workdir.to_str().expect("utf8") },
+    })];
+    assert_eq!(
+        call("document_read", json!({}), &session)["outcome"],
+        "success"
+    );
+    assert!(workdir.join("baseline.view").is_file(), "B initialized");
+    let before = std::fs::read(workdir.join("baseline.view")).expect("B");
+    std::fs::remove_file(workdir.join("edit.state.json")).expect("drop the state");
+    // The next projection init refuses instead of silently regenerating B.
+    // (`workdir_open` alone never touches the projection, so the refusal
+    // surfaces on the first read, before any mutation.)
+    let reopened = call(
+        "document_read",
+        json!({}),
+        &[json!({
+            "name": "workdir_open",
+            "arguments": { "workdir": workdir.to_str().expect("utf8") },
+        })],
+    );
+    assert_eq!(
+        reopened["outcome"], "failure",
+        "orphaned B must refuse: {reopened}"
+    );
+    assert!(
+        codes(&reopened)
+            .iter()
+            .any(|code| code == "workdir-invalid"),
+        "the refusal names the condition: {reopened}"
+    );
+    let message = reopened["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("re-extract"),
+        "the refusal names the way out: {message}"
+    );
+    assert_eq!(
+        std::fs::read(workdir.join("baseline.view")).expect("B"),
+        before,
+        "the refusal wrote nothing over the existing baseline"
+    );
+    assert!(
+        !workdir.join("edit.state.json").exists(),
+        "no state was silently rebuilt"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A known B without the contract marker is a mixed generation, not a reopen.
+///
+/// Pre-marker workdirs (before this marker existed) carry a `baseline.view`
+/// whose rendering rule no read here can recover — `baseline.view` has no
+/// version marker and the `edit.state.json` schema/sync/segmentation guards
+/// only check the binding, not the rule B was rendered under. The gate fails
+/// closed with a fresh-extract diagnosis, before any mutation, and B bytes
+/// are untouched.
+#[test]
+fn baseline_without_contract_marker_refuses_without_overwriting() {
+    let dir = scratch("baseline-premarker");
+    let source = dir.join("source.docx");
+    std::fs::copy(fixture("styled"), &source).expect("copy fixture");
+    let workdir = dir.join("wd");
+    assert_eq!(extract(&source, &workdir)["outcome"], "success");
+    let session = vec![json!({
+        "name": "workdir_open",
+        "arguments": { "workdir": workdir.to_str().expect("utf8") },
+    })];
+    assert_eq!(
+        call("document_read", json!({}), &session)["outcome"],
+        "success"
+    );
+    let before = std::fs::read(workdir.join("baseline.view")).expect("B");
+    // Simulate the pre-marker generation: a valid state/binding from the same
+    // lifecycle, but without the marker this gate checks.
+    let state_text = std::fs::read_to_string(workdir.join("edit.state.json")).expect("state");
+    let mut state_value: serde_json::Value = serde_json::from_str(&state_text).expect("state json");
+    state_value
+        .as_object_mut()
+        .expect("state object")
+        .remove("editable_view_contract");
+    std::fs::write(
+        workdir.join("edit.state.json"),
+        serde_json::to_vec_pretty(&state_value).expect("state json"),
+    )
+    .expect("rewrite state without marker");
+    let reopened = call(
+        "document_read",
+        json!({}),
+        &[json!({
+            "name": "workdir_open",
+            "arguments": { "workdir": workdir.to_str().expect("utf8") },
+        })],
+    );
+    assert_eq!(
+        reopened["outcome"], "failure",
+        "marker-less B must refuse: {reopened}"
+    );
+    assert!(
+        codes(&reopened)
+            .iter()
+            .any(|code| code == "edit-state-incompatible"),
+        "the refusal names the version condition: {reopened}"
+    );
+    let message = reopened["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("fresh workdir"),
+        "the refusal names the way out: {message}"
+    );
+    assert_eq!(
+        std::fs::read(workdir.join("baseline.view")).expect("B"),
+        before,
+        "the refusal wrote nothing over the existing baseline"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A wrong marker is the same mixed generation, not a compatible baseline.
+#[test]
+fn baseline_with_wrong_contract_marker_refuses_without_overwriting() {
+    let dir = scratch("baseline-wrongmarker");
+    let source = dir.join("source.docx");
+    std::fs::copy(fixture("styled"), &source).expect("copy fixture");
+    let workdir = dir.join("wd");
+    assert_eq!(extract(&source, &workdir)["outcome"], "success");
+    let session = vec![json!({
+        "name": "workdir_open",
+        "arguments": { "workdir": workdir.to_str().expect("utf8") },
+    })];
+    assert_eq!(
+        call("document_read", json!({}), &session)["outcome"],
+        "success"
+    );
+    let before = std::fs::read(workdir.join("baseline.view")).expect("B");
+    let state_text = std::fs::read_to_string(workdir.join("edit.state.json")).expect("state");
+    let mut state_value: serde_json::Value = serde_json::from_str(&state_text).expect("state json");
+    state_value.as_object_mut().expect("state object").insert(
+        "editable_view_contract".to_string(),
+        serde_json::json!("editable-view-999"),
+    );
+    std::fs::write(
+        workdir.join("edit.state.json"),
+        serde_json::to_vec_pretty(&state_value).expect("state json"),
+    )
+    .expect("rewrite state with wrong marker");
+    let reopened = call(
+        "document_read",
+        json!({}),
+        &[json!({
+            "name": "workdir_open",
+            "arguments": { "workdir": workdir.to_str().expect("utf8") },
+        })],
+    );
+    assert_eq!(
+        reopened["outcome"], "failure",
+        "wrong-marker B must refuse: {reopened}"
+    );
+    assert!(
+        codes(&reopened)
+            .iter()
+            .any(|code| code == "edit-state-incompatible"),
+        "the refusal names the version condition: {reopened}"
+    );
+    assert_eq!(
+        std::fs::read(workdir.join("baseline.view")).expect("B"),
+        before,
+        "the refusal wrote nothing over the existing baseline"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An explicit foreign marker refuses even when `baseline.view` is gone.
+///
+/// A present-but-unknown `editable_view_contract` is foreign metadata, never
+/// legacy: the marker is a version label, not a digest, so it cannot vouch
+/// for bytes that are no longer there either. The read refuses
+/// `edit-state-incompatible` before any mutation and recreates neither the
+/// baseline nor the state.
+#[test]
+fn explicit_foreign_marker_without_baseline_refuses_without_recreating() {
+    let dir = scratch("baseline-foreign-nob");
+    let source = dir.join("source.docx");
+    std::fs::copy(fixture("styled"), &source).expect("copy fixture");
+    let workdir = dir.join("wd");
+    assert_eq!(extract(&source, &workdir)["outcome"], "success");
+    let session = vec![json!({
+        "name": "workdir_open",
+        "arguments": { "workdir": workdir.to_str().expect("utf8") },
+    })];
+    assert_eq!(
+        call("document_read", json!({}), &session)["outcome"],
+        "success"
+    );
+    let state_text = std::fs::read_to_string(workdir.join("edit.state.json")).expect("state");
+    let mut state_value: serde_json::Value = serde_json::from_str(&state_text).expect("state json");
+    state_value.as_object_mut().expect("state object").insert(
+        "editable_view_contract".to_string(),
+        serde_json::json!("editable-view-2"),
+    );
+    std::fs::write(
+        workdir.join("edit.state.json"),
+        serde_json::to_vec_pretty(&state_value).expect("state json"),
+    )
+    .expect("rewrite state with foreign marker");
+    std::fs::remove_file(workdir.join("baseline.view")).expect("drop B");
+    let reopened = call(
+        "document_read",
+        json!({}),
+        &[json!({
+            "name": "workdir_open",
+            "arguments": { "workdir": workdir.to_str().expect("utf8") },
+        })],
+    );
+    assert_eq!(
+        reopened["outcome"], "failure",
+        "foreign marker without B must refuse: {reopened}"
+    );
+    assert!(
+        codes(&reopened)
+            .iter()
+            .any(|code| code == "edit-state-incompatible"),
+        "the refusal names the version condition: {reopened}"
+    );
+    assert!(
+        !workdir.join("baseline.view").exists(),
+        "the refusal recreated no baseline"
+    );
+    let reread = std::fs::read_to_string(workdir.join("edit.state.json")).expect("state survives");
+    let revalue: serde_json::Value = serde_json::from_str(&reread).expect("state json");
+    assert_eq!(
+        revalue
+            .get("editable_view_contract")
+            .and_then(serde_json::Value::as_str),
+        Some("editable-view-2"),
+        "the refusal rewrote no state"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A review session must not survive a baseline replacement.
 ///
 /// `.review/` is the one lane extraction cannot clear (this layer does not

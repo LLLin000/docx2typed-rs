@@ -54,7 +54,24 @@ fn verdict_for(workdir: &Path, handle: &str) -> Value {
                         .to_string(),
                     "why": target.get("reason").cloned().unwrap_or(Value::Null),
                 }),
-                None => json!({ "editable": true }),
+                None => {
+                    // `editable: true` is a verdict about the TEXT, not a promise
+                    // about formatting. When the replacement will change the
+                    // character formatting of what it covers — a span across runs
+                    // with different `w:rPr`, which is where superscripts and bold
+                    // live — the forecast rides in the same verdict, so the caller
+                    // can tell "editable" from "editable and lossless".
+                    let mut verdict = json!({ "editable": true });
+                    if let Some(format) = report
+                        .get("staged_targets")
+                        .and_then(Value::as_array)
+                        .and_then(|targets| targets.first())
+                        .and_then(|target| target.get("format"))
+                    {
+                        verdict["format"] = format.clone();
+                    }
+                    verdict
+                }
             }
         }
         Err(error) => json!({ "editable": false, "code": error.code, "why": error.detail }),
@@ -150,15 +167,36 @@ pub fn document_find(session: &mut McpSession, args: &Value, build_commit: &str)
         })
         .unwrap_or_default();
 
-    let editable = matches
-        .iter()
-        .filter(|entry| entry["verdict"]["editable"] == json!(true))
-        .count();
+    // Count OCCURRENCES, not blocks. The handle a caller sends belongs to an
+    // occurrence, and a block's own verdict is only its first occurrence's:
+    // measured on a real patent, a page reported `not_editable: 0` while five of
+    // its occurrences carried `editable: false`, so the one number a caller acts
+    // on said the opposite of the list beside it.
+    let mut occurrences = 0usize;
+    let mut editable = 0usize;
+    for entry in &matches {
+        match entry.get("occurrences").and_then(Value::as_array) {
+            Some(listed) if !listed.is_empty() => {
+                for occurrence in listed {
+                    occurrences += 1;
+                    if occurrence["verdict"]["editable"] == json!(true) {
+                        editable += 1;
+                    }
+                }
+            }
+            _ => {
+                occurrences += 1;
+                if entry["verdict"]["editable"] == json!(true) {
+                    editable += 1;
+                }
+            }
+        }
+    }
     // The search's own coverage numbers, kept. `limit` bounds matching BLOCKS,
-    // not occurrences, and a caller that sees only `matches.len()` cannot tell a
-    // complete answer from the first page of one. That distinction matters most
-    // for the thing an agent is usually asked to do to a patent — unify a term
-    // across the whole document — where silently seeing the first twenty
+    // not occurrences, and a caller that sees only the page's own count cannot
+    // tell a complete answer from the first page of one. That distinction matters
+    // most for the thing an agent is usually asked to do to a patent — unify a
+    // term across the whole document — where silently seeing the first twenty
     // matching paragraphs looks exactly like having seen them all.
     let total_matches = data.get("total_matches").cloned().unwrap_or(Value::Null);
     let total_blocks = data.get("total_blocks").cloned().unwrap_or(Value::Null);
@@ -178,12 +216,14 @@ pub fn document_find(session: &mut McpSession, args: &Value, build_commit: &str)
             "query": query,
             "matches": matches,
             "counts": {
-                "matches": matches.len(),
-                // The number the caller actually acts on: a match it cannot edit
-                // as one span is not a match it can pass to document_edit.
+                // What the caller acts on: every entry in `matches` carries the
+                // handles its occurrences are addressed by.
+                "occurrences": occurrences,
                 "editable": editable,
-                "not_editable": matches.len() - editable,
-                // The document-wide numbers, so `matches` is never mistaken for
+                "not_editable": occurrences - editable,
+                // The page's shape, so a paging caller can see where it is.
+                "blocks": matches.len(),
+                // The document-wide numbers, so the page is never mistaken for
                 // the whole answer.
                 "total_matches": total_matches,
                 "total_blocks": total_blocks,

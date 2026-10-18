@@ -201,6 +201,12 @@ pub struct StagedEdit {
     pub capability: Capability,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<String>,
+    /// What the replacement will do to the character formatting of what it
+    /// covers, when the target can be edited at all. Stated, not implied: a
+    /// caller that reads `editable: true` must not read it as "formatting is
+    /// safe" (see `draft::format_forecast`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub format: Option<Value>,
 }
 
 /// Stage a batch of edits: validate every one, publish nothing.
@@ -224,13 +230,29 @@ pub fn stage_edits(
                 // as one edit. Asking the commit path itself, rather than a
                 // second opinion about it, is what keeps this phase from
                 // promising an edit that the next phase refuses.
-                let span_problem =
-                    draft::check_editable_span(workdir, &resolved.paragraph_id, &old_text).err();
+                let span_problem = draft::check_editable_span(
+                    workdir,
+                    &resolved.paragraph_id,
+                    &old_text,
+                    resolved.start,
+                )
+                .err();
                 let capability = if old_text == new_text || span_problem.is_some() {
                     Capability::Unsupported
                 } else {
                     Capability::Supported
                 };
+                let format = capability
+                    .is_ok()
+                    .then(|| {
+                        draft::format_forecast(
+                            workdir,
+                            &resolved.paragraph_id,
+                            &old_text,
+                            resolved.start,
+                        )
+                    })
+                    .flatten();
                 let entry = StagedEdit {
                     handle: edit.handle.clone(),
                     paragraph_id: resolved.paragraph_id.clone(),
@@ -245,6 +267,7 @@ pub fn stage_edits(
                             None => Some("replace-is-a-noop".to_string()),
                         }
                     },
+                    format,
                 };
                 if capability.is_ok() {
                     staged.push(entry);
@@ -267,6 +290,7 @@ pub fn stage_edits(
                         Capability::Unsupported
                     },
                     reason: Some(message),
+                    format: None,
                 });
             }
         }
@@ -336,7 +360,10 @@ pub fn edit(
         "staged": staged.len(),
         "staged_targets": staged,
         "engine": result,
-        "next": "verify, then commit_sync and build_docx",
+        // Names only what the agent surface mounts: `document_edit` already
+        // synced and verified, so the next real step is writing the file out.
+        // The old text sent the caller to two tools that are not mounted.
+        "next": "document_save to write the file, then document_status to confirm",
     }))
 }
 

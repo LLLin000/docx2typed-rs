@@ -721,9 +721,7 @@ impl StyleRegistry {
 /// Label + features for one rPr FRAGMENT (the text form the registry and the
 /// format lane speak). Wraps [`rpr_semantics`] so there is one implementation
 /// of the semantics rather than two that can drift.
-pub(crate) fn rpr_semantics_for(
-    rpr_xml: &str,
-) -> Result<(String, BTreeMap<String, String>), CoreError> {
+pub fn rpr_semantics_for(rpr_xml: &str) -> Result<(String, BTreeMap<String, String>), CoreError> {
     let text = if rpr_xml.trim().is_empty() {
         format!(r#"<w:rPr xmlns:w="{}"/>"#, crate::prose::WORD_NAMESPACE)
     } else {

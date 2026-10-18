@@ -492,6 +492,20 @@ impl McpSession {
         self.workdir.as_deref()
     }
 
+    /// Stop driving the workdir this session is bound to, and say which one it
+    /// was.
+    ///
+    /// Nothing on disk changes: a workdir keeps its baseline, its sidecars and
+    /// its draft, and opening it again resumes exactly where it stood. Only the
+    /// binding is released, so a caller that has to move on to another document
+    /// can — the alternative, refusing until a second server process exists, is
+    /// not something the five tools can express. The engine-level contract stays
+    /// strict (`workdir_open` refuses a different workdir); the surface asks for
+    /// this explicitly on the caller's behalf.
+    pub(crate) fn release_workdir(&mut self) -> Option<String> {
+        self.workdir.take()
+    }
+
     /// The operation engine, for the surface to run one op without a tool hop.
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine
@@ -648,8 +662,18 @@ impl McpSession {
         self.draft_tool("insert_paragraph", args, build_commit, move |target| {
             draft::ensure_projection(target)
                 .map_err(|error| MutationError::new(error.code, error.detail))?;
-            draft::insert_paragraph(target, &after_id, &text, inherit.as_deref())
-                .map_err(|error| MutationError::new(error.code, error.detail))
+            // The engine-level tool keeps the default: `format_policy` is
+            // exposed on the agent surface (`document_edit`), and the frozen
+            // schema bundle this tool declares against is a published contract
+            // that a fix PR does not get to widen.
+            draft::insert_paragraph(
+                target,
+                &after_id,
+                &text,
+                inherit.as_deref(),
+                docx2typed_core::prose::FormatPolicy::SafeInherit,
+            )
+            .map_err(|error| MutationError::new(error.code, error.detail))
         })
     }
 
@@ -710,19 +734,37 @@ impl McpSession {
     /// Settle a draft the caller did not settle, or report why it cannot be.
     ///
     /// Returns `None` when the draft was already settled or has now been, and
-    /// the failure envelope when settling was refused. The same body
+    /// the failure envelope when settling was refused. Settled means the three
+    /// workdir artifacts agree — the draft, its `@edit` header and
+    /// `edit.state.json` — as measured by `classify_edit_state`, not that the
+    /// draft matches the frozen baseline. The same body
     /// `document_edit` runs, for the same reason: one implementation, one
     /// verdict, and no path on which a caller can be told a document is ready
     /// when its draft was never applied.
     pub(crate) fn settle_draft(&self, build_commit: &str) -> Option<Value> {
         let workdir = self.workdir.clone()?;
-        let dirty = docx2typed_review::draft::diff_preview(Path::new(&workdir))
-            .ok()
-            .and_then(|data| data.get("changed_paragraph_ids").cloned())
-            .and_then(|ids| ids.as_array().map(|ids| !ids.is_empty()))
-            .unwrap_or(false);
-        if !dirty {
-            return None;
+        // A revert reads empty on the baseline diff (`changed_paragraph_ids`)
+        // while the committed state still moved, so the baseline diff must not
+        // gate the commit: it skipped the settle that would have reconciled the
+        // workdir and the build then refused it as `edit-dirty`. The commit below
+        // is a genuine no-op when the plan matches and the binding is clean, so a
+        // clean classification is the only skip; an `Err` cannot show agreement
+        // and settles rather than skips.
+        // `classify_edit_state` fails when the projection was never created
+        // (fresh extract: no `edit.md`, no `edit.state.json`) — and a missing
+        // projection is a clean workdir, not a dirty one. Only a positively
+        // non-clean state settles; any error meaning "nothing to settle"
+        // skips. (A save on a fresh workdir settled nothing and left nothing
+        // behind, so the next edit failed `edit-state-missing`.)
+        match docx2typed_core::edit_state::classify_edit_state(Path::new(&workdir)) {
+            Ok(state) if state.state == "clean" => return None,
+            Ok(_) => {}
+            Err(error) => {
+                let message = error.to_string();
+                if message.starts_with("edit-state-missing:") {
+                    return None;
+                }
+            }
         }
         let tracked = self.track;
         let author = self.author.clone();
@@ -2218,15 +2260,31 @@ impl McpSession {
                 style_id.as_deref(),
             )
             .map_err(coded)?;
-            let total =
-                docx2typed_core::prose::record_format_span(target, edit.clone()).map_err(coded)?;
+            // The request goes to the format engine, which plans it; this tool
+            // records the intent and reports the plan's shape. It does not write
+            // a replay record — that path is gone (ADR 0050).
+            let (plan, _snapshot, requests) =
+                docx2typed_review::format_lane::record_format_request(
+                    target,
+                    docx2typed_review::format_lane::FormatRequest {
+                        paragraph_id: edit.paragraph_id.clone(),
+                        start: edit.text_start,
+                        end: edit.text_end,
+                        style_id: edit.style_id.clone(),
+                        attributes: Some(edit.attributes.clone()),
+                    },
+                )
+                .map_err(|error| MutationError::new(error.code, error.detail))?;
+            let paragraph = plan.paragraph(&edit.paragraph_id);
             Ok(json!({
                 "paragraph_id": edit.paragraph_id,
                 "text_start": edit.text_start,
                 "text_end": edit.text_end,
                 "style_id": edit.style_id,
                 "attributes": edit.attributes,
-                "recorded_edits": total,
+                "recorded_edits": requests.len(),
+                "segments": paragraph.map(|plan| plan.segments.len()),
+                "runs": paragraph.map(|plan| plan.runs.len()),
             }))
         })
     }
@@ -2459,7 +2517,7 @@ fn domain_code_from_message(message: &str) -> String {
 /// Dispatch one tool call against the session; returns the CallToolResult
 /// payload (the same value the line protocol wraps in `OK <json>`).
 /// The declared parameters of one tool, from the frozen schema.
-fn declared_parameters(tool: &str) -> Option<BTreeSet<String>> {
+pub(crate) fn declared_parameters(tool: &str) -> Option<BTreeSet<String>> {
     // The agent surface first. Its schemas live in `crate::surface` because they
     // are new and the frozen bundle is a published contract; reading only the
     // bundle meant a surface tool had NO declared parameters, so `unknown

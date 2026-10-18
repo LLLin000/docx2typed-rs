@@ -9,6 +9,7 @@ description = "Structure-preserving DOCX editing engine with verified MCP review
 [dependencies]
 docx2typed-protocol = { version = "0.2.1", path = "../docx2typed-protocol" }
 docx2typed-core = { version = "0.2.1", path = "../docx2typed-core" }
+docx2typed-review = { version = "0.2.1", path = "../docx2typed-review" }
 docx2typed-store = { version = "0.2.1", path = "../docx2typed-store" }
 docx2typed-verify = { version = "0.2.1", path = "../docx2typed-verify" }
 serde_json = "1"

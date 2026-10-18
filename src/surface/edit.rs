@@ -1,5 +1,14 @@
 //! `document_edit` — change the document; the engine does the rest.
 //!
+//! Four kinds, one addressing scheme. `replace` (the default), `insert_after`
+//! and `delete` change the text; `format` gives the characters a handle covers
+//! the character properties of a style the document already carries, named by
+//! `style_id`. The ids are the ones `document_find` reports for the span, and the
+//! engine — not this file — decides what the request means: which characters it
+//! covers, whether it overlaps another request, and how the runs are shaped
+//! afterwards. Format edits and text edits are separate transactions, because a
+//! format edit's span is measured against the text as it stands.
+//!
 //! ONE transaction: resolve every handle, apply, sync, and publish — or write
 //! nothing at all. The caller says `{handle, replace_with}`, which is the
 //! facade's own request shape, so there is no translation to get wrong and no
@@ -30,6 +39,366 @@ use docx2typed_review::{collab, server::MutationError};
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// Probe every member of a selector-expanded batch before it runs, and report the
+/// ones that would refuse.
+///
+/// The dry run the surface already has covers `replace`; a `format` entry needs the
+/// engine's own planner, which the adapter exposes as `probe_format` — plans and
+/// discards. One decision, made by the engine, reported to the caller.
+fn selector_member_probe(
+    session: &mut McpSession,
+    args: &Value,
+    build_commit: &str,
+) -> Option<Value> {
+    if args.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let entries = args.get("edits").and_then(Value::as_array)?;
+    let selector = entries
+        .iter()
+        .find_map(|entry| entry.get("selector"))
+        .filter(|selector| !selector.is_null())?;
+    let workdir = session.open_workdir().map(str::to_string)?;
+    let handles = handles_for_selector(session, selector, build_commit).ok()?;
+    let target = std::path::Path::new(&workdir);
+    let mut failures: Vec<Value> = Vec::new();
+    for (index, handle) in handles.iter().enumerate() {
+        for entry in entries {
+            let kind = entry
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("replace");
+            if kind != "format" {
+                continue;
+            }
+            let resolved = match docx2typed_core::document_search::resolve_match_ref(target, handle)
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    failures.push(json!({
+                        "index": index,
+                        "handle": handle,
+                        "code": error.to_string().split(':').next().unwrap_or("refused").trim(),
+                    }));
+                    continue;
+                }
+            };
+            let length = resolved.text.chars().count();
+            let request = docx2typed_review::format_lane::FormatRequest {
+                paragraph_id: resolved.paragraph_id.clone(),
+                start: resolved.start,
+                end: resolved.start + length,
+                style_id: entry
+                    .get("style_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                attributes: entry.get("format").cloned(),
+            };
+            if let Err(error) = docx2typed_review::format_lane::probe_format(target, &request) {
+                failures.push(json!({
+                    "index": index,
+                    "handle": handle,
+                    "paragraph_id": resolved.paragraph_id,
+                    "range": {
+                        "start": resolved.start,
+                        "end": resolved.start + length,
+                        "unit": "unicode-scalars",
+                    },
+                    "code": error.code,
+                }));
+            }
+        }
+    }
+    if failures.is_empty() {
+        return None;
+    }
+    let mut refusal =
+        session.failure(
+            "document_edit",
+            "selector-member-rejected",
+            &format!(
+            "the selector matched {} target(s) and {} of them cannot be applied, so nothing was \
+             written (a selector batch is all-or-nothing). The members that would refuse: {}. \
+             Narrow the selector, or send the ones that work as their own edits",
+            handles.len(),
+            failures.len(),
+            failures
+                .iter()
+                .map(|failure| format!(
+                    "#{} {} {}",
+                    failure.get("index").and_then(Value::as_u64).unwrap_or(0),
+                    failure
+                        .get("paragraph_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    failure.get("code").and_then(Value::as_str).unwrap_or("refused")
+                ))
+                .collect::<Vec<String>>()
+                .join(", ")
+        ),
+            build_commit,
+        );
+    // The counts and the members as FIELDS, not only as prose: a caller that wants
+    // to act on them should not parse a sentence. `index`, `paragraph_id` and the
+    // range come from the resolution — never from the caller's arithmetic.
+    if let Some(data) = refusal
+        .get_mut("structuredContent")
+        .and_then(|envelope| envelope.get_mut("data"))
+        .and_then(Value::as_object_mut)
+    {
+        data.insert("matched".to_string(), json!(handles.len()));
+        data.insert(
+            "executable".to_string(),
+            json!(handles.len().saturating_sub(failures.len())),
+        );
+        data.insert("rejected".to_string(), json!(failures.len()));
+        data.insert("failures".to_string(), json!(failures));
+        data.insert("written".to_string(), json!(false));
+    }
+    Some(refusal)
+}
+
+/// Which member of a selector-expanded batch refused, and why.
+///
+/// One dry run per member, through the same path the batch took, so the engine
+/// decides — this reports a decision, it does not make one. `index` and the range
+/// come from the resolution, never from the caller's arithmetic.
+fn selector_member_diagnosis(
+    session: &mut McpSession,
+    args: &Value,
+    failure: &Value,
+    build_commit: &str,
+) -> Option<Value> {
+    let entries = args.get("edits").and_then(Value::as_array)?;
+    let selector = entries
+        .iter()
+        .find_map(|entry| entry.get("selector"))
+        .filter(|selector| !selector.is_null())?;
+    let handles = handles_for_selector(session, selector, build_commit).ok()?;
+    let matched = handles.len();
+    let mut failures: Vec<Value> = Vec::new();
+    for (index, handle) in handles.iter().enumerate() {
+        let mut single = entries.clone();
+        for entry in single.iter_mut() {
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("selector");
+                object.insert("handle".to_string(), json!(handle));
+            }
+        }
+        let mut probe_args = args.clone();
+        if let Some(object) = probe_args.as_object_mut() {
+            object.insert("edits".to_string(), json!(single));
+            object.insert("dry_run".to_string(), json!(true));
+        }
+        let probed = super::edit::document_edit(session, &probe_args, build_commit);
+        let Some(envelope) = probed.get("structuredContent") else {
+            continue;
+        };
+        if envelope.get("outcome").and_then(Value::as_str) == Some("success") {
+            continue;
+        }
+        let code = envelope
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .and_then(|diagnostics| diagnostics.first())
+            .and_then(|diagnostic| diagnostic.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("refused")
+            .to_string();
+        failures.push(json!({
+            "index": index,
+            "handle": handle,
+            "code": code,
+        }));
+    }
+    if failures.is_empty() {
+        return None;
+    }
+    let rejected = failures.len();
+    let detail = failure
+        .get("structuredContent")
+        .and_then(|envelope| envelope.get("diagnostics"))
+        .and_then(Value::as_array)
+        .and_then(|diagnostics| diagnostics.first())
+        .and_then(|diagnostic| diagnostic.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some(session.failure(
+        "document_edit",
+        "selector-member-rejected",
+        &format!(
+            "the selector matched {matched} target(s), {rejected} of them cannot be applied, and \
+             nothing was written (the batch is all-or-nothing). The members that refused: {}. \
+             First refusal: {detail}",
+            failures
+                .iter()
+                .map(|failure| format!(
+                    "#{} ({})",
+                    failure.get("index").and_then(Value::as_u64).unwrap_or(0),
+                    failure.get("code").and_then(Value::as_str).unwrap_or("refused")
+                ))
+                .collect::<Vec<String>>()
+                .join(", ")
+        ),
+        build_commit,
+    ))
+}
+
+/// The first key an entry carries that its kind does not consume.
+///
+/// The matrix, and the reason it exists: the schema declares the union of every
+/// kind's fields, so a field that belongs to one kind can be sent with another and
+/// be read as accepted. `replace` carrying `format` did exactly that — the
+/// formatting was dropped without a word.
+pub(crate) fn unconsumed_field<'a>(kind: &str, edit: &'a Value) -> Option<&'a str> {
+    const UNIVERSAL: [&str; 3] = ["kind", "handle", "selector"];
+    let consumed: &[&str] = match kind {
+        "replace" => &["replace_with"],
+        "insert_after" => &["text", "format_policy"],
+        "delete" => &[],
+        "format" => &["style_id", "format"],
+        _ => return None,
+    };
+    let object = edit.as_object()?;
+    object.keys().find_map(|key| {
+        if UNIVERSAL.contains(&key.as_str()) || consumed.contains(&key.as_str()) {
+            return None;
+        }
+        // The marker the selector expansion leaves behind never comes from a
+        // caller and is removed before parsing.
+        if key == FROM_SELECTOR {
+            return None;
+        }
+        Some(key.as_str())
+    })
+}
+
+/// Every handle a `selector` names, in document order.
+///
+/// A caller that wants "every 四氧化三铁 in the body" should say exactly that. The
+/// enumeration is deterministic selection — the surface's job — and it used to be
+/// the caller's: a blind run transcribed thirty-one handles out of a 968-line
+/// reply and rebuilt truncated ones from their base64 structure. `expected_count`
+/// is honoured when the caller gives it: a count that disagrees is a refusal, not
+/// a surprise edit.
+fn handles_for_selector(
+    session: &mut McpSession,
+    selector: &Value,
+    build_commit: &str,
+) -> Result<Vec<String>, Value> {
+    let Some(text) = selector.get("text").and_then(Value::as_str) else {
+        return Err(session.failure(
+            "document_edit",
+            "invalid-arguments",
+            "a selector needs `text`: the text to enumerate. `match` may be `all` (the default) \
+             or `first`, and `expected_count` is checked when given",
+            build_commit,
+        ));
+    };
+    let match_mode = selector
+        .get("match")
+        .and_then(Value::as_str)
+        .unwrap_or("all");
+    if !matches!(match_mode, "all" | "first") {
+        return Err(session.failure(
+            "document_edit",
+            "invalid-arguments",
+            &format!("selector `match` is `{match_mode}`; it may be `all` or `first`"),
+            build_commit,
+        ));
+    }
+    let mut search_args = json!({ "query": text, "limit": 1000 });
+    if let Some(scope) = selector.get("scope") {
+        search_args["scope"] = scope.clone();
+    }
+    // The SURFACE's own find, not the engine's raw search: the raw payload has a
+    // different shape, and reading the wrong one is how this first enumerated
+    // nothing while reporting a count of zero.
+    let searched = super::find::document_find(session, &search_args, build_commit);
+    let Some(envelope) = searched.get("structuredContent") else {
+        return Err(searched);
+    };
+    if envelope.get("outcome").and_then(Value::as_str) != Some("success") {
+        return Err(searched);
+    }
+    let data = envelope.get("data").cloned().unwrap_or(Value::Null);
+    let mut handles: Vec<String> = Vec::new();
+    if let Some(matches) = data.get("matches").and_then(Value::as_array) {
+        for entry in matches {
+            if let Some(occurrences) = entry.get("occurrences").and_then(Value::as_array) {
+                for occurrence in occurrences {
+                    if let Some(handle) = occurrence.get("handle").and_then(Value::as_str) {
+                        handles.push(handle.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let complete = data
+        .get("counts")
+        .and_then(|counts| counts.get("complete"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !complete {
+        return Err(session.failure(
+            "document_edit",
+            "selector-incomplete",
+            &format!(
+                "the search for {text:?} did not cover every match, so a selector that edits \
+                 \"all\" of them would be a guess. Narrow the query"
+            ),
+            build_commit,
+        ));
+    }
+    if match_mode == "first" {
+        handles.truncate(1);
+    }
+    if let Some(expected) = selector.get("expected_count").and_then(Value::as_u64) {
+        if handles.len() as u64 != expected {
+            return Err(session.failure(
+                "document_edit",
+                "selector-count-mismatch",
+                &format!(
+                    "the selector expected {expected} match(es) of {text:?} and the document \
+                     holds {}; nothing was written",
+                    handles.len()
+                ),
+                build_commit,
+            ));
+        }
+    }
+    if handles.is_empty() {
+        return Err(session.failure(
+            "document_edit",
+            "selector-matched-nothing",
+            &format!("no match for {text:?}; nothing was written"),
+            build_commit,
+        ));
+    }
+    Ok(handles)
+}
+
+/// A format edit: give a span the character properties of a style the document
+/// already carries. There is no synthesis here — the style registry holds what
+/// the document has, and a style id it does not hold is refused before anything
+/// is written.
+#[derive(Clone, Debug)]
+pub(crate) struct FormatRequest {
+    pub(crate) handle: String,
+    /// Either a style id the caller named, or empty with `attributes` set.
+    pub(crate) style_id: String,
+    pub(crate) attributes: Option<Value>,
+    /// True when a selector expanded this entry: a target that already holds the
+    /// requested properties is then satisfied rather than a refusal.
+    pub(crate) from_selector: bool,
+}
+
+/// The marker the selector expansion leaves on an entry. Not part of the schema:
+/// it never leaves this module.
+const FROM_SELECTOR: &str = "__from_selector";
+
 /// One edit, in the shape its kind requires.
 ///
 /// The kinds are a closed set and every one of them addresses its target the same
@@ -38,8 +407,15 @@ use std::path::Path;
 /// argument, and an unknown kind is refused naming the allowed ones.
 pub(crate) enum Edit {
     Replace(EditRequest),
-    InsertAfter { handle: String, text: String },
-    Delete { handle: String },
+    InsertAfter {
+        handle: String,
+        text: String,
+        format: docx2typed_core::prose::FormatPolicy,
+    },
+    Delete {
+        handle: String,
+    },
+    Format(FormatRequest),
 }
 
 impl Edit {
@@ -49,18 +425,23 @@ impl Edit {
             Edit::Replace(request) => &request.handle,
             Edit::InsertAfter { handle, .. } => handle,
             Edit::Delete { handle } => handle,
+            Edit::Format(request) => &request.handle,
         }
     }
 }
 
 /// The edits, or a refusal that names the shape rather than only the mistake.
-fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<Vec<Edit>, Value> {
+fn edits_from(
+    session: &mut McpSession,
+    args: &Value,
+    build_commit: &str,
+) -> Result<Vec<Edit>, Value> {
     let Some(edits) = args.get("edits").and_then(Value::as_array) else {
         return Err(session.failure(
             "document_edit",
             "invalid-arguments",
             "document_edit requires `edits`: an array of edits, each with a `handle` from \
-             document_find and a `kind` of replace, insert_after or delete",
+             document_find and a `kind` of replace, insert_after, delete or format",
             build_commit,
         ));
     };
@@ -73,8 +454,39 @@ fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<
             build_commit,
         ));
     }
-    let mut parsed = Vec::with_capacity(edits.len());
-    for (index, edit) in edits.iter().enumerate() {
+    // A selector names its targets by QUERY and the surface enumerates them, so a
+    // caller never transcribes handles: "every 四氧化三铁 in the body" is one entry,
+    // not thirty-one copied ids. The enumeration is deterministic selection, which
+    // is this layer's job — the format engine still decides what each span becomes,
+    // and one target that cannot be applied refuses the whole batch.
+    let mut expanded: Vec<Value> = Vec::with_capacity(edits.len());
+    let mut from_selector = false;
+    for edit in edits {
+        match edit.get("selector") {
+            Some(selector) if !selector.is_null() => {
+                from_selector = true;
+                let handles = handles_for_selector(session, selector, build_commit)?;
+                for handle in handles {
+                    let mut concrete = edit.clone();
+                    if let Some(object) = concrete.as_object_mut() {
+                        object.remove("selector");
+                        object.insert("handle".to_string(), json!(handle));
+                        // Marked, because a whole-set request means "make all of
+                        // these so": a target that already IS so is satisfied, not
+                        // a conflict. An explicit single edit keeps the stricter
+                        // reading — asking for one thing that is already true is
+                        // worth a refusal.
+                        object.insert(FROM_SELECTOR.to_string(), json!(true));
+                    }
+                    expanded.push(concrete);
+                }
+            }
+            _ => expanded.push(edit.clone()),
+        }
+    }
+    let mut parsed = Vec::with_capacity(expanded.len());
+    let mut members: Vec<Value> = Vec::new();
+    for (index, edit) in expanded.iter().enumerate() {
         let number = index + 1;
         let keys = || {
             edit.as_object()
@@ -96,6 +508,37 @@ fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("replace");
+        // Every field this kind accepts is CONSUMED by it. A key the schema
+        // declares but the kind ignores is worse than an unknown key: it reads as
+        // accepted and then does nothing — `{"kind": "replace", "format": {...}}`
+        // silently dropped the formatting. Refused here, whole batch, nothing
+        // written.
+        if let Some(field) = unconsumed_field(kind, edit) {
+            return Err(session.failure(
+                "document_edit",
+                "unsupported-combined-edit",
+                &format!(
+                    "edit #{number} is kind `{kind}` and carries `{field}`, which that kind does \
+                     not use; nothing was written. `format` belongs to its own entry (kind \
+                     `format`), because a format edit's span is measured against the text as it \
+                     stands — replacing text and formatting the replacement in one entry has no \
+                     defined order yet. Send the text edit, then a separate format edit. Keys on \
+                     this entry: [{}]",
+                    keys()
+                ),
+                build_commit,
+            ));
+        }
+        if from_selector {
+            // Kept so a batch that fails can name WHICH member it failed on: the
+            // caller enumerated nothing and cannot reconstruct an index, and
+            // finding it by bisection is a handful of turns it should not spend.
+            members.push(json!({
+                "index": index,
+                "handle": handle,
+                "kind": kind,
+            }));
+        }
         match kind {
             "replace" => {
                 let Some(replace_with) = edit.get("replace_with").and_then(Value::as_str) else {
@@ -128,21 +571,84 @@ fn edits_from(session: &McpSession, args: &Value, build_commit: &str) -> Result<
                         build_commit,
                     ));
                 };
+                let format = match edit.get("format_policy").and_then(Value::as_str) {
+                    None | Some("safe_inherit") => {
+                        docx2typed_core::prose::FormatPolicy::SafeInherit
+                    }
+                    Some("none") => docx2typed_core::prose::FormatPolicy::None,
+                    Some(other) => {
+                        return Err(session.failure(
+                            "document_edit",
+                            "invalid-arguments",
+                            &format!(
+                                "edit #{number} has format_policy `{other}`; the allowed values \
+                                 are safe_inherit (the default) and none"
+                            ),
+                            build_commit,
+                        ))
+                    }
+                };
                 parsed.push(Edit::InsertAfter {
                     handle: handle.to_string(),
                     text: text.to_string(),
+                    format,
                 });
             }
             "delete" => parsed.push(Edit::Delete {
                 handle: handle.to_string(),
             }),
+            "format" => {
+                // Two ways to say it, one authority. `style_id` names a style the
+                // document carries — the ids document_find reports for the span.
+                // `format` names PROPERTIES (`{"bold": true}`) and the engine
+                // resolves the style the document already has for them, refusing
+                // when it has none. An agent that reads rPr features to pick an id
+                // is doing the engine's work; a blind run did exactly that.
+                let style_id = edit.get("style_id").and_then(Value::as_str);
+                let attributes = edit.get("format").and_then(Value::as_object);
+                match (style_id, attributes) {
+                    (Some(style_id), _) => parsed.push(Edit::Format(FormatRequest {
+                        handle: handle.to_string(),
+                        style_id: style_id.to_string(),
+                        attributes: None,
+                        from_selector: edit
+                            .get(FROM_SELECTOR)
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })),
+                    (None, Some(attributes)) => parsed.push(Edit::Format(FormatRequest {
+                        handle: handle.to_string(),
+                        style_id: String::new(),
+                        attributes: Some(Value::Object(attributes.clone())),
+                        from_selector: edit
+                            .get(FROM_SELECTOR)
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })),
+                    (None, None) => {
+                        return Err(session.failure(
+                            "document_edit",
+                            "invalid-arguments",
+                            &format!(
+                                "edit #{number} is kind `format` and needs either `style_id` \
+                                 (one of the ids document_find reports for the span) or `format` \
+                                 (the properties to give the characters, e.g. {{\"bold\": true}}, \
+                                 which the engine resolves against the styles this document \
+                                 already carries); got keys [{}]",
+                                keys()
+                            ),
+                            build_commit,
+                        ))
+                    }
+                }
+            }
             other => {
                 return Err(session.failure(
                     "document_edit",
                     "invalid-arguments",
                     &format!(
                         "edit #{number} has kind `{other}`; the allowed kinds are replace, \
-                         insert_after and delete"
+                         insert_after, delete and format"
                     ),
                     build_commit,
                 ))
@@ -169,12 +675,131 @@ pub(crate) fn apply_and_sync(
 ) -> Result<Value, MutationError> {
     let mut requests: Vec<EditRequest> = Vec::new();
     let mut structural: Vec<Value> = Vec::new();
+    let mut restyles: Vec<Value> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
     for edit in edits {
         match edit {
             Edit::Replace(request) => requests.push(request.clone()),
-            Edit::InsertAfter { handle, text } => {
+            Edit::Format(request) => {
+                // A format edit's span is measured against the text as it stands,
+                // so a batch that also rewrites text would make the span's
+                // meaning depend on the order of the entries. One transaction,
+                // one kind — the caller edits the text first, then formats what
+                // it produced.
+                if edits.iter().any(|other| !matches!(other, Edit::Format(_))) {
+                    return Err(MutationError::new(
+                        "format-and-text-in-one-batch",
+                        "a batch cannot mix text edits with format edits: a format edit's span \
+                         is measured against the text as it stands, so the two kinds would have \
+                         to run in a fixed order to mean anything. Send the text edits, then a \
+                         separate document_edit with the format edits",
+                    ));
+                }
+                let resolved =
+                    docx2typed_core::document_search::resolve_match_ref(target, &request.handle)
+                        .map_err(|error| {
+                            let message = error.to_string();
+                            match message.split_once(':') {
+                                Some((code, detail)) if !code.contains(' ') => {
+                                    MutationError::new(code, detail.trim())
+                                }
+                                _ => MutationError::new("invalid-edit", message),
+                            }
+                        })?;
+                // The surface decides nothing about formatting here. It resolves
+                // the handle to a character range and hands the request to the
+                // engine, which validates the style, settles overlaps and derives
+                // the run structure. A second opinion here is the second authority
+                // the split exists to remove.
+                let length = resolved.text.chars().count();
+                let (start, end) = (resolved.start, resolved.start + length);
+                let style_id = match &request.attributes {
+                    Some(Value::Object(attributes)) => {
+                        docx2typed_review::format_lane::resolve_style(
+                            target,
+                            &resolved.paragraph_id,
+                            start,
+                            end,
+                            attributes,
+                        )
+                        .map_err(|error| MutationError::new(error.code, error.detail))?
+                    }
+                    _ => request.style_id.clone(),
+                };
+                // "Make every X bold" is satisfied by the ones that already are.
+                // Refusing the batch over them made the ordinary case impossible:
+                // one blind run could not bold twelve phrases because the first was
+                // bold in the source. Reported, not silent — the reply names what
+                // was skipped and why.
+                if request.from_selector
+                    && docx2typed_review::format_lane::already_holds(
+                        target,
+                        &resolved.paragraph_id,
+                        start,
+                        end,
+                        &style_id,
+                    )
+                    .map_err(|error| MutationError::new(error.code, error.detail))?
+                {
+                    skipped.push(json!({
+                        "kind": "format",
+                        "paragraph_id": resolved.paragraph_id,
+                        "range": { "start": start, "end": end, "unit": "unicode-scalars" },
+                        "style_id": style_id,
+                        "reason": "already holds these properties",
+                    }));
+                    continue;
+                }
+                let (plan, _snapshot, _requests) =
+                    docx2typed_review::format_lane::record_format_request(
+                        target,
+                        docx2typed_review::format_lane::FormatRequest {
+                            paragraph_id: resolved.paragraph_id.clone(),
+                            start,
+                            end,
+                            style_id: style_id.clone(),
+                            attributes: request.attributes.clone(),
+                        },
+                    )
+                    .map_err(|error| MutationError::new(error.code, error.detail))?;
+                let paragraph_plan = plan.paragraph(&resolved.paragraph_id);
+                restyles.push(json!({
+                    "kind": "format",
+                    "paragraph_id": resolved.paragraph_id,
+                    "range": {
+                        "start": resolved.start,
+                        "end": resolved.start + length,
+                        "unit": "unicode-scalars",
+                    },
+                    "style_id": style_id,
+                    // Two different operations, named apart. `attribute_request`
+                    // derives a style from the span's base properties and requires
+                    // the document to carry it; `registered_style` applies the
+                    // named style's WHOLE property set, which may change `lang`,
+                    // font slots and anything else the run carried. Twelve spans
+                    // being bold says nothing about what else they were.
+                    "mode": if request.attributes.is_some() {
+                        "attribute_request"
+                    } else {
+                        "registered_style"
+                    },
+                    "segments": paragraph_plan.map(|plan| plan.segments.len()),
+                    "runs": paragraph_plan.map(|plan| plan.runs.len()),
+                }));
+            }
+            Edit::InsertAfter {
+                handle,
+                text,
+                format,
+            } => {
                 let anchor = paragraph_of(target, handle)?;
-                let inserted = draft::insert_paragraph(target, &anchor, text, Some(&anchor))
+                // `anchor` is the POSITION. Naming it as the inherit source too
+                // made the engine refuse whenever that paragraph carried
+                // revisions or anchors — a decision the caller cannot see and
+                // cannot act on, since the surface hands out no handle for a
+                // paragraph the search did not match. Passing `None` lets the
+                // engine choose a source that works and keep the position.
+                let inserted = draft::insert_paragraph(target, &anchor, text, None, *format)
                     .map_err(|error| MutationError::new(error.code, error.detail))?;
                 structural
                     .push(json!({ "kind": "insert_after", "anchor": anchor, "result": inserted }));
@@ -198,12 +823,12 @@ pub(crate) fn apply_and_sync(
         facade::edit(target, &requests, false, tracking)
             .map_err(|error| MutationError::new(error.code, error.detail))?
     };
-    if !requests.is_empty() && edited.get("outcome").and_then(Value::as_str) != Some("committed") {
-        // The facade stages every target before it applies any, so a blocked
-        // batch has written nothing. Report it and let the caller decide; the
-        // generation it returns is the one it started from.
-        return Ok(json!({ "edit": edited, "structural": structural, "synced": Value::Null }));
-    }
+    // A blocked batch wrote nothing (the facade stages every target before it
+    // applies any), so the commit below is a genuine no-op for it. But "not
+    // committed" is not the same as "nothing to do": editing a paragraph BACK
+    // to its baseline text reports a no-op while moving the committed state,
+    // so the commit must run whatever the facade called it — including when
+    // `requests` is empty (the save path settles what is there).
 
     // Bootstrap the review session BEFORE `apply_projection` rewrites typed.md.
     // The bootstrap pins the current typed.md hash as the C0 baseline; doing it
@@ -222,6 +847,8 @@ pub(crate) fn apply_and_sync(
         return Ok(json!({
             "edit": edited,
             "structural": structural,
+            "restyles": restyles,
+            "skipped": skipped,
             "synced": {
                 "changed_paragraph_ids": [],
                 "state": "clean",
@@ -250,12 +877,67 @@ pub(crate) fn apply_and_sync(
     Ok(json!({
         "edit": edited,
         "structural": structural,
+        "restyles": restyles,
+        "skipped": skipped,
         "synced": {
             "changed_paragraph_ids": changed,
             "state": "clean",
             "current_snapshot": published.get("current_snapshot").cloned().unwrap_or(Value::Null),
         },
     }))
+}
+
+/// Rewrite the engine's `next` steps in one reply to the step the surface can
+/// take.
+///
+/// The engine answers in its own vocabulary — `data.edit.engine.next` reads
+/// "diff_preview to inspect style ownership, then commit_sync", a synthesised
+/// paragraph's result says "commit_sync allocates the formal paragraph ID" — and
+/// neither tool is mounted, nor is either step outstanding: the commit already
+/// happened inside this call. A blind agent quoted the advice back as a defect,
+/// on the replace path as well as the structural one, so the rewrite covers the
+/// whole reply instead of the fields anyone remembered. The engine's own reply
+/// keeps its wording for the CLI and the tests, where those tools exist.
+fn in_surface_vocabulary(mut data: Value) -> Value {
+    rewrite_next_steps(&mut data);
+    data
+}
+
+fn rewrite_next_steps(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                if key == "next" {
+                    if let Some(step) = entry.as_str() {
+                        if names_an_unmounted_tool(step) {
+                            *entry =
+                                json!("document_save writes the file when you are done editing");
+                            continue;
+                        }
+                    }
+                }
+                rewrite_next_steps(entry);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(rewrite_next_steps),
+        _ => {}
+    }
+}
+
+/// Does this engine step name a tool the agent surface does not mount?
+fn names_an_unmounted_tool(step: &str) -> bool {
+    const ENGINE_ONLY: [&str; 9] = [
+        "commit_sync",
+        "diff_preview",
+        "workdir_open",
+        "workdir_status",
+        "document_patch",
+        "batch_edit",
+        "facade_edit",
+        "facade_locate",
+        "facade_verify",
+    ];
+    ENGINE_ONLY.iter().any(|tool| step.starts_with(tool))
 }
 
 /// The paragraph a handle addresses.
@@ -315,32 +997,78 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
 
     if dry_run {
         // Nothing is written, so nothing needs a transaction or a ledger entry.
-        let workdir = session.open_workdir().unwrap_or_default().to_string();
-        let preview = match facade::edit(
-            Path::new(&workdir),
-            &edits
-                .iter()
-                .filter_map(|edit| match edit {
-                    Edit::Replace(request) => Some(request.clone()),
-                    // A dry run reports what the replacements would do; the
-                    // structural kinds are checked by the same resolve that the
-                    // real call uses, so the report is not weaker than the act.
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            true,
-            tracking,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                return session.failure("document_edit", &error.code, &error.detail, build_commit)
+        let workdir = Path::new(session.open_workdir().unwrap_or_default());
+        // The structural kinds are previewed by resolving their anchor — the
+        // first step the real call takes, and the only one that can fail before
+        // a byte is written — instead of being dropped on the floor. They used
+        // to be filtered out and the survivors handed to the facade, so an
+        // insert-only batch arrived there EMPTY and came back `edit-empty`,
+        // "at least one edit is required", for a call that gave one. A blind
+        // agent probed 20 shapes through `dry_run` (the honest way to try an
+        // unknown tool), was told its edit did not exist every time, and
+        // concluded that inserting a paragraph was not possible at all.
+        let mut replacements: Vec<EditRequest> = Vec::new();
+        let mut structural: Vec<Value> = Vec::new();
+        let mut blocked: Vec<Value> = Vec::new();
+        for edit in &edits {
+            let (kind, handle) = match edit {
+                Edit::Replace(request) => {
+                    replacements.push(request.clone());
+                    continue;
+                }
+                Edit::InsertAfter { handle, .. } => ("insert_after", handle),
+                Edit::Delete { handle } => ("delete", handle),
+                Edit::Format(request) => ("format", &request.handle),
+            };
+            match paragraph_of(workdir, handle) {
+                Ok(anchor) => structural.push(json!({
+                    "kind": kind,
+                    "anchor": anchor,
+                    "capability": "supported",
+                })),
+                Err(error) => blocked.push(json!({
+                    "kind": kind,
+                    "capability": "unsupported",
+                    "reason": format!("{}: {}", error.code, error.detail),
+                })),
+            }
+        }
+        // An empty replacement batch is not a question the facade can answer, so
+        // a structural-only call does not ask it one.
+        let preview = if replacements.is_empty() {
+            Value::Null
+        } else {
+            match facade::edit(workdir, &replacements, true, tracking) {
+                Ok(value) => value,
+                Err(error) => {
+                    return session.failure(
+                        "document_edit",
+                        &error.code,
+                        &error.detail,
+                        build_commit,
+                    )
+                }
             }
         };
-        return session.success(
-            "document_edit",
-            json!({ "operation_id": operation_id, "dry_run": true, "edit": preview }),
-            build_commit,
-        );
+        let mut data = json!({
+            "operation_id": operation_id,
+            "dry_run": true,
+            "edit": preview,
+        });
+        if !structural.is_empty() || !blocked.is_empty() {
+            data["structural"] = json!(structural);
+            // Say what a dry run can and cannot promise about the structural
+            // kinds: the anchor is resolved here, and the properties the new
+            // paragraph inherits are chosen when the edit is applied.
+            data["note"] = json!(
+                "structural edits are previewed by resolving their anchor; the properties an \
+                 inserted paragraph inherits are chosen when the edit is applied"
+            );
+        }
+        if !blocked.is_empty() {
+            data["blocked_targets"] = json!(blocked);
+        }
+        return session.success("document_edit", in_surface_vocabulary(data), build_commit);
     }
 
     // The operation id goes through the args so the store's ledger sees it: a
@@ -362,10 +1090,26 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0);
+
+    // A batch a SELECTOR expanded is probed member by member BEFORE anything is
+    // attempted: the caller enumerated nothing and cannot reconstruct an index, so
+    // without this it bisects the set over several turns. Every probe plans and
+    // throws the plan away — nothing is written, and the batch stays
+    // all-or-nothing.
+    if let Some(diagnosis) = selector_member_probe(session, args, build_commit) {
+        return diagnosis;
+    }
     let Some(envelope) = applied.get("structuredContent") else {
         return applied;
     };
     if envelope.get("outcome").and_then(Value::as_str) != Some("success") {
+        // A batch a SELECTOR expanded can name which member refused. The caller
+        // enumerated nothing, so it cannot reconstruct an index; without this it
+        // bisects the set over several turns. Still zero writes: the diagnosis is
+        // a dry run per member, and the refusal above already wrote nothing.
+        if let Some(diagnosis) = selector_member_diagnosis(session, args, &applied, build_commit) {
+            return diagnosis;
+        }
         return applied;
     }
     let data = envelope.get("data").cloned().unwrap_or_else(|| json!({}));
@@ -401,17 +1145,21 @@ pub fn document_edit(session: &mut McpSession, args: &Value, build_commit: &str)
     }
     session.success(
         "document_edit",
-        json!({
+        in_surface_vocabulary(json!({
             "operation_id": operation_id,
             "dry_run": false,
             // Replacements report through `edit` (the facade's staged targets);
-            // inserts and deletes through `structural`. A caller that asked for
-            // one kind gets the report for it and an explicit null for the other,
-            // rather than a field that silently is not there.
+            // inserts and deletes through `structural`; format edits through
+            // `restyles`. A caller that asked for one kind gets the report for it
+            // and an explicit null for the others, rather than a field that
+            // silently is not there.
             "edit": data.get("edit").cloned().unwrap_or(Value::Null),
             "structural": data.get("structural").cloned().unwrap_or(Value::Null),
+            "restyles": data.get("restyles").cloned().unwrap_or(Value::Null),
+            // A whole-set request reports what it did not need to do.
+            "skipped": data.get("skipped").cloned().unwrap_or(Value::Null),
             "synced": data.get("synced").cloned().unwrap_or(Value::Null),
-        }),
+        })),
         build_commit,
     )
 }

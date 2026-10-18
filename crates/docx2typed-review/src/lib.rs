@@ -13,6 +13,7 @@
 pub mod collab;
 pub mod draft;
 pub mod facade;
+pub mod format_lane;
 pub mod frame;
 pub mod history;
 pub mod queue;
@@ -21,3 +22,8 @@ pub mod server;
 
 pub use collab::{CollaborationError, PATCH_SCHEMA, SNAPSHOT_SCHEMA};
 pub use frame::{FRAME_SCHEMA, POSITION_CONTRACT};
+
+/// The sidecar holding the format requests a workdir has accumulated.
+pub const FORMAT_INTENTS_FILE: &str = "format_intents.json";
+/// The sidecar holding the plan derived from them — what the build executes.
+pub const FORMAT_PLAN_FILE: &str = "format_plan.json";

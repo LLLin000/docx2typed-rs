@@ -856,7 +856,7 @@ impl Engine {
         // integration check, not by the unit tests, because the unit tests
         // call apply_build directly.
         let published =
-            if plan.edits.is_empty() && plan.structure.is_empty() && plan.rpr_edits.is_empty() {
+            if plan.edits.is_empty() && plan.structure.is_empty() && plan.format_plan.is_none() {
                 match self.store.publish_build(&plan.template, &output) {
                     Ok(path) => path,
                     Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
@@ -866,28 +866,31 @@ impl Engine {
                 // surgery and structural synthesis to the template bytes
                 // (revalidated here; plan_build already gated the whole build)
                 // and publish the result.
-                let (bytes, stale_restyles) = match docx2typed_core::prose::apply_build(
+                let build = match docx2typed_core::prose::apply_build(
                     &plan.template,
                     &plan.edits,
                     &plan.structure,
-                    &plan.rpr_edits,
-                    &plan.styles,
                 ) {
                     Ok(result) => result,
                     Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
                 };
-                // A restyle whose paragraph a structure edit removed is reported,
-                // never dropped silently (#26's class).
-                if !stale_restyles.is_empty() {
-                    return Ok(OperationOutcome::failure(vec![Diagnostic::new(
-                        "rpr-edit-stale",
-                        format!(
-                            "these paragraphs carry a formatting edit but no longer exist in the \
-                         build: {}; the formatting was NOT applied",
-                            stale_restyles.join(", ")
-                        ),
-                    )]));
-                }
+                // The format engine's plan is applied AFTER the paragraph set is
+                // settled: it addresses the draft (template + islands +
+                // structure), so that is the package its coordinates mean. A plan
+                // made against another baseline is refused, not applied.
+                let workdir = plan.template.parent().unwrap_or(Path::new("."));
+                let bytes = match plan.format_plan.as_ref() {
+                    Some(_) => match apply_format_plan_to_workdir(workdir, &build.package) {
+                        Ok(bytes) => bytes,
+                        Err(message) => {
+                            return Ok(OperationOutcome::failure(vec![Diagnostic::new(
+                                "format-plan-stale",
+                                message,
+                            )]))
+                        }
+                    },
+                    None => build.package.clone(),
+                };
                 match self.store.publish_bytes(&bytes, &output) {
                     Ok(path) => path,
                     Err(error) => return Ok(self.domain_failure("build", &error.to_string())),
@@ -1040,6 +1043,7 @@ impl Engine {
             )]));
         };
         let edit = docx2typed_core::prose::IslandEdit {
+            char_start: None,
             part,
             paragraph_id,
             leaf_index,
@@ -2060,32 +2064,28 @@ impl Engine {
         let template = plan.template.clone();
         let edits = plan.edits.clone();
         let structure = plan.structure.clone();
-        let rpr_edits = plan.rpr_edits.clone();
-        let styles = plan.styles.clone();
+        let format_plan = plan.format_plan.clone();
         let out = output.to_path_buf();
         let manifest_before = manifest_before.to_string();
         let run = Box::new(move |_target: &Path, tx: &mut Transaction| {
             let staged = tx.staging("out.docx");
-            if edits.is_empty() && structure.is_empty() && rpr_edits.is_empty() {
+            if edits.is_empty() && structure.is_empty() && format_plan.is_none() {
                 fs::copy(&template, &staged).map_err(StoreError::Io)?;
             } else {
                 // Issue #58 / PR 3: edited build through the store: apply
                 // the recorded leaf surgery and structural synthesis to the
                 // template bytes (revalidated) and stage the result.
-                let (bytes, stale) = docx2typed_core::prose::apply_build(
-                    &template, &edits, &structure, &rpr_edits, &styles,
-                )
-                .map_err(|error| StoreError::store("workdir-invalid", error.to_string()))?;
-                if !stale.is_empty() {
-                    return Err(StoreError::store(
-                        "rpr-edit-stale",
-                        format!(
-                            "these paragraphs carry a formatting edit but no longer exist in the \
-                             build: {}; the formatting was NOT applied",
-                            stale.join(", ")
-                        ),
-                    ));
-                }
+                let build = docx2typed_core::prose::apply_build(&template, &edits, &structure)
+                    .map_err(|error| StoreError::store("workdir-invalid", error.to_string()))?;
+                // Then the format engine's plan, over the package whose
+                // coordinates it was derived from.
+                let bytes = if format_plan.is_some() {
+                    let workdir = template.parent().unwrap_or(Path::new("."));
+                    apply_format_plan_to_workdir(workdir, &build.package)
+                        .map_err(|message| StoreError::store("format-plan-stale", message))?
+                } else {
+                    build.package
+                };
                 fs::write(&staged, bytes).map_err(StoreError::Io)?;
             }
             // Flush the staged bytes before publication: the atomic rename
@@ -2902,4 +2902,29 @@ impl Default for Engine {
     fn default() -> Self {
         Engine::new()
     }
+}
+
+/// Apply the workdir's format plan to a package, or say why it cannot be.
+///
+/// One place, used by both build paths: read the plan, rebuild the snapshot it
+/// was derived from, refuse a digest mismatch, then materialise. The build does
+/// not re-derive a single formatting rule (ADR 0050).
+fn apply_format_plan_to_workdir(workdir: &Path, package: &[u8]) -> Result<Vec<u8>, String> {
+    // The requests are the durable input; the plan is a pure function of them and
+    // the draft. So the build RE-DERIVES it here rather than trusting the sidecar:
+    // a plan recorded at edit time goes stale the moment anything else moves the
+    // workdir — a text edit, or the save's own sync — and a stale plan used to be
+    // a permanent refusal with no way out on the five-tool surface. Two blind runs
+    // ended with an undeliverable document because of exactly that.
+    let requests = docx2typed_review::format_lane::load_format_requests(workdir)
+        .map_err(|error| format!("{}: {}", error.code, error.detail))?;
+    if requests.is_empty() {
+        return Ok(package.to_vec());
+    }
+    let (plan, snapshot) = docx2typed_review::format_lane::plan_format(workdir, &requests)
+        .map_err(|error| format!("{}: {}", error.code, error.detail))?;
+    docx2typed_review::format_lane::save_format_plan(workdir, &plan)
+        .map_err(|error| format!("{}: {}", error.code, error.detail))?;
+    docx2typed_review::format_lane::apply_format_plan(package, &plan, &snapshot)
+        .map_err(|error| format!("{}: {}", error.code, error.detail))
 }

@@ -153,7 +153,8 @@ def build_tasks() -> list[Task]:
                 ("document_find", {"query": "不存在的词"}),
             ],
             surface_checks=[
-                (0, "counts.matches", 0),
+                (0, "counts.occurrences", 0),
+                (0, "counts.total_matches", 0),
             ],
         ),
         # --- targeted claim edits ----------------------------------------
@@ -247,7 +248,8 @@ def build_tasks() -> list[Task]:
             ],
             surface_checks=[
                 (1, "structural.0.kind", "insert_after"),
-                (2, "counts.matches", 1),
+                (2, "counts.occurrences", 1),
+                (2, "counts.total_matches", 1),
                 (2, "matches.0.verdict.editable", True),
             ],
         ),
@@ -264,7 +266,8 @@ def build_tasks() -> list[Task]:
                 ("document_find", {"query": "mg"}),
             ],
             surface_checks=[
-                (0, "counts.matches", 0),
+                (0, "counts.occurrences", 0),
+                (0, "counts.total_matches", 0),
             ],
         ),
         # --- refusals -----------------------------------------------------
