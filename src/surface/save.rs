@@ -226,16 +226,16 @@ fn preflight_sidecar_receivable(src: &str, dst: &str) -> Result<(), String> {
     // Parent must exist (we never create directories as a side effect of a
     // refused publish) and the destination, when present, must be openable
     // for write-check. Absent destination + existing parent = receivable.
-    let parent = dst_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    if !parent.is_dir() {
-        return Err(format!(
-            "the document was NOT published: its evidence parent {parent:?} does not exist, \
-             so whatever {output} held is untouched",
-            parent = parent.display(),
-            output = dst,
-        ));
+    let parent = dst_path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        if !parent.is_dir() {
+            return Err(format!(
+                "the document was NOT published: its evidence parent {parent:?} does not exist, \
+                 so whatever {output} held is untouched",
+                parent = parent.display(),
+                output = dst,
+            ));
+        }
     }
     if dst_path.exists() {
         // Probe writability without mutating: open for write (no truncate).
