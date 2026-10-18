@@ -150,3 +150,39 @@ are retained privately and superseded, not counted as additional product bugs.
 The summary collector rejects PASS/EXPECTED_REJECT with a failed assertion and
 keeps no-host/incomplete cases out of executed totals; its three checks pass.
 
+## Directed #72/#73 fix verification
+
+The same four workflow scenarios were rerun with both independent production
+fixes composed locally: [PR #75](https://github.com/LLLin000/docx2typed-rs/pull/75)
+and [PR #76](https://github.com/LLLin000/docx2typed-rs/pull/76).
+The qualification PR contains evidence only, not those production changes.
+
+Final binary SHA-256:
+`feaee847fbd6f0bff6b5b14cee07f4ec5e45f8506d4c696f39b518ba49b0e349`.
+Its recorded descriptor is `31f2a57823006cb8769336b04f6bdf627457b764-dirty`;
+the hash, not a claim of a clean commit build, binds these runs.
+The input manifest and Word host/build are unchanged.
+
+| Check | Observed outcome |
+|---|---|
+| Explicit Word → re-extract → Agent continuation | `PASS` |
+| Old workdir attempts to overwrite Word-changed source | `EXPECTED_REJECT`; external edit retained |
+| Review selective accept/reject delivery candidate | `PASS` |
+| Cross existing Word revision boundary | `EXPECTED_REJECT` |
+| Historical high-value inputs, open/find/edit/save/reopen | 14 completed, 0 failures |
+| Frozen 217-input corpus | 216 `PASS`, 1 `EXPECTED_REJECT`, 0 `CONTRACT_FAILURE`; all 217 classifications unchanged |
+
+Workflow totals: **2 PASS, 2 EXPECTED_REJECT, 0 CONTRACT_FAILURE,
+0 UNSUPPORTED_WORKFLOW, 0 unexecuted**. Workspace: 407 passed, 3 ignored;
+clippy with warnings denied and formatting check passed. Both production PRs'
+Linux/Windows CI checks passed. The store qualification gate passed after
+replacing its incidental test-count pin with the test process exit status.
+
+Anonymous evidence is under
+[`qualification/evidence/real-workflow-qualification-v1/issue72-73-fixed/`](../../qualification/evidence/real-workflow-qualification-v1/issue72-73-fixed/):
+`workflow-summary.json`, `historical14.json`, `corpus-summary.json`, and
+`corpus-results.jsonl`. Original failing evidence above remains historical;
+it is not relabeled. Word COM automation still does not prove human visual
+acceptance, independently observed absence of repair prompts, modern threaded
+comments, or Zotero interoperability.
+
