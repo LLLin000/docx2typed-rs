@@ -230,6 +230,7 @@ recursively deleting `wd.parent()`, the shared temporary directory containing
 other tests' in-flight commit staging. Cleanup now owns only its unique source,
 sentinel and workdir; no shared-parent deletion, retries or test serialization.
 The commit implementation is unchanged. Workspace tests and CI must pass before
+calling PR #69 merge-ready; the corpus PR remains independently scoped.
 
 ### External-file precondition (issue #73)
 
