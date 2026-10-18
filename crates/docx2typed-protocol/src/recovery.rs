@@ -224,6 +224,15 @@ pub fn recovery_for(operation: &str, code: &str) -> Recovery {
             &[],
         );
     }
+    if code == "external-file-changed" {
+        return rm(
+            "re-extract-or-choose-new-output",
+            "the output changed outside the engine; re-extract the current file into the workdir \
+             with explicit discard (--discard-committed-versions) to make it the new baseline, \
+             or save to a new path that does not exist",
+            &["workdir_open", "build_docx"],
+        );
+    }
     // fallback
     r("inspect-diagnostic", &["workdir_status", "review_state"])
 }

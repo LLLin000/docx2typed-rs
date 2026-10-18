@@ -323,6 +323,11 @@ pub fn diagnostic_spec_opt(code: &str) -> Option<DiagnosticSpec> {
             category: "workdir",
             retriable: true,
         }),
+        "external-file-changed" => Some(DiagnosticSpec {
+            severity: "error",
+            category: "output",
+            retriable: false,
+        }),
         _ => None,
     }
 }

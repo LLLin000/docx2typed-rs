@@ -34,8 +34,10 @@ pub use versions::{
 };
 
 pub use store::{
-    has_store, pending_recovery, read_root, state, MutateRun, PinnedGeneration, RecoverySummary,
-    RunOutcome, Store, StoreMutateRequest, Transaction, STORE_DIR_NAME,
+    check_external_target, has_store, pending_recovery, read_external_targets, read_root, state,
+    write_external_targets_public, ExternalExpectation, MutateRun, PinnedGeneration,
+    RecoverySummary, RunOutcome, Store, StoreMutateRequest, Transaction, EXTERNAL_FILE_CHANGED,
+    EXTERNAL_TARGETS_FILE, EXTERNAL_TARGET_SCHEMA, STORE_DIR_NAME,
 };
 
 /// Workdir asset set from the Python Reference (`_WORKDIR_ASSETS`).

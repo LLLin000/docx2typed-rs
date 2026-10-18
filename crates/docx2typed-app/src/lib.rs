@@ -851,10 +851,13 @@ impl Engine {
             // with verified backup; recovery rolls forward/back).
             return self.build_store_backed(context, &workdir, &plan, &output, &manifest_before);
         }
-        // A restyle-only build must still go through apply_build: the pristine
-        // copy path would silently drop the formatting. Caught by the build
-        // integration check, not by the unit tests, because the unit tests
-        // call apply_build directly.
+        // Non-store workdirs publish without the journal, so the same
+        // precondition is enforced here directly: only own bytes or a new
+        // path. `publish_build`/`publish_bytes` stay dumb byte copies; the
+        // decision lives in this one place and mirrors the registry rule.
+        if let Err(outcome) = check_nonstore_external(&workdir, &output) {
+            return Ok(outcome);
+        }
         let published =
             if plan.edits.is_empty() && plan.structure.is_empty() && plan.format_plan.is_none() {
                 match self.store.publish_build(&plan.template, &output) {
@@ -920,6 +923,9 @@ impl Engine {
                 None,
             )]));
         }
+        // Success advances the same registry the store path keeps, so a later
+        // save over this path is judged against these bytes.
+        record_nonstore_success(&workdir, &published, &output_sha256);
         Ok(OperationOutcome::success(
             serde_json::json!({ "output": typed_path_value(&published) }),
             vec![evidence],
@@ -2678,6 +2684,55 @@ fn is_registered_code(code: &str) -> bool {
     // answered the domain default — wrong severity, wrong category, and
     // `retriable: false` for transient conditions — for half of them.
     docx2typed_protocol::diagnostic_spec_opt(code).is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Migration helpers (mirroring scripts/inspect_migrate.py
+// `_verify_staged` / `_build_manifest` / `_evidence_payload`)
+// ---------------------------------------------------------------------------
+
+/// External-output precondition for workdirs without the journal: the same
+/// rule the store enforces, checked here because there is no journal or lane
+/// to check it in. Delegates to the one shared checker — no second copy of
+/// the rule — including the canonical-source binding after an explicit
+/// re-extract.
+fn check_nonstore_external(workdir: &Path, output: &Path) -> Result<(), OperationOutcome> {
+    use docx2typed_store::{check_external_target, read_external_targets};
+    let epoch = docx2typed_core::read_baseline_epoch(workdir).unwrap_or(0);
+    let registry = read_external_targets(workdir);
+    match check_external_target(workdir, output, epoch, &registry) {
+        // Non-store path has no journal to carry the pending observed-absent
+        // marker: Ok(Some(_)) means "absent now, may be created by a single
+        // non-journaled publish". The registry is STILL not written here —
+        // only record_nonstore_success on the success path writes it. A
+        // refused publish therefore leaves zero registry writes, matching the
+        // store path's journal-carried pending marker.
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Ok(()),
+        Err(error) => Err(OperationOutcome::failure(vec![Diagnostic::new(
+            "external-file-changed",
+            error.message(),
+        )])),
+    }
+}
+
+/// Record a non-store publication's success: the canonical target now holds
+/// `sha256` at the current epoch.
+fn record_nonstore_success(workdir: &Path, published: &Path, sha256: &str) {
+    let epoch = docx2typed_core::read_baseline_epoch(workdir).unwrap_or(0);
+    let key = docx2typed_protocol::resolve_path(published)
+        .to_string_lossy()
+        .into_owned();
+    let mut targets = docx2typed_store::read_external_targets(workdir);
+    targets.insert(
+        key,
+        docx2typed_store::ExternalExpectation {
+            expected_sha256: Some(sha256.to_string()),
+            epoch,
+            observed_absent: false,
+        },
+    );
+    let _ = docx2typed_store::write_external_targets_public(workdir, &targets);
 }
 
 // ---------------------------------------------------------------------------
