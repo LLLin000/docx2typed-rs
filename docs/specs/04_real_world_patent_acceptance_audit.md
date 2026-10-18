@@ -349,3 +349,43 @@ run `39099908345` contains a separate Windows workspace failure in
 `store_mutation_replays_byte_exact_and_rejects_reuse` (missing staged
 `format.json`). It is not hidden by the corpus report or a rerun-to-green.
 
+## 11. Issue #70 closure: unchanged corpus, rules and oracle
+
+The original section 10 report and its manifest/results/summary are retained
+unchanged. A fresh execution with the corrected binary is published under
+[`issue70-fixed/`](../../qualification/evidence/real-docx-corpus-v1/issue70-fixed/),
+including a document-ID comparison rather than an edited old report.
+
+| Classification | Original | Fixed binary |
+|---|---:|---:|
+| `PASS` | 210 | 216 |
+| `EXPECTED_REJECT` | 1 | 1 |
+| `NOT_APPLICABLE` | 0 | 0 |
+| `CONTRACT_FAILURE` | 6 | 0 |
+| Incomplete | 0 | 0 |
+
+All 217 document IDs, the manifest digest and scanner digest are identical to
+the original run. Rules remain `real-docx-scan-rules-4`; no query/oracle relaxation
+or corpus expansion. Exactly the original six failures changed to `PASS`; every
+other classification is unchanged. Pristine round-trip remains **217/217 exact
+OPC member names and uncompressed bytes**, not a whole-ZIP byte claim.
+
+The new binary SHA-256 is
+`6e8ac8e169e7a9d60a6584dfaf337523abbe98a678aa2567f5f1e086530469a4`;
+its build descriptor is `8e8db0ab91323974013405a74b730093e366528f-dirty`
+(fixes built before commit `8285d27`; the actual descriptor is retained).
+The root fix changes both the builder and independent expected replay to
+derive attribute-window lengths from the byte literal, scoped to the current
+text opening tag. A separate strict XML parser now rejects malformed output
+`.xml` and `.rels`, including duplicate attributes in an edited target or an
+untouched part, before publication. The real five-tool minimal regression now
+passes without xfail. Verifier tests: **29 passed**; workspace: **393 passed,
+3 opt-in fixture emitters ignored**; clippy warnings denied passes. Final
+Windows review and commit tests pass **48 + 3** after unique-source isolation.
+
+The Windows `format.json` disappearance was caused by a test deleting its
+shared temporary parent, not by the commit state machine. That deletion is
+removed and the test source name is unique; no global lock, retry or serialized
+test runner was added. Core fixes are also on PR #69 as `eb996c5`; this corpus
+comparison remains on PR #71. Remote CI is recorded separately from local proof.
+
