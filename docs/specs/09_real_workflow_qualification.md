@@ -157,7 +157,7 @@ fixes composed locally: [PR #75](https://github.com/LLLin000/docx2typed-rs/pull/
 and [PR #76](https://github.com/LLLin000/docx2typed-rs/pull/76).
 The qualification PR contains evidence only, not those production changes.
 
-Final binary SHA-256:
+Pre-integration binary SHA-256 (historical evidence, not the final clean build):
 `feaee847fbd6f0bff6b5b14cee07f4ec5e45f8506d4c696f39b518ba49b0e349`.
 Its recorded descriptor is `31f2a57823006cb8769336b04f6bdf627457b764-dirty`;
 the hash, not a claim of a clean commit build, binds these runs.
@@ -185,4 +185,62 @@ Anonymous evidence is under
 it is not relabeled. Word COM automation still does not prove human visual
 acceptance, independently observed absence of repair prompts, modern threaded
 comments, or Zotero interoperability.
+
+## Clean-main integration acceptance
+
+PR #76 merged first. PR #75 was merged only after updating to that main and
+passing all eight Linux/Windows CI jobs. The final acceptance binary was then
+built from clean `main@32587ef925988100f41d4d27974ea675cdc0510c`,
+before adding qualification-only evidence. No production code was changed for
+this acceptance.
+
+Official binary SHA-256:
+`d2d5ddc73862a89cf526ffe1e5857c8b23c48bb0730bd47a972b118e6314d14c`.
+Descriptor:
+`docx2typed-rust 0.2.1 (32587ef925988100f41d4d27974ea675cdc0510c)`.
+This clean-main record supersedes the composed dirty-build result above as
+the integration acceptance reference; earlier results remain historical.
+
+With the unchanged input manifest and Word host/build, the four existing Word
+scenarios completed: **2 PASS, 2 EXPECTED_REJECT, 0 CONTRACT_FAILURE,
+0 UNSUPPORTED_WORKFLOW, 0 unexecuted**. Every reported assertion passed.
+The same 14 historical inputs completed open/find/edit/save/reopen with zero
+failures and unchanged source hashes.
+
+The frozen 217-input corpus completed all 217 newly scanned inputs, with zero
+resumed skips and no incomplete cases: **216 PASS, 1 EXPECTED_REJECT,
+0 CONTRACT_FAILURE, 0 NOT_APPLICABLE**. Every document's classification matches
+the prior directed-fix run. Workflow and corpus reports bind the same official
+binary hash and the unchanged manifest
+`ddcd005e6ec46b52aa80d70f6d3befecf6a72060eaaecd468a36652c3b755407`.
+
+The clean-main workspace run passed **407 tests, 3 ignored**, clippy with
+warnings denied, and formatting check. The qualification report collector's
+existing three tests also passed. Anonymous evidence and build/runner
+provenance are under
+[`qualification/evidence/real-workflow-qualification-v1/clean-main-final/`](../../qualification/evidence/real-workflow-qualification-v1/clean-main-final/).
+Private Word artifacts remain in `C:/tmp/docx2typed-final-integration-v1/`.
+
+## Frozen v1 capability boundary
+
+This version covers only the existing four scenarios and the fixed 14/217-input
+regression sets. Four scenarios meeting their contracts means two supported
+successes and two accurate refusals, not four editable workflows. Further
+workflow coverage belongs to a separate qualification version.
+
+| Capability | Claim boundary |
+|---|---|
+| Agent → Word → explicit re-extract → Agent | Specified Word COM handoff accepted |
+| Old workdir encounters external Word save | Detects and refuses the verified stale-overwrite cases |
+| Existing revisions/comments + Agent tracked edit | Specified Word COM review handoff accepted, including selective accept/reject |
+| Unsafe revision-boundary edit | Accurately refused |
+| Human Word UI, no-repair prompts, visual layout | Not qualified |
+| Zotero active citations, modern threaded comments | Not qualified |
+| Absolute no-overwrite under arbitrary concurrent writers | Not established |
+
+The external-file guard is not an absolute compare-and-swap guarantee. Windows
+handle protection does not prevent every external rename-onto-target race
+between the final precondition check and publication. OneDrive/SharePoint and
+other multiprocess/cloud coauthoring safety must not be inferred from this
+qualification; see ADR 0051's external-file precondition.
 
