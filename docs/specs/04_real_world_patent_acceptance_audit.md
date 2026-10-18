@@ -389,3 +389,29 @@ removed and the test source name is unique; no global lock, retry or serialized
 test runner was added. Core fixes are also on PR #69 as `eb996c5`; this corpus
 comparison remains on PR #71. Remote CI is recorded separately from local proof.
 
+## 12. Issue #72 note: tracked verification beside another author's prior revision
+
+review-run9 prepares a prior tracked replace and a classic comment in real Word
+under one maker (`照轩 林`), then agent-edits another paragraph's text under its
+own sidecar identity. The old whole-part identity walk joined the prior
+paragraph's deletion into the agent's deletion run and refused the correct
+output with `the runs of one deletion disagree about who made it` — a
+cross-paragraph grouping error, not an emission error: the builder wraps each
+covered run in place and never rewrites prior revisions.
+
+The fix scopes the check to the edit's own paragraph (`verify_tracked_paragraph`
+in `crates/docx2typed-verify/src/lib.rs`): the template's prior revisions must
+still stand byte-identical inside the edited paragraph (dropped or rewritten
+priors refuse here, where no other gate sees revision wrappers), and the edit's
+own run is the candidate deletions whose `delText` bodies join to `old`, with
+verified priors allowed to stand between covered runs. The identity agreement
+is unchanged — one maker's runs agree, the insertion names the same maker, and
+the sidecar's author/date are checked on the revision the edit produced.
+
+Permanent unit regressions (real core `apply_build` output, real verifier, no
+hand-shaped XML): an edit beside another author's prior revision verifies with
+the prior paragraph byte-identical; an edit inside a paragraph with an untouched
+prior verifies; rewriting or dropping the prior inside the edited paragraph
+refuses; restamping one run of the edit's own deletion or its insertion still
+refuses with the exact disagreement strings.
+

@@ -283,7 +283,9 @@ impl IndependentVerifier {
                     .unwrap_or_default();
             let structural = part_key == "document" && !structure.is_empty();
             if edits.iter().any(|edit| edit.tracked) && !structural {
-                if let Err(message) = verify_tracked_part(&output_part, &edits) {
+                if let Err(message) =
+                    verify_tracked_part(&template_part, &output_part, &edits, part_key.as_str())
+                {
                     edited_exact = false;
                     edited_detail = format!("part {part_path}: {message}");
                 } else {
@@ -1338,23 +1340,294 @@ fn recompute_structure_part(part: &[u8], structure: &StructureEdits) -> Result<V
     apply_spans(part, &structure_spans(part, structure)?)
 }
 
-fn verify_tracked_part(output_part: &[u8], edits: &[&IslandEdit]) -> Result<(), String> {
-    let xml = String::from_utf8_lossy(output_part);
+fn verify_tracked_part(
+    template_part: &[u8],
+    output_part: &[u8],
+    edits: &[&IslandEdit],
+    part_key: &str,
+) -> Result<(), String> {
+    let output_xml = String::from_utf8_lossy(output_part);
+    if !output_xml.contains("<w:del") || !output_xml.contains("<w:ins") {
+        return Err("tracked output is missing w:del/w:ins containers".to_string());
+    }
+    // The revision THIS edit produced lives in the edit's own paragraph. A
+    // document-wide walk joins every prior Word revision ahead of it into the
+    // same run and refuses the output whenever any of them names a different
+    // maker — measured on a real Word handoff whose prior tracked replace
+    // predates the agent's edit under another author. Grouping is therefore
+    // per paragraph, and a prior revision is skipped only when the template
+    // carries its exact bytes: text alone never identifies one.
+    let mut groups: std::collections::BTreeMap<&str, Vec<&IslandEdit>> =
+        std::collections::BTreeMap::new();
     for edit in edits.iter().filter(|edit| edit.tracked) {
+        groups
+            .entry(edit.paragraph_id.as_str())
+            .or_default()
+            .push(edit);
+    }
+    let template_paragraphs = locate_paragraphs(template_part, part_key)?;
+    let output_paragraphs = locate_paragraphs(output_part, part_key)?;
+    for (paragraph_id, group) in &groups {
+        let (_, template_start, template_end) = template_paragraphs
+            .iter()
+            .find(|(id, _, _)| id == paragraph_id)
+            .ok_or_else(|| format!("paragraph not found: {paragraph_id}"))?;
+        let (_, output_start, output_end) = output_paragraphs
+            .iter()
+            .find(|(id, _, _)| id == paragraph_id)
+            .ok_or_else(|| format!("paragraph not found: {paragraph_id}"))?;
+        let template_para = String::from_utf8_lossy(&template_part[*template_start..*template_end]);
+        let output_para = String::from_utf8_lossy(&output_part[*output_start..*output_end]);
+        verify_tracked_paragraph(&template_para, &output_para, paragraph_id, group)?;
+    }
+    Ok(())
+}
+
+/// One revision element (`w:del` / `w:ins`) of a paragraph, in document order.
+/// Borrows the paragraph XML: only the short identity strings allocate, never
+/// the element bytes.
+struct RevisionElement<'a> {
+    /// The complete element bytes, open tag through close tag. A prior
+    /// revision survives an edit byte-identically, so this is its proof.
+    full: &'a str,
+    author: String,
+    date: String,
+    /// The joined `delText` / `w:t` bodies.
+    text: String,
+}
+
+/// Every `w:del` / `w:ins` element of one paragraph's XML, in order.
+///
+/// Same-kind nesting occurs from neither Word nor the builder; a cross-kind
+/// nest (`w:ins` holding a `w:del`, legitimate Word structure) reads as its
+/// own element of each kind, which is what the join below needs. An opening
+/// tag without attributes (`<w:del>`) is not a revision Word or the builder
+/// emits; like the walker this replaces, only the attributed form is read.
+/// `text_tag` is the bare name (`w:t`), never a bare `t`: the latter also
+/// matches inside `delText` and would join text that is not there.
+fn scan_revisions<'a>(xml: &'a str, kind: &str, text_tag: &str) -> Vec<RevisionElement<'a>> {
+    let open = format!("<w:{kind} ");
+    let close = format!("</w:{kind}>");
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found) = xml[cursor..].find(open.as_str()) {
+        let start = cursor + found;
+        let Some(tag_end) = xml[start..].find('>') else {
+            break;
+        };
+        let tag = &xml[start..start + tag_end + 1];
+        let Some(body_end) = xml[start..].find(close.as_str()) else {
+            break;
+        };
+        let body = &xml[start + tag_end + 1..start + body_end];
+        out.push(RevisionElement {
+            full: &xml[start..start + body_end + close.len()],
+            author: attribute(tag, "w:author").unwrap_or_default(),
+            date: attribute(tag, "w:date").unwrap_or_default(),
+            text: inner_text(body, text_tag),
+        });
+        cursor = start + body_end + close.len();
+    }
+    out
+}
+
+/// Claim one unused prior element byte-identical to `full`.
+fn claim_prior(priors: &[RevisionElement<'_>], used: &mut [bool], full: &str) -> bool {
+    for (slot, prior) in priors.iter().enumerate() {
+        if !used[slot] && prior.full == full {
+            used[slot] = true;
+            return true;
+        }
+    }
+    false
+}
+
+/// The revision an edit produced, and the identity it claims.
+struct ProducedRevision {
+    author: String,
+    date: String,
+}
+
+/// Check every tracked edit of one paragraph against the output paragraph.
+///
+/// Prior revisions the template carries must still stand byte-identically: the
+/// builder never rewrites one, and every other gate walks revision wrappers
+/// transparently, so a dropped or rewritten prior inside the edited paragraph
+/// is this check's alone. What remains is the edit's own run — the candidate
+/// deletions whose `delText` bodies join to `old`, with verified priors
+/// allowed to stand between the covered runs the way the builder leaves
+/// them — and all of them must agree about who made them, as must the
+/// insertion carrying `new`.
+fn verify_tracked_paragraph(
+    template_para: &str,
+    output_para: &str,
+    paragraph_id: &str,
+    edits: &[&IslandEdit],
+) -> Result<(), String> {
+    let prior_dels = scan_revisions(template_para, "del", "w:delText");
+    let prior_inss = scan_revisions(template_para, "ins", "w:t");
+    let output_dels = scan_revisions(output_para, "del", "w:delText");
+    let output_inss = scan_revisions(output_para, "ins", "w:t");
+    // A template revision survives byte-identically; only a byte-identical
+    // element is prior. Anything else shaped like a revision is the edit's
+    // own — skipping by text alone would let a rewritten prior pass as the
+    // edit, and would let one edit's run claim another's text.
+    let mut prior_del_used = vec![false; prior_dels.len()];
+    let mut del_is_prior = vec![false; output_dels.len()];
+    for (index, element) in output_dels.iter().enumerate() {
+        if claim_prior(&prior_dels, &mut prior_del_used, &element.full) {
+            del_is_prior[index] = true;
+        }
+    }
+    let mut prior_ins_used = vec![false; prior_inss.len()];
+    let mut ins_is_prior = vec![false; output_inss.len()];
+    for (index, element) in output_inss.iter().enumerate() {
+        if claim_prior(&prior_inss, &mut prior_ins_used, &element.full) {
+            ins_is_prior[index] = true;
+        }
+    }
+    // Every prior revision must still stand: the builder never rewrites one.
+    if let Some(missing) = prior_dels
+        .iter()
+        .enumerate()
+        .find(|(slot, _)| !prior_del_used[*slot])
+        .map(|(_, prior)| prior)
+    {
+        return Err(format!(
+            "prior deletion revision {:?} of the template is missing or rewritten in paragraph {paragraph_id}",
+            missing.text
+        ));
+    }
+    if let Some(missing) = prior_inss
+        .iter()
+        .enumerate()
+        .find(|(slot, _)| !prior_ins_used[*slot])
+        .map(|(_, prior)| prior)
+    {
+        return Err(format!(
+            "prior insertion revision {:?} of the template is missing or rewritten in paragraph {paragraph_id}",
+            missing.text
+        ));
+    }
+    let mut del_consumed = vec![false; output_dels.len()];
+    let mut ins_consumed = vec![false; output_inss.len()];
+    for edit in edits {
         let old = xml_escape(&edit.old);
         let new = xml_escape(&edit.new);
-        if !xml.contains("<w:del") || !xml.contains("<w:ins") {
-            return Err("tracked output is missing w:del/w:ins containers".to_string());
-        }
-        if !deletion_covers(&xml, &old) {
+        if !deletion_covers(output_para, &old) {
             return Err(format!("tracked deletion text {:?} is missing", edit.old));
         }
-        // The revision's IDENTITY is part of the claim, and it is checked on the
-        // revision THIS edit produced — the `del` carrying its old text and the
-        // `ins` carrying its new one. A document-wide search for the author
-        // would accept a tampered revision whenever any other revision still
-        // carried the value: measured, changing one `w:author` passed.
-        let revision = revision_for(&xml, &old, &new)?;
+        // The edit's own run: candidate deletions in document order whose
+        // bodies join to `old`. A verified prior stands BETWEEN two covered
+        // runs unchanged whenever it did: the builder wraps each covered run
+        // in place and leaves whatever sits between runs — bookmarks, priors
+        // — intact. The two runs of one deletion agreeing while a prior sits
+        // between them is the legitimate Word shape, not a disagreement. The
+        // first clean join wins; a joining run that disagrees about its maker,
+        // or two of them, is the tamper the message below owns.
+        let order: Vec<usize> = (0..output_dels.len())
+            .filter(|index| !del_consumed[*index])
+            .collect();
+        let mut chosen: Option<(usize, usize, ProducedRevision)> = None;
+        for start_pos in 0..order.len() {
+            let mut joined = String::new();
+            let mut identity: Option<ProducedRevision> = None;
+            let mut bad = false;
+            let mut end_pos = start_pos;
+            let mut complete = false;
+            for (pos, &index) in order[start_pos..].iter().enumerate() {
+                // A verified prior survives mid-run exactly as the builder
+                // left it: it contributes nothing to the join and agrees with
+                // nothing, and the element after it still continues it.
+                if del_is_prior[index] {
+                    end_pos = start_pos + pos + 1;
+                    continue;
+                }
+                let element = &output_dels[index];
+                let continues = !element.text.is_empty()
+                    && old
+                        .get(joined.len()..)
+                        .is_some_and(|tail| tail.starts_with(element.text.as_str()));
+                if !continues {
+                    break;
+                }
+                match &identity {
+                    Some(seen)
+                        if seen.author != element.author || seen.date != element.date =>
+                    {
+                        bad = true;
+                        break;
+                    }
+                    _ => {
+                        identity = Some(ProducedRevision {
+                            author: element.author.clone(),
+                            date: element.date.clone(),
+                        })
+                    }
+                }
+                joined.push_str(&element.text);
+                end_pos = start_pos + pos + 1;
+                if joined == old {
+                    complete = true;
+                    break;
+                }
+            }
+            if !complete {
+                continue;
+            }
+            if bad {
+                return Err("the runs of one deletion disagree about who made it".to_string());
+            }
+            let identity = identity
+                .ok_or_else(|| format!("no w:del carries the deleted text {:?}", edit.old))?;
+            match &chosen {
+                Some((_, _, seen))
+                    if seen.author != identity.author || seen.date != identity.date =>
+                {
+                    return Err("the runs of one deletion disagree about who made it".to_string());
+                }
+                Some(_) => {}
+                None => chosen = Some((start_pos, end_pos, identity)),
+            }
+        }
+        let Some((start_pos, end_pos, revision)) = chosen else {
+            return Err(format!("no w:del carries the deleted text {:?}", edit.old));
+        };
+        for &index in &order[start_pos..end_pos] {
+            del_consumed[index] = true;
+        }
+        // The insertion is one element: the new text written once, in the run
+        // that carries the match's style — and it must name the same maker.
+        // The first text match with another maker is the tamper, not a cue to
+        // keep searching: two edits sharing one paragraph and one new text
+        // under different makers refuse here, fail-closed.
+        let mut found = false;
+        for (index, element) in output_inss.iter().enumerate() {
+            if ins_is_prior[index] || ins_consumed[index] {
+                continue;
+            }
+            if element.text == new {
+                if element.author != revision.author || element.date != revision.date {
+                    return Err(format!(
+                        "the deletion and the insertion disagree about who made the edit \
+                         ({:?}/{:?} vs {:?}/{:?})",
+                        revision.author, revision.date, element.author, element.date
+                    ));
+                }
+                ins_consumed[index] = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(format!("no w:ins carries the inserted text {:?}", edit.new));
+        }
+        // The revision's IDENTITY is part of the claim, and it is checked on
+        // the revision THIS edit produced — the `del` run carrying its old
+        // text and the `ins` carrying its new one. A document-wide search for
+        // the author would accept a tampered revision whenever any other
+        // revision still carried the value: measured, changing one `w:author`
+        // passed.
         if !edit.author.is_empty() && revision.author != xml_escape(&edit.author) {
             return Err(format!(
                 "tracked revision says author {:?}, the edit recorded {:?}",
@@ -1367,112 +1640,47 @@ fn verify_tracked_part(output_part: &[u8], edits: &[&IslandEdit]) -> Result<(), 
                 revision.date, edit.date
             ));
         }
-        if !xml.contains(&format!("<w:t>{new}</w:t>"))
-            && !xml.contains(&format!("<w:t xml:space=\"preserve\">{new}</w:t>"))
+        if !output_para.contains(&format!("<w:t>{new}</w:t>"))
+            && !output_para.contains(&format!("<w:t xml:space=\"preserve\">{new}</w:t>"))
         {
             return Err(format!("tracked insertion text {:?} is missing", edit.new));
         }
     }
+    // Nothing unaccounted: every new revision element belongs to a recorded
+    // edit of this paragraph.
+    if (0..output_dels.len()).any(|index| !del_is_prior[index] && !del_consumed[index]) {
+        return Err(format!(
+            "the output carries a deletion no recorded edit produced in paragraph {paragraph_id}"
+        ));
+    }
+    if (0..output_inss.len()).any(|index| !ins_is_prior[index] && !ins_consumed[index]) {
+        return Err(format!(
+            "the output carries an insertion no recorded edit produced in paragraph {paragraph_id}"
+        ));
+    }
     Ok(())
 }
 
-/// The revision an edit produced, and the identity it claims.
-struct ProducedRevision {
-    author: String,
-    date: String,
-}
-
-/// Read the identity off the revision THIS edit produced.
-///
-/// A deletion that crosses runs is one `w:del` PER RUN — wrapping each run is
-/// what keeps whatever sits between runs intact — so the deletion is a run of
-/// elements whose `delText` bodies join to `old`, not one element. All of them
-/// belong to the same edit and must agree about who made it.
-fn revision_for(xml: &str, old: &str, new: &str) -> Result<ProducedRevision, String> {
-    let deleted = xml_escape(old);
-    let mut joined = String::new();
-    let mut identity: Option<ProducedRevision> = None;
-    let mut rest = xml;
-    while let Some(start) = rest.find("<w:del ") {
-        let Some(tag_end) = rest[start..].find('>') else {
-            break;
-        };
-        let tag = &rest[start..start + tag_end + 1];
-        let Some(body_end) = rest[start..].find("</w:del>") else {
-            break;
-        };
-        let body = &rest[start + tag_end + 1..start + body_end];
-        let text = inner_text(body, "w:delText");
-        let found = ProducedRevision {
-            author: attribute(tag, "w:author").unwrap_or_default(),
-            date: attribute(tag, "w:date").unwrap_or_default(),
-        };
-        match &identity {
-            Some(seen)
-                if (seen.author.as_str(), seen.date.as_str())
-                    != (found.author.as_str(), found.date.as_str()) =>
-            {
-                return Err("the runs of one deletion disagree about who made it".to_string())
-            }
-            _ => identity = Some(found),
-        }
-        joined.push_str(&text);
-        if joined == deleted {
-            break;
-        }
-        rest = &rest[start + body_end + "</w:del>".len()..];
-    }
-    let deleted_identity =
-        identity.ok_or_else(|| format!("no w:del carries the deleted text {old:?}"))?;
-    if joined != deleted {
-        return Err(format!(
-            "the deletion markup reads {joined:?}, the edit recorded {old:?}"
-        ));
-    }
-
-    // The insertion is one element: the new text is written once, in the run
-    // that carries the match's style.
-    let inserted = xml_escape(new);
-    let mut rest = xml;
-    while let Some(start) = rest.find("<w:ins ") {
-        let Some(tag_end) = rest[start..].find('>') else {
-            break;
-        };
-        let tag = &rest[start..start + tag_end + 1];
-        let Some(body_end) = rest[start..].find("</w:ins>") else {
-            break;
-        };
-        let body = &rest[start + tag_end + 1..start + body_end];
-        if inner_text(body, "w:t") == inserted {
-            let ins = ProducedRevision {
-                author: attribute(tag, "w:author").unwrap_or_default(),
-                date: attribute(tag, "w:date").unwrap_or_default(),
-            };
-            if (
-                deleted_identity.author.as_str(),
-                deleted_identity.date.as_str(),
-            ) != (ins.author.as_str(), ins.date.as_str())
-            {
-                return Err(format!(
-                    "the deletion and the insertion disagree about who made the edit \
-                     ({:?}/{:?} vs {:?}/{:?})",
-                    deleted_identity.author, deleted_identity.date, ins.author, ins.date
-                ));
-            }
-            return Ok(deleted_identity);
-        }
-        rest = &rest[start + body_end + "</w:ins>".len()..];
-    }
-    Err(format!("no w:ins carries the inserted text {new:?}"))
-}
-
 /// The text bodies of one tag inside a fragment, joined.
+///
+/// The open tag must end exactly: `<w:t` also prefixes `<w:tabs/>`, and a
+/// bare `t` search matches inside `delText`. Only `>`, `/` or whitespace may
+/// follow the name; anything else skips past the false hit. Strict, never
+/// looser.
 fn inner_text(fragment: &str, tag: &str) -> String {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
     let mut collected = String::new();
     let mut cursor = fragment;
     while let Some(inner) = cursor.find(&open) {
+        let after = inner + open.len();
+        let exact = cursor.as_bytes().get(after).is_some_and(|byte| {
+            *byte == b'>' || *byte == b'/' || byte.is_ascii_whitespace()
+        });
+        if !exact {
+            cursor = &cursor[after..];
+            continue;
+        }
         let Some(gt) = cursor[inner..].find('>') else {
             break;
         };
@@ -3661,7 +3869,7 @@ mod tests {
     /// tracked branch (`verify_edited`) calls `verify_tracked_part` on the
     /// OUTPUT part instead of `recompute_edited_part`, so `edited-part-exact`
     /// never runs there; the revision check proves the deletion/insertion texts
-    /// plus the THIS-revision author/date agreement (`revision_for`).
+    /// plus the THIS-revision author/date agreement (`verify_tracked_paragraph`).
     ///
     /// Strong gates on the tracked path:
     /// - `parts-match-template-except-edited`: only the recorded edited parts
@@ -3672,11 +3880,13 @@ mod tests {
     ///   stay ignored; textbox-container edits stay exempt by containment.
     /// - `non-target-preserved` / `check_non_target_preserved`: text/run-props
     ///   outside edited spans unchanged (edited paragraph exempt by design).
-    /// - `verify_tracked_part` / `revision_for` / `deletion_covers`: the output
-    ///   must carry w:del+w:ins, the joined delText must equal `old`, one w:ins
-    ///   must carry `new`, and every del of the run plus that ins must agree on
-    ///   author/date with the sidecar.
-    fn tracked_audit_sidecar_for(
+    /// - `verify_tracked_part` / `verify_tracked_paragraph` / `deletion_covers`:
+    ///   the output must carry w:del+w:ins, the template's prior revisions must
+    ///   still stand byte-identical, the joined delText must equal `old`, one
+    ///   w:ins must carry `new`, and every del of the run plus that ins must
+    ///   agree on author/date with the sidecar.
+    fn tracked_audit_sidecar_in(
+        paragraph: &str,
         author: &str,
         date: &str,
         leaf_index: usize,
@@ -3685,10 +3895,20 @@ mod tests {
     ) -> String {
         format!(
             "{{\"schema\":\"docx2typed-islands-1\",\"edits\":[{{\
-               \"part\":\"document\",\"paragraph_id\":\"P0\",\"leaf_index\":{leaf_index},\
+               \"part\":\"document\",\"paragraph_id\":\"{paragraph}\",\"leaf_index\":{leaf_index},\
                \"old\":\"{old}\",\"new\":\"{new}\",\"tracked\":true,\
                \"author\":\"{author}\",\"date\":\"{date}\"}}]}}"
         )
+    }
+
+    fn tracked_audit_sidecar_for(
+        author: &str,
+        date: &str,
+        leaf_index: usize,
+        old: &str,
+        new: &str,
+    ) -> String {
+        tracked_audit_sidecar_in("P0", author, date, leaf_index, old, new)
     }
 
     fn tracked_audit_sidecar(author: &str, date: &str) -> String {
@@ -4250,6 +4470,236 @@ mod tests {
             std::fs::read(&template).expect("template bytes"),
             before,
             "a refused edit leaves the template untouched"
+        );
+    }
+    /// review-run9 shape (issue #72): the template's own history predates the
+    /// agent's edit. Word wrote a tracked replace in P0 under another author;
+    /// the agent then tracked-replaces text in P1 across two runs under its
+    /// own identity. The old whole-part walk joined P0's deletion into the
+    /// agent's run and refused it with `the runs of one deletion disagree
+    /// about who made it`. Real core `apply_build` output, real verifier.
+    const PRIOR_AUTHOR_TEMPLATE: &str = concat!(
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+        "<w:body>",
+        "<w:p><w:r><w:t>Locally grown </w:t></w:r><w:r><w:t>produce</w:t></w:r>",
+        "<w:del w:id=\"0\" w:author=\"prior-author\" w:date=\"2026-10-17T10:00:00Z\">",
+        "<w:r><w:rPr><w:b/></w:rPr><w:delText>fresh herbs</w:delText></w:r></w:del>",
+        "<w:ins w:id=\"1\" w:author=\"prior-author\" w:date=\"2026-10-17T10:00:00Z\">",
+        "<w:r><w:t>fresh spices</w:t></w:r></w:ins>",
+        "<w:r><w:t> daily.</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>Market </w:t></w:r><w:r><w:t>opens </w:t></w:r><w:r><w:t>early</w:t></w:r></w:p>",
+        "</w:body></w:document>",
+    );
+
+    /// A template revision INSIDE the agent's own paragraph: edited P0 carries
+    /// a prior deletion the agent does not touch, plus editable text the agent
+    /// replaces. The prior must survive byte-identically.
+    const INLINE_PRIOR_TEMPLATE: &str = concat!(
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+        "<w:body>",
+        "<w:p><w:r><w:t>Kept lead </w:t></w:r>",
+        "<w:del w:id=\"0\" w:author=\"prior-author\" w:date=\"2026-10-17T10:00:00Z\">",
+        "<w:r><w:delText>struck clause</w:delText></w:r></w:del>",
+        "<w:r><w:t> tail text</w:t></w:r></w:p>",
+        "</w:body></w:document>",
+    );
+
+    fn prior_author_edit(
+        paragraph: &str,
+        leaf_index: usize,
+        old: &str,
+        new: &str,
+    ) -> docx2typed_core::prose::IslandEdit {
+        docx2typed_core::prose::IslandEdit {
+            part: "document".to_string(),
+            paragraph_id: paragraph.to_string(),
+            leaf_index,
+            old: old.to_string(),
+            char_start: None,
+            new: new.to_string(),
+            tracked: true,
+            author: "agent-author".to_string(),
+            date: "2026-10-18T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn tracked_edit_beside_a_prior_revision_by_another_author_verifies() {
+        // The agent's cross-run edit (P1 `opens early` -> `OPENS EARLY`, whole
+        // runs 1+2) builds against a template whose P0 prior revision names
+        // another author. The output must verify clean, and P0's prior del/ins
+        // must be untouched.
+        let (workdir, output) = tracked_audit_setup_for(
+            PRIOR_AUTHOR_TEMPLATE,
+            &tracked_audit_sidecar_in("P1", "agent-author", "2026-10-18T00:00:00Z", 1, "opens early", "OPENS EARLY"),
+        );
+        let edit = prior_author_edit("P1", 1, "opens early", "OPENS EARLY");
+        let legal = tracked_audit_genuine_output_for(&workdir, edit);
+        let output_xml =
+            String::from_utf8_lossy(&opaque_audit_part(&legal, "word/document.xml")).into_owned();
+        assert!(
+            output_xml.contains("prior-author"),
+            "the prior revision must survive the build"
+        );
+        let evidence = tracked_audit_write(&workdir, &output, &legal);
+        assert_eq!(
+            evidence.verdict, "pass",
+            "an edit beside another author's prior revision must verify: {:?}",
+            evidence.checks
+        );
+        let template_pkg = std::fs::read(workdir.join("_template.docx")).expect("template");
+        let template_part = opaque_audit_part(&template_pkg, "word/document.xml");
+        let output_part = opaque_audit_part(&legal, "word/document.xml");
+        let template_ps = locate_paragraphs(&template_part, "document").expect("template ps");
+        let output_ps = locate_paragraphs(&output_part, "document").expect("output ps");
+        let template_p0 = template_ps.iter().find(|(id, _, _)| id == "P0").expect("template P0");
+        let output_p0 = output_ps.iter().find(|(id, _, _)| id == "P0").expect("output P0");
+        assert_eq!(
+            &template_part[template_p0.1..template_p0.2],
+            &output_part[output_p0.1..output_p0.2],
+            "the prior revision's paragraph is byte-identical after the build"
+        );
+    }
+
+    #[test]
+    fn tracked_edit_inside_a_paragraph_with_an_untouched_prior_verifies() {
+        // Same paragraph holds a prior deletion AND the agent's edit (`tail`
+        // -> `TAIL`). The prior del stands byte-identical; the edit's own run
+        // is checked against the sidecar, not joined with the prior.
+        let (workdir, output) = tracked_audit_setup_for(
+            INLINE_PRIOR_TEMPLATE,
+            &tracked_audit_sidecar_for("agent-author", "2026-10-18T00:00:00Z", 2, "tail", "TAIL"),
+        );
+        let legal =
+            tracked_audit_genuine_output_for(&workdir, prior_author_edit("P0", 2, "tail", "TAIL"));
+        let evidence = tracked_audit_write(&workdir, &output, &legal);
+        assert_eq!(
+            evidence.verdict, "pass",
+            "an edit inside a paragraph with an untouched prior must verify: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn rewriting_the_prior_revision_inside_the_edited_paragraph_is_refused() {
+        // The edited paragraph's prior del (author `prior-author`) is
+        // rewritten to the agent's own author: no gate outside the tracked
+        // check sees revision wrappers, so this check must own it.
+        let (workdir, output) = tracked_audit_setup_for(
+            INLINE_PRIOR_TEMPLATE,
+            &tracked_audit_sidecar_for("agent-author", "2026-10-18T00:00:00Z", 2, "tail", "TAIL"),
+        );
+        let legal =
+            tracked_audit_genuine_output_for(&workdir, prior_author_edit("P0", 2, "tail", "TAIL"));
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            xml.replace("w:author=\"prior-author\"", "w:author=\"agent-author\"")
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        assert_eq!(
+            evidence.verdict, "fail",
+            "a rewritten prior inside the edited paragraph must not verify: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn dropping_the_prior_revision_inside_the_edited_paragraph_is_refused() {
+        // Same class, removal rather than rewrite: the template's prior del is
+        // gone from the output paragraph.
+        let (workdir, output) = tracked_audit_setup_for(
+            INLINE_PRIOR_TEMPLATE,
+            &tracked_audit_sidecar_for("agent-author", "2026-10-18T00:00:00Z", 2, "tail", "TAIL"),
+        );
+        let legal =
+            tracked_audit_genuine_output_for(&workdir, prior_author_edit("P0", 2, "tail", "TAIL"));
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            let open = xml.find("<w:del ").expect("prior del present");
+            let end = open
+                + xml[open..].find("</w:del>").expect("prior del closes")
+                + "</w:del>".len();
+            format!("{}{}", &xml[..open], &xml[end..])
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        assert_eq!(
+            evidence.verdict, "fail",
+            "a dropped prior inside the edited paragraph must not verify: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn tampering_one_run_of_the_edits_own_deletion_still_disagrees() {
+        // The author agreement is NOT weakened: the first del run of P1's
+        // cross-run deletion is restamped to another maker, and the grouped
+        // check must still fail with the exact disagreement string the
+        // cross-paragraph false reject used.
+        let (workdir, output) = tracked_audit_setup_for(
+            PRIOR_AUTHOR_TEMPLATE,
+            &tracked_audit_sidecar_in(
+                "P1",
+                "agent-author",
+                "2026-10-18T00:00:00Z",
+                1,
+                "opens early",
+                "OPENS EARLY",
+            ),
+        );
+        let legal = tracked_audit_genuine_output_for(
+            &workdir,
+            prior_author_edit("P1", 1, "opens early", "OPENS EARLY"),
+        );
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            xml.replacen(
+                "w:author=\"agent-author\"",
+                "w:author=\"intruder\"",
+                1,
+            )
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let detail = evidence
+            .checks
+            .iter()
+            .find(|check| check.name == "edited-part-exact")
+            .and_then(|check| check.detail.clone())
+            .unwrap_or_default();
+        assert_eq!(evidence.verdict, "fail", "a disagreeing run must not verify");
+        assert!(
+            detail.contains("runs of one deletion disagree"),
+            "the disagreement message must survive scoping, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn tampering_the_insertion_author_still_disagrees() {
+        // Same, del/ins leg: the insertion is restamped and the pair must
+        // refuse with the del/ins disagreement string.
+        let (workdir, output) = tracked_audit_setup_for(
+            PRIOR_AUTHOR_TEMPLATE,
+            &tracked_audit_sidecar_in("P1", "agent-author", "2026-10-18T00:00:00Z", 1, "opens early", "OPENS EARLY"),
+        );
+        let edit = prior_author_edit("P1", 1, "opens early", "OPENS EARLY");
+        let legal = tracked_audit_genuine_output_for(&workdir, edit);
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            // The insertion is the last agent-author revision: restamp the LAST
+            // occurrence, not the prior or the deletion half.
+            let open = xml.rfind("w:author=\"agent-author\"").expect("agent ins present");
+            format!(
+                "{}w:author=\"intruder\"{}",
+                &xml[..open],
+                &xml[open + "w:author=\"agent-author\"".len()..]
+            )
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let detail = evidence
+            .checks
+            .iter()
+            .find(|check| check.name == "edited-part-exact")
+            .and_then(|check| check.detail.clone())
+            .unwrap_or_default();
+        assert_eq!(evidence.verdict, "fail", "a restamped insertion must not verify");
+        assert!(
+            detail.contains("deletion and the insertion disagree"),
+            "the del/ins disagreement message must survive scoping, got: {detail}"
         );
     }
 }
