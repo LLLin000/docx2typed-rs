@@ -108,3 +108,97 @@ edited is not a workaround, it is the bug.
 - the 14 real documents: the full task (find → edit → save → reopen) succeeds, or
   the target is refused before the edit with a reason that names it;
 - the corpus fixtures and the round-trip test stay green throughout.
+
+## Pre-merge safety closure (2026-10-18)
+
+This review keeps the reconciliation model and the frozen edit protocol. It
+changes only reproduced failures of the invariants above.
+
+### Frozen baseline lifecycle and compatibility
+
+`baseline.view` is initialized lazily by `ensure_projection`, before the first
+edit, from the extracted template. Normal edits, commits, saves, reopenings and
+refusals must not rewrite it. An existing baseline without `edit.state.json` is
+a torn workdir, not a fresh one: initialization refuses rather than replacing B.
+An explicit permitted extract/reset removes the old baseline with the other
+old-generation assets in the same `ChangeSet`. This is not an additional
+power-loss or mid-publication rollback guarantee.
+
+New state files declare `editable_view_contract: "editable-view-1"`. With an
+existing B, a missing or mismatched marker refuses as `edit-state-incompatible`
+and names fresh extraction as the recovery. An explicitly foreign marker also
+refuses when B is absent. Unmarked legacy workdirs with no B retain the existing
+fallback; this is not evidence that arbitrary old renderers are compatible.
+The marker labels a contract version, not a cryptographic digest of B.
+
+`rust-tests/sync_guard.rs` exercises edit, commit, real save, reopen, refused
+edit and inconsistent-state refusal while checking B's digest. It also extracts
+the saved DOCX into a new workdir, where a new baseline is legitimate, and tests
+orphaned B and missing/foreign version markers without regeneration.
+
+### Weak text comparison is not a structural proof
+
+`readings_disagree` remains an auxiliary, whitespace/marker-insensitive text
+comparison. It does not establish opaque identity or structure. Independent
+verification is responsible for those claims.
+
+The safety audit used genuine tracked output from the core builder, then
+tampered with it before calling `IndependentVerifier::verify`. Three
+counterexamples originally verified as `pass`:
+
+- an opaque node invented in an edited paragraph;
+- an opening-attribute-only rewrite of an opaque run in another paragraph;
+- an unchanged, ordered group of opaque nodes relocated relative to the text
+  within an untouched paragraph.
+
+The minimal corrections are in `docx2typed-verify`:
+
+- opaque identity hashes the complete XML node, including its opening tag;
+- targeted protected-node lists compare exactly: identity, count and relative
+  order, including an originally empty list;
+- paragraphs outside authorized text/format spans preserve their complete XML
+  bytes, not merely their text and run-property sequence.
+
+Revision wrappers remain transparent, and existing authorized textbox and
+format-span exemptions are unchanged. Byte offsets may shift after a legitimate
+edit; preserving source placement does not mean freezing absolute byte offsets.
+The core still refuses edits into opaque paragraphs before writing.
+
+Direct edits retain independent edited-part byte recomputation. Tracked edits
+use revision-text/identity validation plus the protected-structure and
+non-target-byte gates; their evidence no longer claims a byte recomputation
+that did not occur. Permanent adversarial tests cover deletion, count-preserving
+swap, identity/attribute replacement, duplication, invention (including no
+baseline protected nodes), cross-paragraph movement and same-paragraph
+non-target relocation. Legal direct and tracked outputs pass the same verifier.
+
+### Executed closure evidence
+
+- `cargo build --release`, `cargo clippy --workspace --all-targets -- -D warnings`
+  and `cargo fmt --all --check`: pass.
+- `cargo test --workspace`: **388 passed, 0 failed, 3 ignored**, 44 suites.
+  This includes the existing structural, format-engine and publication gates.
+- The fresh-workdir real-document regression: **14/14** inputs complete
+  find, edit, save and reopen.
+- `seq7`: revoke the island, save again and reopen; the final DOCX is
+  **byte-identical to its source ZIP**, not just equal in visible text.
+- For 02, 13 and 08, all OPC member names and non-document member bytes match
+  the source. Each `word/document.xml` differs by exactly one UTF-8
+  `的` → `之` substitution; every byte outside that substitution is identical.
+  This proves more than equal paragraph or `proofErr` counts.
+
+The adversarial cases live in `crates/docx2typed-verify/src/lib.rs`, including
+`tracked_inventing_a_protected_node_inside_targeted_p0`,
+`tracked_inventing_a_protected_node_in_empty_baseline_p0`,
+`tracked_outer_opening_attribute_change_on_opaque_run_in_p1` and
+`tracked_relocating_opaque_group_within_untouched_p1`. The last case keeps opaque
+identity, count and order unchanged and is refused by `non-target-preserved`;
+identity/order checks alone are not presented as source-position proof.
+
+The historical **432-document** scan is not a result of this gate. Its original
+manifest is unavailable in the retained records, and a new inventory must not be
+silently presented as that corpus. A future classified run requires a frozen
+input manifest and matching binary/view-contract metadata. Success, accurate
+early refusal, contract failure and inconclusive infrastructure/oracle results
+must remain separate; no-match queries and unproven target-occurrence linkage
+are not successful edits or accurate-refusal evidence.

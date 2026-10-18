@@ -21,6 +21,11 @@ pub const EDIT_STATE_SCHEMA: &str = "typed-clean-edit-state-1";
 pub const EDIT_SCHEMA_VERSION: i64 = 1;
 pub const SYNC_CONTRACT_VERSION: i64 = 1;
 pub const SEGMENTATION_CONTRACT: &str = "uax29-c1-1/unicode-16.0.0";
+/// The single editable-view rendering rule (ADR 0051) the frozen baseline and
+/// the draft are both rendered by. Emitted into `edit.state.json` at every
+/// projection init; `classify_edit_state` refuses a workdir whose
+/// `baseline.view` exists without a matching marker, before any mutation.
+pub const EDITABLE_VIEW_CONTRACT: &str = "editable-view-1";
 
 pub const STATE_FILE: &str = "edit.state.json";
 pub const PROJECTION_FILE: &str = "edit.md";
@@ -257,6 +262,38 @@ pub fn classify_edit_state(root: &Path) -> Result<EditState, CoreError> {
         return Err(domain(
             "edit-state-incompatible: segmentation_contract mismatch in edit.state.json",
         ));
+    }
+    // Editable-view version gate: `editable_view_contract` is a version LABEL
+    // in `edit.state.json` naming the rule the frozen baseline was rendered
+    // under — not a digest, and not proof that a hand-modified `baseline.view`
+    // is intact. A PRESENT marker that is absent from the known set is foreign
+    // metadata, never legacy, so it refuses whether or not `baseline.view`
+    // currently exists: accepting it would let one lifecycle's rule silently
+    // govern another's bytes. A MISSING marker is legacy ONLY when no
+    // `baseline.view` exists either — the workdir predates the freeze and
+    // reads keep the template-render fallback exactly as before. A missing
+    // marker beside an existing baseline is a mixed generation and refuses
+    // with a fresh-extract diagnosis, before any mutation.
+    match state
+        .get("editable_view_contract")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(marker) if marker == EDITABLE_VIEW_CONTRACT => {}
+        Some(marker) => {
+            return Err(domain(format!(
+                "edit-state-incompatible: editable_view_contract {marker:?} in edit.state.json is not \
+                 a known editable-view rule; re-extract the source into a fresh workdir to \
+                 re-establish the baseline",
+            )));
+        }
+        None if root.join("baseline.view").is_file() => {
+            return Err(domain(
+                "edit-state-incompatible: edit.state.json has no editable_view_contract but \
+                 baseline.view exists — the frozen baseline is from a different lifecycle \
+                 generation; re-extract the source into a fresh workdir to re-establish the baseline",
+            ));
+        }
+        None => {}
     }
     for key in ["base_typed_sha256", "base_projection_sha256"] {
         let value = state

@@ -211,6 +211,7 @@ dependencies = [
 name = "docx2typed-verify"
 version = "0.2.1"
 dependencies = [
+ "docx2typed-core",
  "docx2typed-protocol",
  "hex",
  "serde_json",

@@ -236,10 +236,18 @@ impl IndependentVerifier {
             detail: Some(detail),
         });
 
-        // Check 3: each edited part equals the template part with exactly
-        // the recorded leaf replacements applied.
+        // Check 3: direct edits recompute the part byte-exact from the
+        // template plus the recorded leaf replacements; tracked edits instead
+        // validate the output's own revision markup (del/ins texts plus the
+        // THIS-revision author/date agreement) while the protected-structure
+        // gate below pins every opaque byte independently. The check name stays
+        // `edited-part-exact` for evidence stability, but the success detail
+        // must say which proof actually ran — never claim a byte recomputation
+        // the tracked branch did not perform.
         let mut edited_exact = true;
         let mut edited_detail = String::new();
+        let mut tracked_validated = 0usize;
+        let mut recomputed = 0usize;
         let template_package = std::fs::read(template).unwrap_or_default();
         for part_path in &edited_part_paths {
             let this_part: &str = part_path.as_str();
@@ -261,6 +269,8 @@ impl IndependentVerifier {
                 if let Err(message) = verify_tracked_part(&output_part, &edits) {
                     edited_exact = false;
                     edited_detail = format!("part {part_path}: {message}");
+                } else {
+                    tracked_validated += 1;
                 }
             } else if edits.iter().any(|edit| edit.tracked) {
                 // PR 3 scope: tracked leaf revisions and paragraph-level
@@ -313,6 +323,8 @@ impl IndependentVerifier {
                             edited_detail = format!(
                                 "part {part_path} differs from the independently recomputed edit"
                             );
+                        } else {
+                            recomputed += 1;
                         }
                     }
                     Err(message) => {
@@ -327,7 +339,10 @@ impl IndependentVerifier {
             status: if edited_exact { "pass" } else { "fail" }.to_string(),
             detail: Some(if edited_detail.is_empty() {
                 format!(
-                    "{} edited parts recomputed byte-exact",
+                    "{} of {} edited parts validated ({recomputed} recomputed byte-exact, \
+                     {tracked_validated} tracked revision-markup validated, \
+                     opaque bytes pinned by protected-structure-preserved)",
+                    recomputed + tracked_validated,
                     edited_part_paths.len()
                 )
             } else {
@@ -1504,6 +1519,13 @@ fn collect_shape(
 /// `document.xml`, so a run property changed three paragraphs away was invisible
 /// — measured: adding `<w:u w:val="double"/>` to an untouched run verified clean.
 ///
+/// Beyond text and run properties, the RAW XML bytes of a paragraph outside the
+/// edit must be identical: moving protected nodes within the same untouched
+/// paragraph keeps every identity, count and order — and the visible text —
+/// while changing what the bytes mean positionally. Measured on a genuine
+/// tracked build: relocating both drawings ahead of the paragraph's text
+/// verified `pass` on every check before this.
+///
 /// The edited paragraphs are exempt on purpose: a tracked edit legitimately
 /// re-wraps them, carrying each covered run's properties into the `w:del` and
 /// the insertion, so their property MULTISET changes while the document's
@@ -1550,6 +1572,15 @@ fn check_non_target_preserved(
                 "paragraph {index}: run properties outside the edit changed ({} before, {} after)",
                 shape.run_properties.len(),
                 actual.run_properties.len()
+            ));
+        }
+        // Source-position contract: same identities in the same order can still
+        // sit at different byte positions, which no identity list can see. The
+        // spans pair the two sides by ORDER (same paragraphs, same sequence),
+        // so a slice comparison is a position proof, not an offset estimate.
+        if baseline[shape.start..shape.end] != output_part[actual.start..actual.end] {
+            return Err(format!(
+                "paragraph {index}: XML outside the edit changed                  (same text and properties, different source bytes)"
             ));
         }
     }
@@ -1782,7 +1813,13 @@ fn opaque_identity(
     node: &LightNode,
     paragraph_id: &str,
 ) -> ProtectedNode {
-    let bytes = &part[paragraph_start + node.open_end..paragraph_start + node.end];
+    // The identity pins the COMPLETE opaque XML (`open_start..end`): interior
+    // bytes, closing tag AND the node's own opening-tag attributes. Hashing
+    // from `open_end` left an outer-attribute rewrite (e.g. a smuggled
+    // `w:rsidR` on the run) invisible to the protected check; the tracked path
+    // has no byte-exact recomputation to catch it instead. Measured on a
+    // genuine tracked build: the tampered output verified `pass` before this.
+    let bytes = &part[paragraph_start + node.open_start..paragraph_start + node.end];
     ProtectedNode {
         paragraph_id: paragraph_id.to_string(),
         kind: "opaque".to_string(),
@@ -1819,14 +1856,17 @@ fn identity_attributes(tag: &[u8], name: &str) -> String {
 }
 
 /// The protected structure of a part must survive an edit: nothing lost, nothing
-/// reordered — and it must survive RE-WRAPPING, which is what a tracked edit
-/// does to everything around it.
+/// reordered, nothing invented — and it must survive RE-WRAPPING, which is what
+/// a tracked edit does to everything around it.
 ///
 /// `targeted` names the paragraphs the edit declared. In those, the template's
-/// protected nodes must appear in the same relative order (an edit may move
-/// them; it may not drop, reorder or invent them). Everywhere else the lists
-/// must be equal outright. Synthesised paragraphs (`N`) have no baseline and are
-/// out of scope.
+/// protected-node list must equal the output's list EXACTLY (same identities,
+/// same count, same order): the old subsequence walk let an invented or
+/// duplicated node pass, and the tracked path has no byte-exact recomputation
+/// to catch it instead. Revision wrappers (`ins`/`del`/`moveFrom`/`moveTo`)
+/// stay transparent — an edit may legitimately add those — and proof marks
+/// stay ignored. Everywhere else the lists must be equal outright.
+/// Synthesised paragraphs (`N`) have no baseline and are out of scope.
 fn check_protected_structure(
     template_part: &[u8],
     output_part: &[u8],
@@ -1895,39 +1935,39 @@ fn check_protected_structure(
         ));
     }
 
-    // Edited paragraphs: the template's nodes must still be there, in order.
+    // Edited paragraphs: the template's protected-node list must equal the
+    // output's list exactly -- same identities, same count, same relative
+    // order. Re-wrapping around the nodes (what a tracked edit does) keeps the
+    // list; dropping, reordering or inventing a node changes it.
     for paragraph_id in targeted {
+        // No empty-baseline skip: a targeted paragraph that starts with NO
+        // protected nodes and gains one is an invention, not a no-op. (`N`
+        // synthesised ids never reach this loop — edits and deletions name
+        // baseline paragraphs — so this cannot misfire on new paragraphs.)
+        // Compared as node references: `PartialEq` pins paragraph, kind and
+        // identity while ignoring the shifted byte ranges, so no per-node
+        // string is allocated on the success path.
         let expect: Vec<&ProtectedNode> = before
             .iter()
             .filter(|node| node.paragraph_id == *paragraph_id)
             .collect();
-        if expect.is_empty() {
-            continue;
-        }
         let actual: Vec<&ProtectedNode> = after
             .iter()
             .filter(|node| node.paragraph_id == *paragraph_id)
             .collect();
-        let mut cursor = 0usize;
-        for node in &expect {
-            match actual[cursor..]
-                .iter()
-                .position(|candidate| candidate == node)
-            {
-                Some(offset) => cursor += offset + 1,
-                None => {
-                    return Err(format!(
-                        "{paragraph_id}: protected {} {} did not survive the edit \
-                         (present after: {:?})",
-                        node.kind,
-                        node.identity,
-                        actual
-                            .iter()
-                            .map(|candidate| format!("{}:{}", candidate.kind, candidate.identity))
-                            .collect::<Vec<_>>()
-                    ));
-                }
-            }
+        if expect != actual {
+            let show = |nodes: &[&ProtectedNode]| {
+                nodes
+                    .iter()
+                    .map(|node| format!("{}:{}", node.kind, node.identity))
+                    .collect::<Vec<_>>()
+            };
+            return Err(format!(
+                "{paragraph_id}: protected structure changed by the edit \
+                 (expected {:?}, present after: {:?})",
+                show(&expect),
+                show(&actual)
+            ));
         }
     }
     Ok(())
@@ -3159,6 +3199,920 @@ mod tests {
         assert!(
             edit_run_ranges(part, "document", &edit(4)).is_err(),
             "an offset counted over the runs is a different address, not a second chance"
+        );
+    }
+    /// Opaque-safety audit (blind-agent finding: `readings_disagree` is only an
+    /// auxiliary Word-view comparison that ignores opaque markers, so it MUST
+    /// NOT carry protection; see draft.rs `readings_disagree`). These tests call
+    /// the REAL verifier entrypoint (`IndependentVerifier::verify`) on a legal
+    /// edited output and then on tampered outputs, and name the exact failing
+    /// gate. Threads: direct (non-tracked) island edit of P0 `world`->`WORLD`.
+    ///
+    /// Existing strong gates cited below (do NOT weaken them):
+    /// - `edited-part-exact` (verify_edited, recompute_edited_part): the whole
+    ///   edited part must equal the template part with exactly the recorded leaf
+    ///   replacements applied, compared byte-for-byte. This is the gate that
+    ///   protects opaque OPENING attributes, invented/duplicated nodes and any
+    ///   other byte change inside a TARGETED paragraph.
+    /// - `protected-structure-preserved` / `check_protected_structure`: EVERY
+    ///   paragraph compared as an exact kind+identity/count/order list —
+    ///   untouched and targeted alike. Revision wrappers stay transparent;
+    ///   proof marks stay ignored; textbox-container edits stay exempt by
+    ///   containment.
+    /// - `opaque_identity`: pins the COMPLETE opaque XML (`open_start..end`):
+    ///   interior bytes, closing tag AND the node's own opening-tag attributes.
+    /// - `check_non_target_preserved`: text/run-properties outside edited
+    ///   paragraphs must be unchanged; the edited paragraph itself is exempt.
+    static OPAQUE_AUDIT_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// Reachability contract (core `resolve_leaf` / `opaque-paragraph-mutated`):
+    /// a paragraph containing ANY opaque node is fully locked, so the targeted
+    /// paragraph P0 carries plain text + bookmarks only (editable), and the two
+    /// distinct drawings live in the NON-target paragraph P1. Genuine tracked
+    /// P0 `world`->`WORLD` builds therefore succeed; tampering targets P1 for
+    /// the untouched-paragraph exact gate and P0 for the targeted exact-list
+    /// gate.
+    const OPAQUE_AUDIT_TEMPLATE: &str = concat!(
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\">",
+        "<w:body>",
+        "<w:p><w:r><w:t>Hello </w:t></w:r><w:r><w:t>world</w:t></w:r>",
+        "<w:bookmarkStart w:id=\"7\" w:name=\"markA\"/>",
+        "<w:bookmarkEnd w:id=\"7\"/>",
+        "</w:p>",
+        "<w:p><w:r><w:t>Second paragraph</w:t></w:r>",
+        "<w:r><w:drawing><wp:inline>SHAPE-A</wp:inline></w:drawing></w:r>",
+        "<w:r><w:drawing><wp:inline>SHAPE-B</wp:inline></w:drawing></w:r>",
+        "<w:bookmarkStart w:id=\"8\" w:name=\"markB\"/>",
+        "<w:bookmarkEnd w:id=\"8\"/>",
+        "</w:p>",
+        "</w:body></w:document>",
+    );
+
+    const OPAQUE_AUDIT_DRAWING_A: &str =
+        "<w:r><w:drawing><wp:inline>SHAPE-A</wp:inline></w:drawing></w:r>";
+    const OPAQUE_AUDIT_DRAWING_B: &str =
+        "<w:r><w:drawing><wp:inline>SHAPE-B</wp:inline></w:drawing></w:r>";
+
+    fn opaque_audit_package(document_xml: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut zip_bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_bytes));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("[Content_Types].xml", options).unwrap();
+            writer.write_all(br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#).unwrap();
+            writer.start_file("word/document.xml", options).unwrap();
+            writer.write_all(document_xml).unwrap();
+            writer.start_file("word/styles.xml", options).unwrap();
+            writer.write_all(br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#).unwrap();
+            writer.finish().unwrap();
+        }
+        zip_bytes
+    }
+
+    fn opaque_audit_part(package: &[u8], member: &str) -> Vec<u8> {
+        use std::io::Read;
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(package.to_vec())).expect("zip");
+        for index in 0..archive.len() {
+            let mut part = archive.by_index(index).expect("member");
+            if part.name() == member {
+                let mut buf = Vec::new();
+                part.read_to_end(&mut buf).expect("read");
+                return buf;
+            }
+        }
+        panic!("missing member {member}");
+    }
+
+    fn opaque_audit_repack(template_pkg: &[u8], member: &str, bytes: &[u8]) -> Vec<u8> {
+        use std::io::{Read, Write};
+        let mut members: Vec<(String, Vec<u8>)> = Vec::new();
+        {
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(template_pkg.to_vec()))
+                .expect("template zip");
+            for index in 0..archive.len() {
+                let mut part = archive.by_index(index).expect("member");
+                let name = part.name().to_string();
+                let mut buf = Vec::new();
+                part.read_to_end(&mut buf).expect("read");
+                members.push((name, buf));
+            }
+        }
+        let mut out = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, data) in &members {
+                writer.start_file(name.as_str(), options).unwrap();
+                if name == member {
+                    writer.write_all(bytes).unwrap();
+                } else {
+                    writer.write_all(data).unwrap();
+                }
+            }
+            writer.finish().unwrap();
+        }
+        out
+    }
+
+    fn opaque_audit_setup(document_xml: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let n = OPAQUE_AUDIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "docx2typed-verify-opaque-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch workdir");
+        let package = opaque_audit_package(document_xml.as_bytes());
+        std::fs::write(dir.join("_template.docx"), &package).expect("template");
+        let islands = "{\"schema\":\"docx2typed-islands-1\",\"edits\":[{\"part\":\"document\",\"paragraph_id\":\"P0\",\"leaf_index\":1,\"old\":\"world\",\"new\":\"WORLD\",\"tracked\":false,\"author\":\"\",\"date\":\"\"}]}";
+        std::fs::write(dir.join("islands.json"), islands).expect("islands");
+        let output = dir.join(format!("output-{n}.docx"));
+        std::fs::write(&output, &package).expect("output placeholder");
+        (dir, output)
+    }
+
+    fn opaque_audit_legal_xml() -> String {
+        OPAQUE_AUDIT_TEMPLATE.replace("<w:t>world</w:t>", "<w:t>WORLD</w:t>")
+    }
+
+    fn opaque_audit_verify(
+        workdir: &std::path::Path,
+        output: &std::path::Path,
+    ) -> VerificationEvidence {
+        IndependentVerifier::new().verify(&VerificationRequest {
+            workdir: workdir.to_path_buf(),
+            output: output.to_path_buf(),
+            profile: "S".to_string(),
+        })
+    }
+
+    fn opaque_audit_check(evidence: &VerificationEvidence, name: &str) -> String {
+        evidence
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .map(|check| check.status.clone())
+            .unwrap_or_else(|| "missing".to_string())
+    }
+
+    fn opaque_audit_tampered_evidence(
+        mutate: impl FnOnce(String) -> String,
+    ) -> VerificationEvidence {
+        let (workdir, output) = opaque_audit_setup(OPAQUE_AUDIT_TEMPLATE);
+        let template_pkg = std::fs::read(workdir.join("_template.docx")).expect("template");
+        let tampered_xml = mutate(opaque_audit_legal_xml());
+        let out_pkg =
+            opaque_audit_repack(&template_pkg, "word/document.xml", tampered_xml.as_bytes());
+        std::fs::write(&output, &out_pkg).expect("output");
+        opaque_audit_verify(&workdir, &output)
+    }
+
+    #[test]
+    fn legal_edit_passes_and_leaves_non_target_protected_bytes_identical() {
+        // Baseline: the recorded P0 text edit verifies clean, and the untouched
+        // paragraph's protected XML is byte-identical (strong gate:
+        // `edited-part-exact` byte equality + per-paragraph protected lists).
+        let (workdir, output) = opaque_audit_setup(OPAQUE_AUDIT_TEMPLATE);
+        let template_pkg = std::fs::read(workdir.join("_template.docx")).expect("template");
+        let legal_xml = opaque_audit_legal_xml();
+        let out_pkg = opaque_audit_repack(&template_pkg, "word/document.xml", legal_xml.as_bytes());
+        std::fs::write(&output, &out_pkg).expect("output");
+        let evidence = opaque_audit_verify(&workdir, &output);
+        assert_eq!(
+            evidence.verdict, "pass",
+            "legal edit must verify clean: {:?}",
+            evidence.checks
+        );
+        for name in [
+            "parts-match-template-except-edited",
+            "edited-part-exact",
+            "protected-structure-preserved",
+            "non-target-preserved",
+        ] {
+            assert_eq!(opaque_audit_check(&evidence, name), "pass", "{name}");
+        }
+        let template_part = opaque_audit_part(&template_pkg, "word/document.xml");
+        let output_part = opaque_audit_part(&out_pkg, "word/document.xml");
+        let template_ps = locate_paragraphs(&template_part, "document").expect("template ps");
+        let output_ps = locate_paragraphs(&output_part, "document").expect("output ps");
+        let template_p1 = template_ps
+            .iter()
+            .find(|(id, _, _)| id == "P1")
+            .expect("template P1");
+        let output_p1 = output_ps
+            .iter()
+            .find(|(id, _, _)| id == "P1")
+            .expect("output P1");
+        assert_eq!(
+            &template_part[template_p1.1..template_p1.2],
+            &output_part[output_p1.1..output_p1.2],
+            "non-target paragraph P1 bytes are untouched by the P0 edit"
+        );
+        let before = protected_nodes(&template_part, "document").expect("before");
+        let after = protected_nodes(&output_part, "document").expect("after");
+        let shape = |nodes: &[ProtectedNode], id: &str| {
+            nodes
+                .iter()
+                .filter(|node| node.paragraph_id == id)
+                .map(|node| format!("{}:{}", node.kind, node.identity))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&before, "P1"), shape(&after, "P1"), "P1 identities");
+        assert_eq!(
+            shape(&before, "P0"),
+            shape(&after, "P0"),
+            "P0 protected identities survive a legal text edit"
+        );
+    }
+
+    #[test]
+    fn removing_an_opaque_node_from_the_untouched_paragraph_is_refused() {
+        // Drawings now live in non-target P1: removal trips BOTH the exact
+        // recomputation (P1 bytes changed outside any edit) and the
+        // per-paragraph-exact protected comparison for P1.
+        let evidence =
+            opaque_audit_tampered_evidence(|xml| xml.replace(OPAQUE_AUDIT_DRAWING_A, ""));
+        assert_eq!(evidence.verdict, "fail", "deletion must not verify");
+        assert_eq!(opaque_audit_check(&evidence, "edited-part-exact"), "fail");
+        assert_eq!(
+            opaque_audit_check(&evidence, "protected-structure-preserved"),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn swapping_two_distinct_opaque_nodes_is_refused() {
+        // Count-preserving swap inside non-target P1: multiset identical, so
+        // only RELATIVE ORDER protects it — the per-paragraph-exact comparison
+        // fails alongside `edited-part-exact`.
+        let evidence = opaque_audit_tampered_evidence(|xml| {
+            let staged = xml.replace(OPAQUE_AUDIT_DRAWING_A, "@@OPAQUE-A@@");
+            let staged = staged.replace(OPAQUE_AUDIT_DRAWING_B, OPAQUE_AUDIT_DRAWING_A);
+            staged.replace("@@OPAQUE-A@@", OPAQUE_AUDIT_DRAWING_B)
+        });
+        assert_eq!(evidence.verdict, "fail", "reorder must not verify");
+        assert_eq!(opaque_audit_check(&evidence, "edited-part-exact"), "fail");
+        assert_eq!(
+            opaque_audit_check(&evidence, "protected-structure-preserved"),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn replacing_a_protected_identity_while_keeping_text_is_refused() {
+        // Attribute-only identity change on the P1 anchor (`markB` -> `markX`):
+        // visible text unchanged, anchor identity rewritten. Exact and
+        // protected gates both fail. (P0's `markA` variant is covered by the
+        // tracked suite below.)
+        let evidence = opaque_audit_tampered_evidence(|xml| {
+            xml.replace("w:name=\"markB\"", "w:name=\"markX\"")
+        });
+        assert_eq!(evidence.verdict, "fail", "identity rewrite must not verify");
+        assert_eq!(opaque_audit_check(&evidence, "edited-part-exact"), "fail");
+        assert_eq!(
+            opaque_audit_check(&evidence, "protected-structure-preserved"),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn outer_opening_attribute_change_is_refused_by_both_gates() {
+        // `opaque_identity` pins the complete opaque XML (`open_start..end`),
+        // so a `w:rsidR` smuggled onto the drawing run's opening tag changes
+        // the identity: `protected-structure-preserved` fails alongside
+        // `edited-part-exact` (measured: protected passed before the fix).
+        let evidence = opaque_audit_tampered_evidence(|xml| {
+            xml.replacen(
+                "<w:r><w:drawing>",
+                "<w:r w:rsidR=\"00FF0000\"><w:drawing>",
+                1,
+            )
+        });
+        assert_eq!(
+            evidence.verdict, "fail",
+            "attribute smuggling must not verify"
+        );
+        assert_eq!(opaque_audit_check(&evidence, "edited-part-exact"), "fail");
+        assert_eq!(
+            opaque_audit_check(&evidence, "protected-structure-preserved"),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn duplicating_a_protected_node_in_the_untouched_paragraph_is_refused() {
+        // Duplication inside non-target P1: the per-paragraph-exact comparison
+        // has a full count bound there, so protected fails alongside exact.
+        let evidence = opaque_audit_tampered_evidence(|xml| {
+            xml.replace(
+                OPAQUE_AUDIT_DRAWING_A,
+                &format!("{OPAQUE_AUDIT_DRAWING_A}{OPAQUE_AUDIT_DRAWING_A}"),
+            )
+        });
+        assert_eq!(evidence.verdict, "fail", "duplication must not verify");
+        assert_eq!(opaque_audit_check(&evidence, "edited-part-exact"), "fail");
+        assert_eq!(
+            opaque_audit_check(&evidence, "protected-structure-preserved"),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn inventing_a_protected_node_inside_the_edited_paragraph_is_refused() {
+        // The targeted check is an exact list comparison (same identities,
+        // same count, same order), so an invented drawing inside targeted P0
+        // fails `protected-structure-preserved` alongside `edited-part-exact`
+        // (measured: protected passed before the fix).
+        let evidence = opaque_audit_tampered_evidence(|xml| {
+            xml.replace(
+                "<w:bookmarkEnd w:id=\"7\"/>",
+                &format!("<w:bookmarkEnd w:id=\"7\"/>{OPAQUE_AUDIT_DRAWING_A}"),
+            )
+        });
+        assert_eq!(evidence.verdict, "fail", "invention must not verify");
+        assert_eq!(opaque_audit_check(&evidence, "edited-part-exact"), "fail");
+        assert_eq!(
+            opaque_audit_check(&evidence, "protected-structure-preserved"),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn duplicating_a_protected_node_inside_the_edited_paragraph_is_refused() {
+        // Count guard on the direct path: doubling the P1 drawing (edited here
+        // via the direct recomputation's P1 bytes) fails both gates; the
+        // targeted-P0 count case is pinned by the tracked suite below.
+        let evidence = opaque_audit_tampered_evidence(|xml| {
+            xml.replace(
+                OPAQUE_AUDIT_DRAWING_B,
+                &format!("{OPAQUE_AUDIT_DRAWING_B}{OPAQUE_AUDIT_DRAWING_B}"),
+            )
+        });
+        assert_eq!(evidence.verdict, "fail", "duplication must not verify");
+        assert_eq!(opaque_audit_check(&evidence, "edited-part-exact"), "fail");
+        assert_eq!(
+            opaque_audit_check(&evidence, "protected-structure-preserved"),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn moving_a_protected_node_across_paragraphs_is_refused() {
+        // Paragraph/source containment: identities carry `paragraph_id`, and
+        // untouched paragraphs are compared per-paragraph exactly, so moving
+        // SHAPE-A from P1 into targeted P0 breaks both sides at once.
+        let evidence = opaque_audit_tampered_evidence(|xml| {
+            let without = xml.replace(OPAQUE_AUDIT_DRAWING_A, "");
+            without.replace(
+                "<w:bookmarkEnd w:id=\"7\"/>",
+                &format!("<w:bookmarkEnd w:id=\"7\"/>{OPAQUE_AUDIT_DRAWING_A}"),
+            )
+        });
+        assert_eq!(
+            evidence.verdict, "fail",
+            "cross-paragraph move must not verify"
+        );
+        assert_eq!(opaque_audit_check(&evidence, "edited-part-exact"), "fail");
+        assert_eq!(
+            opaque_audit_check(&evidence, "protected-structure-preserved"),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn text_edit_crossing_a_protected_node_is_refused() {
+        // A text edit that absorbs the bookmark pair it should have preserved:
+        // the anchors are gone AND the edited text is longer than recorded, so
+        // both the recomputation and the protected exact-list comparison refuse it.
+        let evidence = opaque_audit_tampered_evidence(|xml| {
+            let crossed = xml.replace(
+                "<w:bookmarkStart w:id=\"7\" w:name=\"markA\"/><w:bookmarkEnd w:id=\"7\"/>",
+                "",
+            );
+            crossed.replace("<w:t>WORLD</w:t>", "<w:t>WORLDX</w:t>")
+        });
+        assert_eq!(evidence.verdict, "fail", "cross-node edit must not verify");
+        assert_eq!(opaque_audit_check(&evidence, "edited-part-exact"), "fail");
+        assert_eq!(
+            opaque_audit_check(&evidence, "protected-structure-preserved"),
+            "fail"
+        );
+    }
+
+    /// Tracked-path opaque-safety audit: same tamper classes, but the output
+    /// under test is a GENUINE `apply_build` tracked result (`tracked: true`,
+    /// author `audit-author`, date `2026-10-18`), not a hand-edited string. The
+    /// tracked branch (`verify_edited`) calls `verify_tracked_part` on the
+    /// OUTPUT part instead of `recompute_edited_part`, so `edited-part-exact`
+    /// never runs there; the revision check proves the deletion/insertion texts
+    /// plus the THIS-revision author/date agreement (`revision_for`).
+    ///
+    /// Strong gates on the tracked path:
+    /// - `parts-match-template-except-edited`: only the recorded edited parts
+    ///   may differ at all.
+    /// - `protected-structure-preserved` / `check_protected_structure`: EVERY
+    ///   paragraph compared as an exact identity/count/order list — untouched
+    ///   and targeted alike. Revision wrappers stay transparent; proof marks
+    ///   stay ignored; textbox-container edits stay exempt by containment.
+    /// - `non-target-preserved` / `check_non_target_preserved`: text/run-props
+    ///   outside edited spans unchanged (edited paragraph exempt by design).
+    /// - `verify_tracked_part` / `revision_for` / `deletion_covers`: the output
+    ///   must carry w:del+w:ins, the joined delText must equal `old`, one w:ins
+    ///   must carry `new`, and every del of the run plus that ins must agree on
+    ///   author/date with the sidecar.
+    fn tracked_audit_sidecar_for(
+        author: &str,
+        date: &str,
+        leaf_index: usize,
+        old: &str,
+        new: &str,
+    ) -> String {
+        format!(
+            "{{\"schema\":\"docx2typed-islands-1\",\"edits\":[{{\
+               \"part\":\"document\",\"paragraph_id\":\"P0\",\"leaf_index\":{leaf_index},\
+               \"old\":\"{old}\",\"new\":\"{new}\",\"tracked\":true,\
+               \"author\":\"{author}\",\"date\":\"{date}\"}}]}}"
+        )
+    }
+
+    fn tracked_audit_sidecar(author: &str, date: &str) -> String {
+        tracked_audit_sidecar_for(author, date, 1, "world", "WORLD")
+    }
+
+    const TRACKED_AUDIT_AUTHOR: &str = "audit-author";
+    const TRACKED_AUDIT_DATE: &str = "2026-10-18";
+
+    /// P0 carries no protected nodes at all — the empty-baseline case the old
+    /// `if expect.is_empty() { continue; }` skip used to wave through.
+    const TRACKED_AUDIT_PLAIN_TEMPLATE: &str = concat!(
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+        "<w:body>",
+        "<w:p><w:r><w:t>Just plain text here</w:t></w:r></w:p>",
+        "</w:body></w:document>",
+    );
+
+    fn tracked_audit_setup_for(
+        template_xml: &str,
+        sidecar: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let n = OPAQUE_AUDIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "docx2typed-verify-tracked-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch workdir");
+        let package = opaque_audit_package(template_xml.as_bytes());
+        std::fs::write(dir.join("_template.docx"), &package).expect("template");
+        std::fs::write(dir.join("islands.json"), sidecar).expect("islands");
+        (dir.clone(), dir.join(format!("tracked-output-{n}.docx")))
+    }
+
+    fn tracked_audit_setup() -> (std::path::PathBuf, std::path::PathBuf) {
+        tracked_audit_setup_for(
+            OPAQUE_AUDIT_TEMPLATE,
+            &tracked_audit_sidecar(TRACKED_AUDIT_AUTHOR, TRACKED_AUDIT_DATE),
+        )
+    }
+
+    fn tracked_audit_edit_for(
+        leaf_index: usize,
+        old: &str,
+        new: &str,
+    ) -> docx2typed_core::prose::IslandEdit {
+        docx2typed_core::prose::IslandEdit {
+            part: "document".to_string(),
+            paragraph_id: "P0".to_string(),
+            leaf_index,
+            old: old.to_string(),
+            char_start: None,
+            new: new.to_string(),
+            tracked: true,
+            author: TRACKED_AUDIT_AUTHOR.to_string(),
+            date: TRACKED_AUDIT_DATE.to_string(),
+        }
+    }
+
+    fn tracked_audit_edit() -> docx2typed_core::prose::IslandEdit {
+        tracked_audit_edit_for(1, "world", "WORLD")
+    }
+
+    fn tracked_audit_genuine_output_for(
+        workdir: &std::path::Path,
+        edit: docx2typed_core::prose::IslandEdit,
+    ) -> Vec<u8> {
+        let template = workdir.join("_template.docx");
+        let out = docx2typed_core::prose::apply_build(
+            &template,
+            &[edit],
+            &docx2typed_core::prose::StructureEdits::default(),
+        )
+        .expect("genuine tracked build")
+        .package;
+        assert!(
+            out.windows(b"<w:del ".len()).any(|w| w == b"<w:del "),
+            "genuine output must carry a tracked deletion"
+        );
+        assert!(
+            out.windows(b"<w:ins ".len()).any(|w| w == b"<w:ins "),
+            "genuine output must carry a tracked insertion"
+        );
+        out
+    }
+
+    fn tracked_audit_genuine_output(workdir: &std::path::Path) -> Vec<u8> {
+        tracked_audit_genuine_output_for(workdir, tracked_audit_edit())
+    }
+
+    fn tracked_audit_write(
+        workdir: &std::path::Path,
+        output: &std::path::Path,
+        package: &[u8],
+    ) -> VerificationEvidence {
+        std::fs::write(output, package).expect("output");
+        opaque_audit_verify(workdir, output)
+    }
+
+    fn tracked_audit_mutate(
+        legal: &[u8],
+        part: &str,
+        mutate: impl FnOnce(String) -> String,
+    ) -> Vec<u8> {
+        let part_xml = String::from_utf8(opaque_audit_part(legal, part)).expect("utf8");
+        opaque_audit_repack(legal, part, mutate(part_xml).as_bytes())
+    }
+
+    #[test]
+    fn tracked_legal_output_passes_verification() {
+        // Baseline: the genuine tracked build (w:del carrying `world`, w:ins
+        // carrying `WORLD`, both stamped audit-author/2026-10-18; P0 bookmarks
+        // are anchors, not opaque interiors, so core accepts the edit) verifies
+        // clean, and non-target P1 (drawings + markB) is byte-identical to the
+        // template — the drawings survived the tracked re-wrap untouched.
+        let (workdir, output) = tracked_audit_setup();
+        let legal = tracked_audit_genuine_output(&workdir);
+        let evidence = tracked_audit_write(&workdir, &output, &legal);
+        assert_eq!(
+            evidence.verdict, "pass",
+            "legal tracked output must verify clean: {:?}",
+            evidence.checks
+        );
+        for name in [
+            "parts-match-template-except-edited",
+            "protected-structure-preserved",
+            "non-target-preserved",
+        ] {
+            assert_eq!(opaque_audit_check(&evidence, name), "pass", "{name}");
+        }
+        // The tracked branch skips byte-exact recomputation by construction:
+        // `edited-part-exact` is recorded as a pass with no exact comparison.
+        let exact = evidence
+            .checks
+            .iter()
+            .find(|check| check.name == "edited-part-exact")
+            .expect("edited-part-exact present");
+        assert_eq!(exact.status, "pass");
+        let template_pkg = std::fs::read(workdir.join("_template.docx")).expect("template");
+        let template_part = opaque_audit_part(&template_pkg, "word/document.xml");
+        let output_part = opaque_audit_part(&legal, "word/document.xml");
+        let template_ps = locate_paragraphs(&template_part, "document").expect("template ps");
+        let output_ps = locate_paragraphs(&output_part, "document").expect("output ps");
+        let template_p1 = template_ps
+            .iter()
+            .find(|(id, _, _)| id == "P1")
+            .expect("template P1");
+        let output_p1 = output_ps
+            .iter()
+            .find(|(id, _, _)| id == "P1")
+            .expect("output P1");
+        assert_eq!(
+            &template_part[template_p1.1..template_p1.2],
+            &output_part[output_p1.1..output_p1.2],
+            "non-target paragraph P1 bytes are untouched by the tracked P0 edit"
+        );
+    }
+
+    #[test]
+    fn tracked_removing_an_opaque_node_from_the_untouched_paragraph() {
+        // Drop SHAPE-A from P1 of the genuine tracked output: P1 is compared
+        // per-paragraph exactly, so the protected gate must refuse it. The
+        // revision gate still sees its del/ins texts and stays silent.
+        let (workdir, output) = tracked_audit_setup();
+        let legal = tracked_audit_genuine_output(&workdir);
+        assert!(
+            String::from_utf8_lossy(&opaque_audit_part(&legal, "word/document.xml"))
+                .contains(OPAQUE_AUDIT_DRAWING_A)
+        );
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            xml.replace(OPAQUE_AUDIT_DRAWING_A, "")
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let protected = opaque_audit_check(&evidence, "protected-structure-preserved");
+        assert_eq!(
+            protected, "fail",
+            "dropping a protected node must be refused by the protected gate: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn tracked_swapping_two_distinct_opaque_nodes_in_p1() {
+        // Count-preserving A<->B swap inside non-target P1 of the genuine
+        // tracked output: per-paragraph-exact comparison must refuse it.
+        let (workdir, output) = tracked_audit_setup();
+        let legal = tracked_audit_genuine_output(&workdir);
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            let staged = xml.replace(OPAQUE_AUDIT_DRAWING_A, "@@OPAQUE-A@@");
+            let staged = staged.replace(OPAQUE_AUDIT_DRAWING_B, OPAQUE_AUDIT_DRAWING_A);
+            staged.replace("@@OPAQUE-A@@", OPAQUE_AUDIT_DRAWING_B)
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let protected = opaque_audit_check(&evidence, "protected-structure-preserved");
+        assert_eq!(
+            protected, "fail",
+            "reordering protected nodes must be refused by the protected gate: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn tracked_relocating_opaque_group_within_untouched_p1() {
+        // Same-paragraph relocation: BOTH drawings move as an ordered group to
+        // BEFORE P1's text. Protected identities, count and relative order
+        // (A,B,markB) are unchanged, and text/run-properties are untouched —
+        // only the non-target XML bytes moved. The per-paragraph byte-exact
+        // comparison must still refuse it: position inside the untouched
+        // paragraph is protection-relevant, not just node identity.
+        let (workdir, output) = tracked_audit_setup();
+        let legal = tracked_audit_genuine_output(&workdir);
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            let text_run = "<w:r><w:t>Second paragraph</w:t></w:r>";
+            assert!(
+                xml.contains(text_run)
+                    && xml.contains(OPAQUE_AUDIT_DRAWING_A)
+                    && xml.contains(OPAQUE_AUDIT_DRAWING_B),
+                "fixture shape changed"
+            );
+            let without_a = xml.replace(OPAQUE_AUDIT_DRAWING_A, "");
+            let without_both = without_a.replace(OPAQUE_AUDIT_DRAWING_B, "");
+            without_both.replacen(
+                text_run,
+                &format!("{OPAQUE_AUDIT_DRAWING_A}{OPAQUE_AUDIT_DRAWING_B}{text_run}"),
+                1,
+            )
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        // Identity/order are legitimately unchanged here — the relocation keeps
+        // the same node vector — so the protected gate is NOT the responsible
+        // one; the non-target raw-XML gate carries this proof.
+        assert_eq!(
+            opaque_audit_check(&evidence, "protected-structure-preserved"),
+            "pass",
+            "relocation keeps identities/order: {:?}",
+            evidence.checks
+        );
+        assert_eq!(
+            opaque_audit_check(&evidence, "non-target-preserved"),
+            "fail",
+            "same-paragraph relocation must be refused by the non-target gate: {:?}",
+            evidence.checks
+        );
+        assert_eq!(
+            evidence.verdict, "fail",
+            "tracked P1 relocation must not verify: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn tracked_replacing_a_protected_identity_while_keeping_text() {
+        // w:name markA (targeted P0) -> markX in the genuine tracked output:
+        // visible text unchanged, anchor identity rewritten. The targeted
+        // exact list finds no such node -> protected gate must refuse it.
+        let (workdir, output) = tracked_audit_setup();
+        let legal = tracked_audit_genuine_output(&workdir);
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            xml.replace("w:name=\"markA\"", "w:name=\"markX\"")
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let protected = opaque_audit_check(&evidence, "protected-structure-preserved");
+        assert_eq!(
+            protected, "fail",
+            "identity rewrite must be refused by the protected gate: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn tracked_outer_opening_attribute_change_on_opaque_run_in_p1() {
+        // `opaque_identity` pins the complete opaque XML (`open_start..end`),
+        // so a `w:rsidR` smuggled onto P1's drawing run opening tag changes
+        // the identity and the protected gate fails (measured: the tampered
+        // output verified `pass` before the fix).
+        let (workdir, output) = tracked_audit_setup();
+        let legal = tracked_audit_genuine_output(&workdir);
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            xml.replacen(
+                "<w:r><w:drawing>",
+                "<w:r w:rsidR=\"00FF0000\"><w:drawing>",
+                1,
+            )
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let protected = opaque_audit_check(&evidence, "protected-structure-preserved");
+        assert_eq!(
+            protected, "fail",
+            "outer-attribute rewrite must be refused by the protected gate: {:?}",
+            evidence.checks
+        );
+        assert_eq!(
+            evidence.verdict, "fail",
+            "tracked P1 outer-attribute tamper must not verify: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn tracked_duplicating_a_protected_node_in_untouched_p1() {
+        // Duplication inside non-target P1: the per-paragraph-exact comparison
+        // has a full count bound there, so the protected gate must refuse it.
+        let (workdir, output) = tracked_audit_setup();
+        let legal = tracked_audit_genuine_output(&workdir);
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            xml.replace(
+                OPAQUE_AUDIT_DRAWING_A,
+                &format!("{OPAQUE_AUDIT_DRAWING_A}{OPAQUE_AUDIT_DRAWING_A}"),
+            )
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let protected = opaque_audit_check(&evidence, "protected-structure-preserved");
+        assert_eq!(
+            protected, "fail",
+            "duplication in an untouched paragraph must be refused: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn tracked_moving_a_protected_node_from_p1_into_targeted_p0() {
+        // SHAPE-A from untouched P1 into targeted P0 of the genuine tracked
+        // output: P1's per-paragraph-exact list loses a node (and P0's gains
+        // one), so the protected gate must refuse it.
+        let (workdir, output) = tracked_audit_setup();
+        let legal = tracked_audit_genuine_output(&workdir);
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            let without = xml.replace(OPAQUE_AUDIT_DRAWING_A, "");
+            without.replace(
+                "<w:bookmarkEnd w:id=\"7\"/>",
+                &format!("<w:bookmarkEnd w:id=\"7\"/>{OPAQUE_AUDIT_DRAWING_A}"),
+            )
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let protected = opaque_audit_check(&evidence, "protected-structure-preserved");
+        assert_eq!(
+            protected, "fail",
+            "cross-paragraph move must be refused by the protected gate: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn tracked_inventing_a_protected_node_inside_targeted_p0() {
+        // EXTRA opaque smuggled into targeted P0 of the genuine tracked
+        // output: the targeted list comparison is exact (count bound included),
+        // so the protected gate fails (measured: the tampered output verified
+        // `pass` before the fix).
+        let (workdir, output) = tracked_audit_setup();
+        let legal = tracked_audit_genuine_output(&workdir);
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            xml.replace(
+                "<w:bookmarkEnd w:id=\"7\"/>",
+                &format!("<w:bookmarkEnd w:id=\"7\"/>{OPAQUE_AUDIT_DRAWING_A}"),
+            )
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let protected = opaque_audit_check(&evidence, "protected-structure-preserved");
+        assert_eq!(
+            protected, "fail",
+            "invented node must be refused by the protected gate: {:?}",
+            evidence.checks
+        );
+        assert_eq!(
+            evidence.verdict, "fail",
+            "tracked P0 invention tamper must not verify: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn tracked_duplicating_a_bookmark_inside_targeted_p0() {
+        // Count guard inside the targeted paragraph: doubling P0's markA
+        // bookmark pair changes the targeted list's count, so the protected
+        // gate fails even though the visible text is unchanged.
+        let (workdir, output) = tracked_audit_setup();
+        let legal = tracked_audit_genuine_output(&workdir);
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            xml.replace(
+                "<w:bookmarkStart w:id=\"7\" w:name=\"markA\"/><w:bookmarkEnd w:id=\"7\"/>",
+                "<w:bookmarkStart w:id=\"7\" w:name=\"markA\"/><w:bookmarkEnd w:id=\"7\"/>\
+                     <w:bookmarkStart w:id=\"7\" w:name=\"markA\"/><w:bookmarkEnd w:id=\"7\"/>",
+            )
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let protected = opaque_audit_check(&evidence, "protected-structure-preserved");
+        assert_eq!(
+            protected, "fail",
+            "duplicated bookmark must be refused by the protected gate: {:?}",
+            evidence.checks
+        );
+        assert_eq!(
+            evidence.verdict, "fail",
+            "tracked P0 duplication tamper must not verify: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn tracked_inventing_a_protected_node_in_empty_baseline_p0() {
+        // Same reproduced class on the EMPTY baseline the old skip hid: P0
+        // starts with no protected nodes, so a smuggled drawing must fail the
+        // exact list comparison (expect [] vs actual [opaque]). Genuine tracked
+        // `plain`->`PLAIN` build, then the drawing is injected into P0.
+        let (workdir, output) = tracked_audit_setup_for(
+            TRACKED_AUDIT_PLAIN_TEMPLATE,
+            &tracked_audit_sidecar_for(
+                TRACKED_AUDIT_AUTHOR,
+                TRACKED_AUDIT_DATE,
+                0,
+                "plain",
+                "PLAIN",
+            ),
+        );
+        let legal =
+            tracked_audit_genuine_output_for(&workdir, tracked_audit_edit_for(0, "plain", "PLAIN"));
+        let tampered = tracked_audit_mutate(&legal, "word/document.xml", |xml| {
+            xml.replace(
+                "<w:t>PLAIN</w:t>",
+                &format!("<w:t>PLAIN</w:t>{OPAQUE_AUDIT_DRAWING_A}"),
+            )
+        });
+        let evidence = tracked_audit_write(&workdir, &output, &tampered);
+        let protected = opaque_audit_check(&evidence, "protected-structure-preserved");
+        assert_eq!(
+            protected, "fail",
+            "invented node on an empty baseline must be refused: {:?}",
+            evidence.checks
+        );
+        assert_eq!(
+            evidence.verdict, "fail",
+            "tracked empty-baseline invention must not verify: {:?}",
+            evidence.checks
+        );
+    }
+
+    #[test]
+    fn core_refuses_a_text_edit_inside_an_opaque_paragraph() {
+        // Reachability-side proof, NOT a verifier case: a paragraph containing
+        // an opaque drawing locks every leaf (core `resolve_leaf` ->
+        // `opaque-paragraph-mutated`), so no genuine tracked output of that
+        // shape exists. Anchors (bookmarks) do NOT lock: a text edit beside
+        // them builds fine, which the legal-output tests above already prove.
+        let dir = std::env::temp_dir().join(format!(
+            "docx2typed-verify-cross-{}-{}",
+            std::process::id(),
+            OPAQUE_AUDIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch workdir");
+        let package = opaque_audit_package(OPAQUE_AUDIT_TEMPLATE.as_bytes());
+        let template = dir.join("_template.docx");
+        std::fs::write(&template, &package).expect("template");
+        let before = std::fs::read(&template).expect("template bytes");
+        let err = docx2typed_core::prose::apply_edits(
+            &template,
+            &[docx2typed_core::prose::IslandEdit {
+                part: "document".to_string(),
+                paragraph_id: "P1".to_string(),
+                leaf_index: 0,
+                old: "Second paragraph".to_string(),
+                char_start: None,
+                new: "Second paragraph edited".to_string(),
+                tracked: true,
+                author: TRACKED_AUDIT_AUTHOR.to_string(),
+                date: TRACKED_AUDIT_DATE.to_string(),
+            }],
+        )
+        .expect_err("editing a paragraph with an opaque drawing must be refused");
+        assert!(
+            err.to_string().contains("opaque-paragraph-mutated"),
+            "refusal must name the locked interior, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&template).expect("template bytes"),
+            before,
+            "a refused edit leaves the template untouched"
         );
     }
 }

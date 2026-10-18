@@ -12,3 +12,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 hex = "0.4"
 serde_json = "1"
+
+[dev-dependencies]
+docx2typed-core = { version = "0.2.1", path = "../docx2typed-core" }

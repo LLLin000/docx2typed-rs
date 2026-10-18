@@ -87,6 +87,7 @@ fn state_json(typed_sha256: &str, projection_sha256: &str) -> Value {
         "edit_schema_version": 1,
         "sync_contract_version": 1,
         "segmentation_contract": "uax29-c1-1/unicode-16.0.0",
+        "editable_view_contract": docx2typed_core::edit_state::EDITABLE_VIEW_CONTRACT,
         "base_typed_sha256": typed_sha256,
         "base_projection_sha256": projection_sha256,
     })
@@ -135,10 +136,31 @@ fn render_projection(
 /// Create the edit projection (edit.md + edit.state.json) from the template
 /// inventory when absent; otherwise leave it untouched. Mutation path used
 /// by the draft tools; returns the existing or fresh `EditState`.
+///
+/// `baseline.view` is written once, on the first initialization, and never
+/// rewritten (ADR 0051, principle 2): a workdir that already carries one
+/// keeps it even when `edit.state.json` is missing. A missing state beside
+/// an existing baseline is a torn workdir (crash, hand edit), not a fresh
+/// one, so this refuses with a re-extract diagnosis instead of rebuilding
+/// the frozen baseline around new bytes. `baseline.view` carries no version
+/// marker, so an older projection rule and a corrupted file both read as a
+/// mismatch and cannot be told apart — only a fresh extract re-establishes
+/// them. The `edit.state.json` schema/sync/segmentation guards cannot cover
+/// this case because they only run when the state file exists, which is
+/// exactly what is missing here.
 pub fn ensure_projection(workdir: &Path) -> Result<EditState, CollaborationError> {
     if workdir.join(STATE_FILE).is_file() {
         return classify_edit_state(workdir)
-            .map_err(|error| CollaborationError::new("workdir-invalid", error.to_string()));
+            .map_err(|error| core_failure(error, "workdir-invalid"));
+    }
+    if workdir.join(BASELINE_VIEW_FILE).is_file() {
+        return Err(CollaborationError::new(
+            "workdir-invalid",
+            format!(
+                "baseline.view exists but edit.state.json is missing in {}; refusing to rebuild the frozen baseline — re-extract the source into a fresh workdir",
+                workdir.to_string_lossy()
+            ),
+        ));
     }
     let paragraphs = inventory_paragraphs(workdir)?;
     let (text, typed_sha256) = render_projection(workdir, &paragraphs)?;
