@@ -214,6 +214,7 @@ dependencies = [
  "docx2typed-core",
  "docx2typed-protocol",
  "hex",
+ "roxmltree",
  "serde_json",
  "sha2",
  "zip",

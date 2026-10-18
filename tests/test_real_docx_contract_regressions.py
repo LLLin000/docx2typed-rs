@@ -3,13 +3,11 @@ from pathlib import Path
 import sys
 import zipfile
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from qualification.real_docx_scan import _resolve_bin, mcp_session
 
 
-@pytest.mark.xfail(strict=True, reason="corpus-v1: existing xml:space is duplicated by a whitespace-preserving direct edit")
 def test_existing_xml_space_survives_direct_edit(tmp_path):
     binary = _resolve_bin(None)
     source = tmp_path / "source.docx"

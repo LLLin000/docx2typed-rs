@@ -207,3 +207,28 @@ metadata. Its completed outcomes are `PASS`, `EXPECTED_REJECT`,
 an incomplete scan, not a successful edit or an accurate refusal. No eligible
 safe target is reported separately from a named, independently justified
 unsupported target; an unproven target-occurrence linkage cannot pass.
+
+### Issue #70 and Windows CI follow-up
+
+The original corpus evidence remains immutable. Its six contract failures share
+one reproduced defect: the builder and independent replay both used an
+18-byte window to detect the 20-byte `xml:space="preserve"` attribute. Both now
+derive the window length from the literal and inspect only the current text
+element, not earlier runs. Existing single-quoted attributes are preserved too.
+The minimized five-tool regression is mandatory; its strict xfail is removed.
+
+Independent verification additionally strictly parses every output `.xml` and
+`.rels` member before successful publication (`output-xml-wellformed`). Duplicate
+attributes in either an edited target or an untouched member fail verification,
+even if the byte-level text replay agrees. This closes the shared-bug escape
+without coupling verification to the builder's parser or changing the edit
+protocol. Package fidelity still means member names and uncompressed member
+bytes, not necessarily identical ZIP container bytes.
+
+The Windows staged `format.json` failure was caused by the source-drift test
+recursively deleting `wd.parent()`, the shared temporary directory containing
+other tests' in-flight commit staging. Cleanup now owns only its unique source,
+sentinel and workdir; no shared-parent deletion, retries or test serialization.
+The commit implementation is unchanged. Workspace tests and CI must pass before
+calling PR #69 merge-ready; the corpus PR remains independently scoped.
+

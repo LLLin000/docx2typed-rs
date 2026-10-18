@@ -1897,22 +1897,25 @@ fn needs_xml_space(text: &str) -> bool {
 /// or None when the attribute is already present (or the tag cannot be
 /// located).
 fn maybe_inject_xml_space(part_bytes: &[u8], open_end: usize) -> Option<(usize, usize, Vec<u8>)> {
-    let has_preserve = part_bytes[..open_end]
-        .windows(18)
-        .any(|window| window == b"xml:space=\"preserve\"");
-    if has_preserve {
-        return None;
-    }
-    // Find the tag start: scan back to the last '<'.
+    // Only this text element owns the attribute; a preceding run may carry it.
     let tag_start = part_bytes[..open_end]
         .iter()
         .rposition(|&byte| byte == b'<')?;
+    let tag = &part_bytes[tag_start..open_end];
+    for attribute in [b"xml:space=\"preserve\"", b"xml:space='preserve'"] {
+        if tag
+            .windows(attribute.len())
+            .any(|window| window == attribute)
+        {
+            return None;
+        }
+    }
     let insert_at = part_bytes[tag_start..open_end]
         .iter()
         .rposition(|&byte| byte == b'>')
         .map(|position| tag_start + position)
         .unwrap_or(open_end);
-    let mut out = Vec::with_capacity(open_end - tag_start + 19);
+    let mut out = Vec::with_capacity(open_end - tag_start + b" xml:space=\"preserve\"".len());
     out.extend_from_slice(&part_bytes[tag_start..insert_at]);
     out.extend_from_slice(b" xml:space=\"preserve\"");
     out.extend_from_slice(&part_bytes[insert_at..open_end]);
@@ -5374,6 +5377,20 @@ mod tests {
         // Everything before and after the edited range is byte-identical.
         assert_eq!(&template_doc[..template_pva], &out_doc[..out_plba]);
         assert_eq!(&template_doc[template_pva + 3..], &out_doc[out_plba + 4..]);
+    }
+
+    #[test]
+    fn whitespace_preservation_belongs_to_the_current_text_element() {
+        for tag in [
+            b"<w:t xml:space=\"preserve\">".as_slice(),
+            b"<w:t xml:space='preserve'>",
+        ] {
+            assert!(maybe_inject_xml_space(tag, tag.len()).is_none());
+        }
+        let xml = b"<w:t xml:space=\"preserve\"> old </w:t><w:t>";
+        let (_, _, tag) =
+            maybe_inject_xml_space(xml, xml.len()).expect("current text needs attribute");
+        assert_eq!(tag, b"<w:t xml:space=\"preserve\">");
     }
 
     #[test]

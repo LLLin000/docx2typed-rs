@@ -2086,15 +2086,33 @@ fn source_drift_reports_a_source_that_moved_on_and_stays_quiet_otherwise() {
     use docx2typed_review::draft::source_drift;
 
     let wd = workdir("drift", "complex");
+    // Unique source name owned by this test. An earlier revision used the
+    // shared `complex.docx` directly under the shared temp dir and deleted
+    // it at the end — touching bytes outside its own workdir. The unique
+    // name keeps every write/remove strictly inside this test's own files.
+    let source_name = format!(
+        "{}.source.docx",
+        wd.file_name().expect("workdir name").to_string_lossy()
+    );
     // A Rust workdir records the file name it came from; point that name at a
     // copy sitting beside the workdir, which is where a source normally lives.
-    let beside = wd.parent().expect("parent").join("complex.docx");
+    let beside = wd.parent().expect("parent").join(&source_name);
+    // Sibling sentinel owned by this test: removing the shared parent (the
+    // earlier `remove_dir_all(wd.parent())` tail that deleted sibling
+    // workdirs and in-flight `.docx2typed-commit-*` staging mid-commit)
+    // would take this file with it, so the tail asserts below fail if that
+    // cleanup is ever reintroduced.
+    let sentinel = wd
+        .parent()
+        .expect("parent")
+        .join(format!("{source_name}.sentinel.tmp"));
+    fs::write(&sentinel, b"sentinel").expect("place the sentinel");
     fs::copy(fixture("complex"), &beside).expect("place the source beside the workdir");
     let format_path = wd.join("format.json");
     let mut format: Value =
         serde_json::from_str(&fs::read_to_string(&format_path).expect("format.json"))
             .expect("format json");
-    format["source"] = json!("complex.docx");
+    format["source"] = json!(source_name);
     fs::write(
         &format_path,
         serde_json::to_vec_pretty(&format).expect("serialize"),
@@ -2102,7 +2120,7 @@ fn source_drift_reports_a_source_that_moved_on_and_stays_quiet_otherwise() {
     .expect("write format.json");
 
     let drift = source_drift(&wd).expect("a comparable source");
-    assert_eq!(drift["source"], json!("complex.docx"));
+    assert_eq!(drift["source"], json!(source_name));
     assert_eq!(
         drift["changed"],
         json!(false),
@@ -2134,5 +2152,23 @@ fn source_drift_reports_a_source_that_moved_on_and_stays_quiet_otherwise() {
         source_drift(&wd).is_none(),
         "an uncomparable source reports nothing rather than a false clean"
     );
-    let _ = fs::remove_dir_all(wd.parent().expect("parent"));
+    // Cleanup owns exactly what this test placed: `beside` (removed above),
+    // `sentinel` (removed below), `wd` via its `ScratchGuard`. An earlier
+    // tail removed `wd.parent()` — the shared temp dir — deleting sibling
+    // workdirs and in-flight `.docx2typed-commit-*` staging mid-commit, so a
+    // concurrent extract failed `workdir-invalid` naming
+    // `.../.docx2typed-commit-<pid>-<n>.tmp/format.json` (Windows CI, a
+    // different test each run). The sentinel assert below fails if that
+    // cleanup is ever reintroduced.
+    fs::remove_file(&sentinel).expect("remove the sentinel");
+    let parent = wd.parent().expect("parent");
+    assert!(parent.is_dir(), "shared parent must survive test cleanup");
+    assert!(
+        !sentinel.exists(),
+        "cleanup removes this test's own sentinel file"
+    );
+    assert!(
+        wd.join("format.json").is_file(),
+        "the workdir must survive its own test's cleanup"
+    );
 }
