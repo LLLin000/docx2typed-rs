@@ -230,5 +230,22 @@ recursively deleting `wd.parent()`, the shared temporary directory containing
 other tests' in-flight commit staging. Cleanup now owns only its unique source,
 sentinel and workdir; no shared-parent deletion, retries or test serialization.
 The commit implementation is unchanged. Workspace tests and CI must pass before
-calling PR #69 merge-ready; the corpus PR remains independently scoped.
+
+### External-file precondition (issue #73)
+
+Publishing replaces a file the engine does not own. The precondition names
+which replacements are this workdir's: the target holding the workdir's own
+last-published bytes at this baseline epoch, the canonical source still
+holding the baseline bytes after an explicit re-extract, or a new path
+observed absent. Anything else refuses `external-file-changed` before any
+mutation and again immediately before publication — source and workdir
+unchanged, sidecars beside C untouched. Success (live or recovery
+roll-forward) advances `external-targets.json` to the published bytes; the
+epoch keys every entry, so a re-extract re-baselines without cleanup.
+Journals predating the record fail closed. Windows holds the live target
+with `FILE_SHARE_READ|FILE_SHARE_DELETE` (deny writes, allow our own
+rename) across hash + publication; new paths publish via no-clobber
+hard-link create. The residual — an external rename-onto-target between the
+final check and the rename — is documented, not claimed away. No mtimes, no
+silent adoption, no CAS absolute.
 

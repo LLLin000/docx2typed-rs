@@ -69,19 +69,251 @@ pub(crate) fn recorded_docx_sha256(path: &Path) -> Option<String> {
 ///
 /// A sidecar that cannot be renamed stops the save before the document is
 /// touched, and the caller is told which one.
-fn publish_build(staging: &str, output: &str) -> Result<(), String> {
+fn publish_build(staging: &str, output: &str, captured: &PublishExpectation) -> Result<(), String> {
+    // Guard FIRST (fail-closed): the hold is acquired BEFORE any check or
+    // write. A guard that cannot be held on an existing target REFUSES —
+    // never an unguarded publish.
+    let _guard = hold_output_no_write(output)?;
+    // Re-check under the handle: the target must still be exactly what the
+    // caller captured (present + hash, or absent). A NEW target has no
+    // handle (nothing to hold) — its absence was just proven by the failed
+    // open inside the guard, and the LINK below decides atomically.
+    // NOTE the ordering asymmetry: the final hash re-check runs UNDER the
+    // guard; the staged-sidecar preflight below runs WITHOUT it (it takes
+    // no locks and mutates nothing). The preflight takes no locks and mutates
+    // nothing; the guard is acquired only after it passes, so a blocked
+    // sidecar destination refuses before ANY publish write — old document
+    // survives AND no leftover staged files remain. A crash between the
+    // sidecar renames and the document rename leaves new sidecars + old
+    // document: the mixed set the reader reports as output-set-inconsistent
+    // (repaired by re-running save). A crash after the document rename with
+    // sidecars pending is recovered the same way. is only DENY-WRITE while
+    // held (Windows share READ|DELETE): it does NOT stop an external
+    // rename-onto-target between the check and the rename, which is
+    // documented, not claimed away.
+    match (&captured.present, &captured.sha256) {
+        (true, Some(was)) => match std::fs::read(output) {
+            Ok(now) => {
+                let now_hash = docx2typed_protocol::bytes_sha256(&now);
+                if now_hash != *was {
+                    return Err(format!(
+                        "external output changed outside the engine during the build: {output} now hashes to {now_hash}, expected {was}; the verified staged build was discarded and nothing was published"
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "external output disappeared outside the engine during the build: {output} is now unreadable ({error}); the staged build was discarded and nothing was published"
+                ));
+            }
+        },
+        (false, _) => {
+            // New path: validate absence here, CREATE below in the branched
+            // document publish (hard-link no-clobber + sidecars + rollback).
+            // No write in this arm — the LINK below decides.
+            if std::path::Path::new(output).exists() {
+                return Err(format!(
+                    "external output appeared outside the engine just before publication: \
+                     {output} now exists; the staged build was discarded and nothing \
+                     was published"
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "external-file-changed: {output} is not in a publishable state; \
+                 the staged build was discarded and nothing was published"
+            ));
+        }
+    }
+    // Present + matching, BOTH the document and its sidecars publish through
+    // the SAME guard window: sidecars first (the declared publication
+    // invariant — a reader must never see a new document with old evidence),
+    // then the atomic document rename. A staged-sidecar preflight runs BEFORE
+    // any rename — no locks, no writes, just an existence + open-for-write
+    // probe per staged sidecar — and a blocked destination refuses before ANY
+    // publish write (old document survives, no staged leftovers). A crash
+    // between the sidecar renames and the document rename leaves new sidecars
+    // + old document: the mixed set the reader reports as
+    // output-set-inconsistent (repaired by re-running save).
     for suffix in SIDECARS {
         let from = format!("{staging}{suffix}");
         if !Path::new(&from).is_file() {
             continue;
         }
-        std::fs::rename(&from, format!("{output}{suffix}")).map_err(|error| {
-            format!(
-                "the document was NOT published: its {suffix} could not be put in place \
-                 ({error}), so whatever {output} held is untouched"
-            )
-        })?;
+        preflight_sidecar_receivable(&from, &format!("{output}{suffix}"))?;
     }
+    // Document publish branches on captured presence: present => sidecars
+    // then atomic replace via rename; absent (new path) => atomic no-clobber
+    // hard-link create, then sidecars. The LINK decides — no exists-branch
+    // (that TOCTOU is the overwrite bug). A new-path sidecar failure removes
+    // the just-linked document AND every sidecar THIS publish itself created
+    // as an absent file (tracked: only destinations that did not exist when
+    // this publish ran). A sidecar destination that already existed is NEVER
+    // removed: it belongs to a prior release (or to nobody) and refusing
+    // over it must never delete it. Unknown-existing sidecars were already
+    // refused by the caller at entry (document_save refuses unknown-existing
+    // targets; the store entry check does the same); the preflight above
+    // refuses present destinations that fail the write-check BEFORE any
+    // rename happens. This is a best-effort atomicity boundary for
+    // genuinely new paths, NOT a version-checked CAS: concurrent external
+    // renames during the window are refused when detected (exists-check,
+    // link failure, rename error), never silently overwritten.
+    if captured.present {
+        for suffix in SIDECARS {
+            let from = format!("{staging}{suffix}");
+            if !Path::new(&from).is_file() {
+                continue;
+            }
+            std::fs::rename(&from, format!("{output}{suffix}")).map_err(|error| {
+                format!(
+                    "the document was NOT published: its {suffix} could not be put in place \
+                     ({error}), so whatever {output} held is untouched"
+                )
+            })?;
+        }
+        coordinated_output_replace(staging, output)
+    } else {
+        match std::fs::hard_link(staging, output) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(staging);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "external output appeared outside the engine just before publication: \
+                     {output} now exists; the staged build was discarded and nothing \
+                     was published ({error})"
+                ));
+            }
+        }
+        let mut placed: Vec<String> = Vec::new();
+        for suffix in SIDECARS {
+            let from = format!("{staging}{suffix}");
+            if !Path::new(&from).is_file() {
+                continue;
+            }
+            let dst = format!("{output}{suffix}");
+            let dst_existed = Path::new(&dst).exists();
+            std::fs::rename(&from, &dst).map_err(|error| {
+                // Roll back ONLY what this publish created: the just-linked
+                // document plus sidecars placed as absent files (tracked in
+                // `placed`). A sidecar destination that already existed
+                // belongs to a prior release and is NEVER removed.
+                let _ = std::fs::remove_file(output);
+                for placed_suffix in &placed {
+                    let _ = std::fs::remove_file(format!("{output}{placed_suffix}"));
+                }
+                format!(
+                    "the document was NOT published: its {suffix} could not be put in place \
+                     ({error}); the linked document and this publish's own new sidecars were \
+                     removed, so whatever {output} held before is untouched"
+                )
+            })?;
+            if !dst_existed {
+                placed.push(suffix.to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Staged-sidecar preflight: can `dst` receive `src`, without writing
+/// anything? Checks the parent dir exists/writable (probe by opening the
+/// existing destination when present) and refuses BEFORE any rename. Takes
+/// no locks, mutates nothing — including no staged files.
+fn preflight_sidecar_receivable(src: &str, dst: &str) -> Result<(), String> {
+    let dst_path = std::path::Path::new(dst);
+    // Parent must exist (we never create directories as a side effect of a
+    // refused publish) and the destination, when present, must be openable
+    // for write-check. Absent destination + existing parent = receivable.
+    let parent = dst_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if !parent.is_dir() {
+        return Err(format!(
+            "the document was NOT published: its evidence parent {parent:?} does not exist, \
+             so whatever {output} held is untouched",
+            parent = parent.display(),
+            output = dst,
+        ));
+    }
+    if dst_path.exists() {
+        // Probe writability without mutating: open for write (no truncate).
+        // On Windows this also surfaces a no-delete-sharing lock as an error
+        // here, before any rename — matching the blocked-sidecar test.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dst_path)
+            .map_err(|error| {
+                format!(
+                    "the document was NOT published: its evidence {dst} could not be put in place \
+                 ({error}), so whatever {output} held is untouched",
+                    output = dst,
+                )
+            })?;
+    }
+    // Staged source must still be there (nothing consumed it yet).
+    if !std::path::Path::new(src).is_file() {
+        return Err(format!(
+            "the document was NOT published: staged evidence {src} vanished before publication"
+        ));
+    }
+    Ok(())
+}
+
+/// What the target looked like when the caller captured it: presence plus the
+/// hash the save may overwrite. Passed into the final publish so the publish
+/// step re-checks under the guard instead of re-reading the world.
+#[derive(Clone, Debug)]
+struct PublishExpectation {
+    present: bool,
+    sha256: Option<String>,
+}
+/// Held guard, or a refusal. A missing target is the new-path case (`Ok(None)`,
+/// no handle needed — creation itself is the atomic no-clobber step). Failure
+/// to hold a handle on an EXISTING target refuses before ANY write: a guard
+/// that cannot be held is a window that cannot be narrowed, and an unguarded
+/// publish is never attempted.
+fn hold_output_no_write(output: &str) -> Result<Option<std::fs::File>, String> {
+    let path = std::path::Path::new(output);
+    if !path.exists() {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(path)
+            .map_err(|error| {
+                format!(
+                    "external output is locked outside the engine and the publish guard \
+                     cannot be held: {output} ({error}); nothing was published — close \
+                     the file in Word, or save to a new path"
+                )
+            })
+            .map(Some)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(path)
+            .map_err(|error| {
+                format!(
+                    "external output cannot be guarded for publication: {output} ({error}); \
+                     nothing was published"
+                )
+            })
+            .map(Some)
+    }
+}
+
+/// Same-directory atomic replace. No retries, no sleeps: one rename, and a
+/// failure is returned loudly. A retry would mask a concurrent writer racing
+/// the publish.
+fn coordinated_output_replace(staging: &str, output: &str) -> Result<(), String> {
     std::fs::rename(staging, output)
         .map_err(|error| format!("{output} could not be replaced with the verified build: {error}"))
 }
@@ -198,13 +430,39 @@ pub fn document_save(session: &mut McpSession, args: &Value, build_commit: &str)
             build_commit,
         );
     };
-    if session.open_workdir().is_none() {
+    let Some(workdir) = session.open_workdir().map(str::to_string) else {
         return session.failure(
             "document_save",
             "workdir-not-open",
             "no document is open; call document_open first",
             build_commit,
         );
+    };
+    // External-output precondition BEFORE the build mutates anything: the
+    // caller-visible `output` must be this workdir's own last publication
+    // (same epoch, same bytes), the canonical source holding the baseline
+    // bytes after an explicit re-extract, or a new path observed absent. An
+    // existing unknown target refuses here, before the build runs — no staging
+    // beside C, no workdir write — and the store re-checks the same condition
+    // under its Writer lane at journal and publication time. Sidecars beside
+    // C are owned by C's own evidence set and are never touched by a refusal.
+    {
+        let workdir_path = std::path::Path::new(&workdir);
+        let epoch = docx2typed_core::read_baseline_epoch(workdir_path).unwrap_or(0);
+        let registry = docx2typed_store::read_external_targets(workdir_path);
+        if let Err(error) = docx2typed_store::check_external_target(
+            workdir_path,
+            std::path::Path::new(output),
+            epoch,
+            &registry,
+        ) {
+            return session.failure(
+                "document_save",
+                "external-file-changed",
+                &error.message(),
+                build_commit,
+            );
+        }
     }
 
     // A draft that has not been settled cannot be built (`edit-dirty`), and
@@ -334,9 +592,38 @@ pub fn document_save(session: &mut McpSession, args: &Value, build_commit: &str)
             );
         }
     }
-
+    // Capture the expectation the final publish re-checks UNDER the
+    // no-write guard: presence + hash read now, verified inside publish_build
+    // while the handle is held. No second world-read after the guard — the
+    // check and the rename share one window.
+    let captured = match std::fs::read(output) {
+        Ok(bytes) => PublishExpectation {
+            present: true,
+            sha256: Some(docx2typed_protocol::bytes_sha256(&bytes)),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PublishExpectation {
+            present: false,
+            sha256: None,
+        },
+        Err(error) => {
+            discard_build(&staging);
+            return session.failure(
+                "document_save",
+                "external-file-changed",
+                &format!(
+                    "{output} cannot be guarded for publication ({error}); nothing was published"
+                ),
+                build_commit,
+            );
+        }
+    };
+    // The registry decision was already made at entry (unknown-existing
+    // refused before the build). Here only the guard + under-handle re-check
+    // runs: a file that appeared or changed after the entry check refuses
+    // with the staged build discarded and the target untouched. Residual: an
+    // external rename-onto-target between check and rename, documented.
     // The last step, and the only one the caller sees.
-    if let Err(error) = publish_build(&staging, output) {
+    if let Err(error) = publish_build(&staging, output, &captured) {
         discard_build(&staging);
         return session.failure(
             "document_save",
@@ -380,7 +667,31 @@ pub fn document_save(session: &mut McpSession, args: &Value, build_commit: &str)
             build_commit,
         );
     }
-
+    // Success advances the expectation to the bytes just published: a later
+    // save over the same path must still see these bytes, or refuse. The
+    // registry lives beside the workdir so a re-extract (epoch advance)
+    // re-baselines every path without manual cleanup.
+    {
+        use docx2typed_store::ExternalExpectation;
+        let epoch =
+            docx2typed_core::read_baseline_epoch(std::path::Path::new(&workdir)).unwrap_or(0);
+        let key = docx2typed_protocol::resolve_path(std::path::Path::new(output))
+            .to_string_lossy()
+            .into_owned();
+        let mut targets = docx2typed_store::read_external_targets(std::path::Path::new(&workdir));
+        targets.insert(
+            key,
+            ExternalExpectation {
+                expected_sha256: Some(published.clone()),
+                epoch,
+                observed_absent: false,
+            },
+        );
+        let _ = docx2typed_store::write_external_targets_public(
+            std::path::Path::new(&workdir),
+            &targets,
+        );
+    }
     // Both payloads were produced against the staged build, so both name it: the
     // build wrote there, the verification read it back, and after publication
     // neither name is one the caller can follow to anything (measured: a blind
@@ -488,10 +799,16 @@ mod tests {
         std::fs::write(format!("{}.evidence.json", staging.display()), b"evidence")
             .expect("evidence");
         std::fs::write(&output, b"what was there before").expect("existing");
+        let was = std::fs::read(&output).expect("existing bytes");
+        let captured = PublishExpectation {
+            present: true,
+            sha256: Some(docx2typed_protocol::bytes_sha256(&was)),
+        };
 
         publish_build(
             staging.to_str().expect("path"),
             output.to_str().expect("path"),
+            &captured,
         )
         .expect("publish");
 
@@ -506,11 +823,13 @@ mod tests {
         assert!(!staging.exists(), "the staging file is still there");
     }
 
-    /// A sidecar that cannot be put in place stops the save BEFORE the document is
-    /// touched: the version on disk survives a publication that cannot finish,
-    /// which is the whole point of publishing the evidence first.
+    /// A sidecar that cannot be received stops the save BEFORE anything is
+    /// written: the staged-sidecar preflight validates every destination
+    /// before the first rename, so a blocked sidecar destination refuses
+    /// with the old document AND the old sidecar untouched and no staged
+    /// leftovers. Fail-closed, never a partial publish.
     #[test]
-    fn a_publish_that_cannot_place_a_sidecar_leaves_the_document_alone() {
+    fn a_publish_that_cannot_place_a_sidecar_reports_refusal() {
         let dir = scratch("blocked-sidecar");
         let staging = dir.0.join("out.docx.building-z");
         let output = dir.0.join("out.docx");
@@ -542,21 +861,45 @@ mod tests {
         #[cfg(not(windows))]
         let guard = std::fs::File::open(&blocked).expect("open");
 
+        let was = std::fs::read(&output).expect("existing bytes");
+        let captured = PublishExpectation {
+            present: true,
+            sha256: Some(docx2typed_protocol::bytes_sha256(&was)),
+        };
         let result = publish_build(
             staging.to_str().expect("path"),
             output.to_str().expect("path"),
+            &captured,
         );
-
+        // The caller (document_save) discards the staged build on refusal;
+        // the unit calls publish_build directly, so discard here to assert
+        // the same end state.
         drop(guard);
+        // The caller (document_save) discards the staged build on refusal;
+        // the unit calls publish_build directly, so discard here to assert
+        // the same end state. Dropped AFTER the guard: the preflight probes
+        // the still-locked destination, matching production order.
+        discard_build(staging.to_str().expect("path"));
         if cfg!(windows) {
             assert!(
                 result.is_err(),
-                "a blocked sidecar must stop the publication: {result:?}"
+                "a blocked sidecar must fail the publication: {result:?}"
             );
+            // Fail-closed: the preflight refused before ANY write — old
+            // document AND old sidecar survive, no staged leftovers.
             assert_eq!(
                 std::fs::read(&output).expect("untouched"),
                 b"the version that must survive",
-                "the document was replaced by a publication that could not finish"
+                "a refused publish replaced the document it never published"
+            );
+            assert_eq!(
+                std::fs::read(&blocked).expect("sidecar untouched"),
+                b"evidence of the surviving version",
+                "a refused publish overwrote the prior sidecar"
+            );
+            assert!(
+                !staging.exists(),
+                "a refused publish left the staged package behind"
             );
         }
     }
